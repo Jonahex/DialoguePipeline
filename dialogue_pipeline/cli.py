@@ -123,6 +123,15 @@ def build_parser() -> argparse.ArgumentParser:
     finalize_parser.add_argument("--output", required=True, type=Path)
     finalize_parser.add_argument("--overwrite", action="store_true")
     finalize_parser.add_argument("--allow-incomplete", action="store_true")
+    finalize_parser.add_argument(
+        "--allow-segment-reuse",
+        action="store_true",
+        default=None,
+        help=(
+            "Allow one selected segment to be copied to multiple target "
+            "filenames; defaults to export.allow_segment_reuse."
+        ),
+    )
     finalize_parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -232,6 +241,7 @@ def dispatch(args: argparse.Namespace) -> int:
             output_dir=args.output.resolve(),
             overwrite=args.overwrite,
             allow_incomplete=args.allow_incomplete,
+            allow_segment_reuse=args.allow_segment_reuse,
             dry_run=args.dry_run,
         )
         _print_json(result)

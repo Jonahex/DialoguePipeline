@@ -22,6 +22,81 @@ from .util import (
 )
 
 
+def split_regions_on_word_gaps(
+    regions: list[dict[str, Any]],
+    transcription: dict[str, Any],
+    *,
+    duration_seconds: float,
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not bool(settings.get("word_split_enabled", True)):
+        return regions
+
+    minimum_gap = float(settings.get("word_split_gap_seconds", 0.55))
+    minimum_region = float(settings.get("word_split_min_region_seconds", 1.5))
+    maximum_boundaries = max(
+        0,
+        int(settings.get("word_split_max_boundaries", 2)),
+    )
+    pre_padding = float(settings.get("pre_padding_seconds", 0.15))
+    post_padding = float(settings.get("post_padding_seconds", 0.25))
+    minimum_segment = float(settings.get("minimum_segment_seconds", 0.15))
+    if maximum_boundaries == 0:
+        return regions
+
+    refined = []
+    for region in regions:
+        speech_start = float(region["speech_start"])
+        speech_end = float(region["speech_end"])
+        if speech_end - speech_start < minimum_region:
+            refined.append(region)
+            continue
+        _, words, _ = transcript_for_region(
+            transcription,
+            speech_start,
+            speech_end,
+        )
+        if len(words) < 2:
+            refined.append(region)
+            continue
+        gap_candidates = []
+        for left, right in zip(words, words[1:]):
+            left_end = float(left.get("end", speech_start))
+            right_start = float(right.get("start", speech_end))
+            gap = right_start - left_end
+            if gap >= minimum_gap:
+                gap_candidates.append((gap, (left_end + right_start) / 2.0))
+        boundaries = sorted(
+            boundary
+            for _, boundary in sorted(gap_candidates, reverse=True)[
+                :maximum_boundaries
+            ]
+        )
+        if not boundaries:
+            refined.append(region)
+            continue
+
+        speech_boundaries = [speech_start, *boundaries, speech_end]
+        pieces = []
+        for left, right in zip(speech_boundaries, speech_boundaries[1:]):
+            if right - left < minimum_segment:
+                continue
+            pieces.append(
+                {
+                    "speech_start": left,
+                    "speech_end": right,
+                    "start": max(0.0, left - pre_padding),
+                    "end": min(duration_seconds, right + post_padding),
+                    "split_source": "word_gap",
+                }
+            )
+        if len(pieces) >= 2:
+            refined.extend(pieces)
+        else:
+            refined.append(region)
+    return refined
+
+
 def segment_project(
     *,
     project_dir: Path,
@@ -141,6 +216,12 @@ def segment_project(
                 settings.get("post_padding_seconds", 0.25)
             ),
         )
+        regions = split_regions_on_word_gaps(
+            regions,
+            transcription,
+            duration_seconds=duration_seconds,
+            settings=settings,
+        )
         session_dir = segment_root / session["id"]
         segment_records = []
 
@@ -182,7 +263,9 @@ def segment_project(
                     "file": output_path.relative_to(project_dir).as_posix(),
                     "transcript": transcript,
                     "word_count": len(words),
+                    "words": words,
                     "asr_probability": probability,
+                    "split_source": region.get("split_source", "acoustic"),
                     "metrics": metrics,
                 }
             )

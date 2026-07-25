@@ -4,21 +4,33 @@ import math
 import subprocess
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from openpyxl import load_workbook
 
 from dialogue_pipeline.alignment import (
+    _apply_duplicate_line_policy,
+    _apply_local_asr_rescue,
     _candidate_reliability,
+    _has_unsafe_untranscribed_merge,
+    _multisentence_fragment_join_actions,
+    _vocalization_review_actions,
     _write_review_workbook,
     align_project,
     order_independent_align,
+    sentence_fidelity,
     sequence_align,
     text_similarity,
+    transcript_fidelity,
 )
 from dialogue_pipeline.audio import cut_pcm_wav, prepare_pcm_segmentation_source
 from dialogue_pipeline.finalize import finalize_review
-from dialogue_pipeline.segmentation import segment_project
+from dialogue_pipeline.segmentation import (
+    segment_project,
+    split_regions_on_word_gaps,
+)
 from dialogue_pipeline.util import (
     default_model_cache_root,
     resolve_model_cache_root,
@@ -248,6 +260,531 @@ def test_exact_short_match_is_reliable_unless_script_text_is_duplicated() -> Non
     ) == (False, "SHORT_LINE_AMBIGUOUS")
 
 
+def test_short_line_auto_reliability_requires_order_and_no_extra_words() -> None:
+    settings = {
+        "short_line_min_score": 88.0,
+        "short_line_min_margin": 15.0,
+        "short_line_min_ordered_score": 70.0,
+        "short_line_min_token_coverage": 1.0,
+        "short_line_min_token_precision": 1.0,
+    }
+    line = {"line": "Not... remember..."}
+
+    assert text_similarity(line["line"], "Remember Not") >= 88.0
+    assert _candidate_reliability(
+        line=line,
+        match_score=text_similarity(line["line"], "Remember Not"),
+        margin=40.0,
+        settings=settings,
+        observed="Remember Not",
+    ) == (False, "SHORT_LINE_ORDER_MISMATCH")
+    assert _candidate_reliability(
+        line=line,
+        match_score=text_similarity(line["line"], "Not remember not"),
+        margin=40.0,
+        settings=settings,
+        observed="Not remember not",
+    ) == (False, "SHORT_LINE_EXTRA_WORDS")
+    assert _candidate_reliability(
+        line=line,
+        match_score=100.0,
+        margin=40.0,
+        settings=settings,
+        observed="Not remember",
+    ) == (True, "")
+
+
+def test_suspicious_duration_prevents_exact_match_auto_acceptance() -> None:
+    line = {"line": "Pathetic!"}
+
+    assert _candidate_reliability(
+        line=line,
+        match_score=100.0,
+        margin=40.0,
+        settings={"reliable_min_duration_plausibility": 25.0},
+        observed="Pathetic",
+        duration_plausibility=20.2,
+    ) == (False, "POSSIBLE_REPEATED_TAKES")
+    assert _candidate_reliability(
+        line=line,
+        match_score=100.0,
+        margin=40.0,
+        settings={"reliable_min_duration_plausibility": 25.0},
+        observed="Pathetic",
+        duration_plausibility=38.4,
+    ) == (True, "")
+
+
+@pytest.mark.parametrize(
+    ("expected", "repeated"),
+    [
+        (
+            "You'll break before I will!",
+            "Break Before I Will You'll Break Before I Will Will "
+            "You'll Break Before I Will",
+        ),
+        (
+            "Right! Bring it on!",
+            "Bring It On Right Bring It On Right Bring It On",
+        ),
+    ],
+)
+def test_transcribed_repeated_takes_prevent_auto_acceptance(
+    expected: str,
+    repeated: str,
+) -> None:
+    reliable, reason = _candidate_reliability(
+        line={"line": expected},
+        match_score=text_similarity(expected, repeated),
+        margin=40.0,
+        settings={},
+        observed=repeated,
+        duration_plausibility=50.0,
+    )
+
+    assert reliable is False
+    assert reason == "EXCESS_TRANSCRIPT_WORDS"
+
+
+def test_transcript_fidelity_tolerates_minor_asr_spelling_errors() -> None:
+    fidelity = transcript_fidelity(
+        "Good afternoon.",
+        "Good afternon",
+    )
+
+    assert fidelity["ordered_similarity"] >= 90.0
+    assert fidelity["token_coverage"] == 1.0
+    assert fidelity["token_precision"] == 1.0
+    assert fidelity["extra_word_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("expected", "partial"),
+    [
+        (
+            "You've been avoiding the sun, haven't you? "
+            "Can't say I blame you with this heat.",
+            "Can't say I blame you with this heat",
+        ),
+        (
+            "Got too much to do. Feels like I barely started...",
+            "Feels like I barely started",
+        ),
+        (
+            "Ever hear the story about the frozen Hist? "
+            "Wonder if any of it's true...",
+            "Ever hear the story about the frozen Hist",
+        ),
+        (
+            "Been some strange storms lately. "
+            "You wouldn't know anything about that, would you?",
+            "You wouldn't know anything about that would you",
+        ),
+        ("Maybe over here... No, nothing.", "Maybe over here"),
+    ],
+)
+def test_missing_sentence_prevents_auto_acceptance(
+    expected: str,
+    partial: str,
+) -> None:
+    sentence = sentence_fidelity(expected, partial)
+
+    assert sentence["clause_count"] == 2
+    assert sentence["missing_clause_count"] >= 1
+    assert _candidate_reliability(
+        line={"line": expected},
+        match_score=max(90.0, text_similarity(expected, partial)),
+        margin=40.0,
+        settings={
+            "reliable_min_score": 70.0,
+            "reliable_min_margin": 5.0,
+            "reliable_min_clause_score": 55.0,
+        },
+        observed=partial,
+    ) == (False, "MISSING_SENTENCE")
+
+
+def test_adjacent_sentence_fragments_create_complete_take_candidates() -> None:
+    line_text = (
+        "You've been avoiding the sun, haven't you? "
+        "Can't say I blame you with this heat."
+    )
+    lines = [{"line_id": "line", "line": line_text}]
+    transcripts = [
+        "Been avoiding the sun haven't you",
+        "Can't say I blame you with this heat",
+        "You've been avoiding the sun haven't you",
+        "Can't say I blame you with this heat",
+    ]
+    segments = [
+        {
+            "start_seconds": index * 2.0,
+            "end_seconds": index * 2.0 + 1.5,
+            "transcript": transcript,
+            "asr_probability": 0.95,
+        }
+        for index, transcript in enumerate(transcripts)
+    ]
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": index,
+            "count": 1,
+            "line_index": 0,
+            "match_score": text_similarity(line_text, transcript),
+            "transcript": transcript,
+            "duration_plausibility": 80.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+        for index, transcript in enumerate(transcripts)
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_segments": 2,
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+    )
+
+    assert [(action["start_index"], action["count"]) for action in joined] == [
+        (0, 2),
+        (2, 2),
+    ]
+    assert all(action["fragment_join"] for action in joined)
+    assert all(action["fragment_source_count"] == 2 for action in joined)
+    assert all(
+        sentence_fidelity(line_text, action["transcript"])[
+            "missing_clause_count"
+        ]
+        == 0
+        for action in joined
+    )
+
+
+def test_untranscribed_audio_in_merge_prevents_auto_acceptance() -> None:
+    unsafe = _has_unsafe_untranscribed_merge(
+        action={"start_index": 0, "count": 2},
+        base_segments=[
+            {
+                "start_seconds": 0.0,
+                "end_seconds": 1.0,
+                "transcript": "Hello there",
+                "metrics": {"duration_seconds": 1.0, "rms_dbfs": -20.0},
+            },
+            {
+                "start_seconds": 1.2,
+                "end_seconds": 2.2,
+                "transcript": "",
+                "metrics": {"duration_seconds": 1.0, "rms_dbfs": -24.0},
+            },
+        ],
+        settings={},
+    )
+
+    assert unsafe is True
+    assert _candidate_reliability(
+        line={"line": "Hello there."},
+        match_score=100.0,
+        margin=50.0,
+        settings={},
+        observed="Hello there",
+        unsafe_untranscribed_merge=unsafe,
+    ) == (False, "MERGED_UNTRANSCRIBED_AUDIO")
+
+
+def test_word_timestamp_gaps_split_a_region_into_take_candidates() -> None:
+    transcription = {
+        "segments": [
+            {
+                "start": 0.0,
+                "end": 4.0,
+                "text": "Take this Take this",
+                "words": [
+                    {"start": 0.2, "end": 0.5, "word": " Take"},
+                    {"start": 0.5, "end": 0.8, "word": " this"},
+                    {"start": 1.5, "end": 1.8, "word": " Take"},
+                    {"start": 1.8, "end": 2.1, "word": " this"},
+                ],
+            }
+        ]
+    }
+    regions = [
+        {
+            "speech_start": 0.0,
+            "speech_end": 4.0,
+            "start": 0.0,
+            "end": 4.0,
+        }
+    ]
+
+    refined = split_regions_on_word_gaps(
+        regions,
+        transcription,
+        duration_seconds=4.0,
+        settings={
+            "word_split_enabled": True,
+            "word_split_gap_seconds": 0.55,
+            "word_split_min_region_seconds": 1.0,
+            "word_split_max_boundaries": 2,
+            "minimum_segment_seconds": 0.15,
+            "pre_padding_seconds": 0.1,
+            "post_padding_seconds": 0.1,
+        },
+    )
+
+    assert len(refined) == 2
+    assert all(region["split_source"] == "word_gap" for region in refined)
+
+
+def test_duplicate_weak_order_assigns_separate_take_groups() -> None:
+    lines = [
+        {"line_id": "a", "line": "Found you!"},
+        {"line_id": "b", "line": "Found you!"},
+    ]
+    segments = [
+        {"start_seconds": 0.0, "end_seconds": 1.0},
+        {"start_seconds": 20.0, "end_seconds": 21.0},
+    ]
+    actions = [
+        {
+            "start_index": 0,
+            "count": 1,
+            "line_index": 0,
+            "match_score": 100.0,
+            "top_matches": [
+                {"line_index": 0, "match_score": 100.0},
+                {"line_index": 1, "match_score": 100.0},
+            ],
+        },
+        {
+            "start_index": 1,
+            "count": 1,
+            "line_index": 0,
+            "match_score": 100.0,
+            "top_matches": [
+                {"line_index": 0, "match_score": 100.0},
+                {"line_index": 1, "match_score": 100.0},
+            ],
+        },
+    ]
+
+    _apply_duplicate_line_policy(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "duplicate_line_policy": "weak_order",
+            "take_group_gap_seconds": 5.0,
+        },
+    )
+
+    assert [action["line_index"] for action in actions] == [0, 1]
+    assert all(action["duplicate_resolved"] for action in actions)
+
+
+def test_nonverbal_review_policy_does_not_supply_random_candidates() -> None:
+    actions = _vocalization_review_actions(
+        base_segments=[
+            {
+                "start_seconds": 0.0,
+                "end_seconds": 0.8,
+                "transcript": "completely unrelated",
+                "word_count": 2,
+            }
+        ],
+        lines=[{"line_id": "a", "line": "(cough)"}],
+        session_id="session",
+        settings={"nonverbal_policy": "review"},
+        existing_actions=[],
+    )
+
+    assert actions == []
+
+
+def test_vocalization_weak_order_policy_supplies_review_candidates() -> None:
+    actions = _vocalization_review_actions(
+        base_segments=[
+            {
+                "start_seconds": 0.0,
+                "end_seconds": 0.8,
+                "transcript": "eaargh",
+                "word_count": 1,
+            }
+        ],
+        lines=[{"line_id": "a", "line": "Aaaarraaagh..."}],
+        session_id="session",
+        settings={
+            "nonverbal_policy": "weak_order",
+            "vocalization_alignment": {
+                "enabled": True,
+                "candidates_per_line": 1,
+            }
+        },
+        existing_actions=[],
+    )
+
+    assert len(actions) == 1
+    assert actions[0]["force_candidate"] is True
+    assert actions[0]["forced_review_reason"] == "VOCALIZATION_REVIEW"
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_status"),
+    [
+        ("review", "NONVERBAL_REVIEW"),
+        ("skip", "SKIP"),
+    ],
+)
+def test_review_workbook_does_not_preselect_nonverbal_lines(
+    tmp_path: Path,
+    policy: str,
+    expected_status: str,
+) -> None:
+    line = {
+        "line_id": "Sheet::R3",
+        "sheet": "Sheet",
+        "sheet_index": 0,
+        "excel_row": 3,
+        "quest": "",
+        "context": "",
+        "line": "(cough)",
+        "acting_note": "",
+        "emotion": "",
+        "target_filename": "cough_target",
+    }
+    review_path = tmp_path / f"{policy}.xlsx"
+    _write_review_workbook(
+        review_path=review_path,
+        project_dir=tmp_path,
+        source_lines=[line],
+        candidates_by_line={},
+        unmatched_rows=[],
+        nonverbal_policy=policy,
+    )
+
+    workbook = load_workbook(review_path, read_only=False, data_only=False)
+    lines_sheet = workbook["Lines"]
+    headers = {
+        cell.value: cell.column for cell in lines_sheet[1] if cell.value
+    }
+    assert lines_sheet.cell(2, headers["Candidate Count"]).value == 0
+    assert lines_sheet.cell(2, headers["Suggested Best Segment"]).value is None
+    assert lines_sheet.cell(2, headers["Selected Segment"]).value is None
+    assert lines_sheet.cell(2, headers["Status"]).value == expected_status
+    assert lines_sheet.cell(2, headers["Candidate Summary"]).value
+    summary_statuses = {
+        lines_sheet.cell(row, 1).value
+        for row in range(1, lines_sheet.max_row + 1)
+    }
+    assert "NONVERBAL_REVIEW" in summary_statuses
+    assert len(lines_sheet._charts) == 1
+    workbook.close()
+
+
+@pytest.mark.parametrize("aligner", [sequence_align, order_independent_align])
+def test_text_aligners_exclude_nonverbal_lines(aligner) -> None:
+    actions = aligner(
+        [
+            {
+                "start_seconds": 0.0,
+                "end_seconds": 1.0,
+                "transcript": "cough",
+                "asr_probability": 0.9,
+            },
+            {
+                "start_seconds": 2.0,
+                "end_seconds": 3.0,
+                "transcript": "hello there",
+                "asr_probability": 0.9,
+            },
+        ],
+        [
+            {"line_id": "nonverbal", "line": "(cough)"},
+            {"line_id": "spoken", "line": "Hello there."},
+        ],
+        {
+            "max_merge_segments": 1,
+            "path_min_score": 35.0,
+            "candidate_min_score": 35.0,
+            "lookahead_lines": 8,
+        },
+    )
+
+    assert actions
+    assert {action["line_index"] for action in actions} == {1}
+
+
+def test_local_asr_rescue_accepts_a_better_cached_segment_transcript(
+    tmp_path: Path,
+) -> None:
+    segment_file = tmp_path / "segment.wav"
+    _write_tone(segment_file)
+    fake_word = SimpleNamespace(probability=0.95)
+    fake_segment = SimpleNamespace(
+        text="Good afternoon",
+        words=[fake_word, fake_word],
+    )
+
+    class FakeModel:
+        def transcribe(self, *_args, **_kwargs):
+            return iter([fake_segment]), SimpleNamespace()
+
+    segment = {
+        "segment_id": "session__s00001",
+        "file": "segment.wav",
+        "source_sha256": "abc",
+        "start_seconds": 0.0,
+        "end_seconds": 1.0,
+        "transcript": "Afternon",
+        "word_count": 1,
+        "asr_probability": 0.3,
+    }
+    project = {
+        "language": "en",
+        "transcription": {
+            "model": "large-v3",
+            "device": "cpu",
+            "compute_type": "int8",
+        },
+    }
+
+    accepted = _apply_local_asr_rescue(
+        project_dir=tmp_path,
+        project=project,
+        session={"id": "session"},
+        session_lines=[
+            {
+                "line_id": "a",
+                "line": "Good afternoon.",
+            }
+        ],
+        base_segments=[segment],
+        settings={
+            "local_asr_rescue": {
+                "enabled": True,
+                "trigger_score": 101.0,
+                "minimum_probability": 0.5,
+                "minimum_score_gain": 0.0,
+                "minimum_score": 72.0,
+            }
+        },
+        runtime={
+            "model": FakeModel(),
+            "device": "cpu",
+            "compute_type": "int8",
+        },
+    )
+
+    assert accepted == 1
+    assert segment["transcript"] == "Good afternoon"
+    assert segment["transcript_source"] == "local_asr_rescue"
+
+
 def test_sample_accurate_cut_and_finalize(tmp_path: Path) -> None:
     source = tmp_path / "source.wav"
     segment_file = tmp_path / "segments" / "session" / "session__s00001.wav"
@@ -281,6 +818,15 @@ def test_sample_accurate_cut_and_finalize(tmp_path: Path) -> None:
         "segment_file": segment_file.relative_to(tmp_path).as_posix(),
         "transcript": "Hello there.",
         "match_score": 100.0,
+        "ordered_similarity": 100.0,
+        "token_coverage": 1.0,
+        "token_precision": 1.0,
+        "extra_word_count": 0,
+        "clause_count": 1,
+        "minimum_clause_score": 100.0,
+        "missing_clause_count": 0,
+        "fragment_join": False,
+        "fragment_source_count": 0,
         "confidence_margin": 50.0,
         "technical_score": 100.0,
         "selection_score": 115.0,
@@ -342,6 +888,21 @@ def test_sample_accurate_cut_and_finalize(tmp_path: Path) -> None:
     assert len(lines_sheet._charts) == 1
     assert lines_sheet["B7"].value.startswith("=COUNTIF(")
     assert "Unmatched Segments" in workbook.sheetnames
+    candidates_sheet = workbook["Candidates"]
+    candidate_headers = {
+        cell.value: cell.column for cell in candidates_sheet[1] if cell.value
+    }
+    assert (
+        candidates_sheet.cell(
+            2,
+            candidate_headers["Minimum Clause Score"],
+        ).value
+        == 100.0
+    )
+    assert (
+        candidates_sheet.cell(2, candidate_headers["Fragment Join"]).value
+        is False
+    )
     unmatched_sheet = workbook["Unmatched Segments"]
     assert unmatched_sheet["A2"].value == "session__s00001"
     assert unmatched_sheet["A2"].hyperlink is not None
@@ -385,6 +946,108 @@ def test_sample_accurate_cut_and_finalize(tmp_path: Path) -> None:
     )
     assert result["error_count"] == 0
     assert (output_dir / "TargetFile_00000001_1.wav").is_file()
+
+
+def test_finalize_can_optionally_reuse_one_segment(tmp_path: Path) -> None:
+    segment_file = tmp_path / "segment.wav"
+    _write_tone(segment_file)
+    lines = [
+        {
+            "line_id": f"Sheet::R{row}",
+            "sheet": "Sheet",
+            "sheet_index": 0,
+            "excel_row": row,
+            "quest": "",
+            "context": "",
+            "line": "Found you!",
+            "acting_note": "",
+            "emotion": "",
+            "target_filename": f"target_{row}",
+        }
+        for row in (3, 4)
+    ]
+    candidates = {}
+    for line in lines:
+        candidates[line["line_id"]] = [
+            {
+                "line_id": line["line_id"],
+                "session_id": "session",
+                "segment_id": "session__s00001",
+                "segment_file": "segment.wav",
+                "transcript": "Found you",
+                "match_score": 100.0,
+                "confidence_margin": 0.0,
+                "technical_score": 100.0,
+                "selection_score": 115.0,
+                "reliable": True,
+                "reliability_reason": "",
+                "source_audio": "source.wav",
+                "start_seconds": 0.0,
+                "end_seconds": 1.0,
+                "duration_seconds": 1.0,
+                "asr_probability": 0.99,
+                "base_indices": [0],
+                "rank": 1,
+            }
+        ]
+    review_path = tmp_path / "review.xlsx"
+    _write_review_workbook(
+        review_path=review_path,
+        project_dir=tmp_path,
+        source_lines=lines,
+        candidates_by_line=candidates,
+        unmatched_rows=[],
+    )
+    write_json(
+        tmp_path / "segments_manifest.json",
+        {
+            "sessions": [
+                {
+                    "session_id": "session",
+                    "segments": [
+                        {
+                            "segment_id": "session__s00001",
+                            "file": "segment.wav",
+                            "source_audio": "source.wav",
+                            "start_seconds": 0.0,
+                            "end_seconds": 1.0,
+                            "transcript": "Found you",
+                        }
+                    ],
+                    "derived_segments": [],
+                }
+            ]
+        },
+    )
+    project = {
+        "export": {
+            "extension": ".wav",
+            "sample_rate": 48000,
+            "channels": 1,
+            "bits_per_sample": 16,
+        }
+    }
+
+    with pytest.raises(ValueError, match="Finalization stopped"):
+        finalize_review(
+            project_dir=tmp_path,
+            project=project,
+            review_path=review_path,
+            output_dir=tmp_path / "blocked",
+            dry_run=True,
+        )
+    result = finalize_review(
+        project_dir=tmp_path,
+        project=project,
+        review_path=review_path,
+        output_dir=tmp_path / "allowed",
+        allow_segment_reuse=True,
+        dry_run=True,
+    )
+
+    assert result["error_count"] == 0
+    assert result["export_count"] == 2
+    assert result["allow_segment_reuse"] is True
 
 
 def test_segmentation_and_alignment_integration(tmp_path: Path) -> None:

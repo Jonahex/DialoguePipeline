@@ -71,6 +71,34 @@ def is_nonverbal_script(value: str) -> bool:
     return bool(re.fullmatch(r"\s*\([^)]*\)\s*", value or ""))
 
 
+def is_vocalization_script(value: str) -> bool:
+    if is_nonverbal_script(value):
+        return True
+    normalized = normalize_text(value)
+    vocalizations = {
+        "oof",
+        "hunh",
+        "unh",
+        "huh",
+        "gah",
+        "yah",
+        "rargh",
+        "aaaarraaagh",
+        "yearrgh",
+        "hyargh",
+        "rrarggh",
+        "yeeeaarrggh",
+        "hhyyaarrgghh",
+        "nnnnyyaarrgghh",
+        "aggh",
+        "aarrggh",
+        "wagh",
+        "raaagh",
+        "nooo",
+    }
+    return normalized in vocalizations
+
+
 def relpath_for_config(path: Path, project_dir: Path) -> str:
     return Path(os.path.relpath(path.resolve(), project_dir.resolve())).as_posix()
 

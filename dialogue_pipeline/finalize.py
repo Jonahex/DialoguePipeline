@@ -69,6 +69,7 @@ def finalize_review(
     output_dir: Path,
     overwrite: bool = False,
     allow_incomplete: bool = False,
+    allow_segment_reuse: bool | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     manifest_path = project_dir / "segments_manifest.json"
@@ -96,6 +97,10 @@ def finalize_review(
             project.get("export", {}).get("bits_per_sample", 16)
         ),
     }
+    if allow_segment_reuse is None:
+        allow_segment_reuse = bool(
+            project.get("export", {}).get("allow_segment_reuse", False)
+        )
     exports = []
     errors = []
     selected_ids = []
@@ -197,25 +202,28 @@ def finalize_review(
     finally:
         workbook.close()
 
-    duplicate_segment_ids = {
-        segment_id
-        for segment_id, count in Counter(selected_ids).items()
-        if count > 1
-    }
-    for segment_id in sorted(duplicate_segment_ids):
-        affected = [
-            export["line_id"]
-            for export in exports
-            if export["selected_segment_id"] == segment_id
-        ]
-        for line_id in affected:
-            errors.append(
-                {
-                    "line_id": line_id,
-                    "error": "SEGMENT_REUSED",
-                    "detail": f"{segment_id} also assigned to another line",
-                }
-            )
+    if not allow_segment_reuse:
+        duplicate_segment_ids = {
+            segment_id
+            for segment_id, count in Counter(selected_ids).items()
+            if count > 1
+        }
+        for segment_id in sorted(duplicate_segment_ids):
+            affected = [
+                export["line_id"]
+                for export in exports
+                if export["selected_segment_id"] == segment_id
+            ]
+            for line_id in affected:
+                errors.append(
+                    {
+                        "line_id": line_id,
+                        "error": "SEGMENT_REUSED",
+                        "detail": (
+                            f"{segment_id} also assigned to another line"
+                        ),
+                    }
+                )
     duplicate_target_names = {
         target_name
         for target_name, count in Counter(target_names).items()
@@ -308,6 +316,7 @@ def finalize_review(
         "export_report": export_report,
         "error_report": error_report,
         "dry_run": dry_run,
+        "allow_segment_reuse": allow_segment_reuse,
     }
 
 

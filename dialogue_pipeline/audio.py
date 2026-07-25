@@ -296,10 +296,11 @@ def transcript_for_region(
 
     overlapping = []
     for segment in transcription.get("segments", []):
-        overlap = min(end, float(segment["end"])) - max(
-            start, float(segment["start"])
-        )
-        if overlap > 0:
+        segment_start = float(segment["start"])
+        segment_end = float(segment["end"])
+        overlap = min(end, segment_end) - max(start, segment_start)
+        segment_duration = max(0.001, segment_end - segment_start)
+        if overlap > 0 and overlap / segment_duration >= 0.50:
             overlapping.append(str(segment.get("text") or "").strip())
     return " ".join(text for text in overlapping if text).strip(), [], None
 

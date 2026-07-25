@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=65.5", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dialogue-va-pipeline"
+version = "0.1.0"
+description = "Split long voice recordings, align takes to an Excel script, and finalize selected assets."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "faster-whisper>=1.1,<2",
+    "numpy>=1.26,<3",
+    "openpyxl>=3.1,<4",
+    "rapidfuzz>=3.10,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<10",
+]
+
+[project.scripts]
+dialogue-pipeline = "dialogue_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["dialogue_pipeline*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]

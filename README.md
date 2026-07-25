@@ -96,6 +96,19 @@ both its Segment ID and hyperlink. Segment IDs from the `Candidates` sheet or
 the `Unmatched Segments` sheet also work.
 Set `Status` to `SKIP` only when a line should intentionally be omitted.
 
+Alignment defaults to `alignment.mode: "unordered"`. Every valid audio span is
+scored against every line enabled for the session; a global interval resolver
+then chooses non-overlapping spans without requiring the actor to follow sheet
+or row order. Repeated nearby matches to one line are retained as separate
+takes. `candidate_top_k` controls how many competing line matches are retained
+per chosen span, while `order_hint_weight` is `0.0` by default and may be set to
+a small positive value when recording order is known to be useful only as a
+tie-breaker.
+
+Set `alignment.mode` to `"sequence"` to use the legacy monotonic aligner.
+`lookahead_lines`, `skip_line_penalty`, and `repeat_take_penalty` apply only to
+that legacy mode.
+
 ### 5. Finalize selected files
 
 Validate without copying:

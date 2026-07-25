@@ -58,6 +58,12 @@ def text_similarity(expected: str, observed: str) -> float:
     ratio = fuzz.ratio(expected_normalized, observed_normalized)
     weighted = fuzz.WRatio(expected_normalized, observed_normalized)
     partial = fuzz.partial_ratio(expected_normalized, observed_normalized)
+    token_sort = fuzz.token_sort_ratio(expected_normalized, observed_normalized)
+    token_set = fuzz.token_set_ratio(expected_normalized, observed_normalized)
+    compact_ratio = fuzz.ratio(
+        expected_normalized.replace(" ", "").replace("'", ""),
+        observed_normalized.replace(" ", "").replace("'", ""),
+    )
 
     if len(expected_tokens) <= 3:
         score = 0.55 * ratio + 0.25 * weighted + 0.20 * coverage
@@ -71,6 +77,18 @@ def text_similarity(expected: str, observed: str) -> float:
         score *= 0.88
     if length_ratio > 2.2:
         score *= 0.85
+
+    order_insensitive = max(
+        0.50 * token_sort + 0.30 * token_set + 0.20 * compact_ratio,
+        0.60 * token_set + 0.40 * compact_ratio,
+    )
+    if compact_ratio < 98.0 and length_ratio < 0.45:
+        order_insensitive *= 0.80
+    elif compact_ratio < 98.0 and length_ratio < 0.70:
+        order_insensitive *= 0.97
+    if length_ratio > 2.2:
+        order_insensitive *= 0.92
+    score = max(score, order_insensitive)
     return max(0.0, min(100.0, score))
 
 
@@ -257,15 +275,245 @@ def sequence_align(
     return [action for action in actions if action["type"] == "assigned"]
 
 
+def _duration_plausibility(
+    line: dict[str, Any],
+    span: dict[str, Any],
+) -> float:
+    expected_words = max(1, word_count(line["line"]))
+    expected_seconds = max(0.35, expected_words / 2.7)
+    observed_seconds = max(
+        0.05,
+        float(span["end_seconds"]) - float(span["start_seconds"]),
+    )
+    duration_ratio = observed_seconds / expected_seconds
+    distance = abs(math.log(max(0.05, duration_ratio)))
+    return 100.0 * math.exp(-distance / 1.25)
+
+
+def _order_hint(
+    *,
+    segment_index: int,
+    segment_count: int,
+    line_index: int,
+    line_count: int,
+) -> float:
+    segment_position = segment_index / max(1, segment_count - 1)
+    line_position = line_index / max(1, line_count - 1)
+    return max(0.0, 1.0 - abs(segment_position - line_position))
+
+
+def order_independent_align(
+    segments: list[dict[str, Any]],
+    lines: list[dict[str, Any]],
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Match non-overlapping audio spans without requiring script order.
+
+    Each selected span has one primary line plus a small set of alternative
+    line matches. Multiple separate spans may select the same line, which is
+    how repeated takes are represented.
+    """
+
+    if not segments or not lines:
+        return []
+
+    segment_count = len(segments)
+    line_count = len(lines)
+    max_merge = int(settings.get("max_merge_segments", 3))
+    max_gap = float(settings.get("max_merge_gap_seconds", 2.5))
+    max_span = float(settings.get("max_span_seconds", 35.0))
+    minimum_score = max(
+        float(settings.get("path_min_score", 35.0)),
+        float(settings.get("candidate_min_score", 45.0)),
+    )
+    top_k = max(1, int(settings.get("candidate_top_k", 5)))
+    noise_penalty = float(settings.get("noise_penalty", 2.2))
+    merge_penalty = float(settings.get("merge_span_penalty", 0.2))
+    duration_weight = float(settings.get("duration_hint_weight", 1.0))
+    order_weight = float(settings.get("order_hint_weight", 0.0))
+
+    proposals_by_start: list[list[dict[str, Any]]] = [
+        [] for _ in range(segment_count)
+    ]
+    for segment_index in range(segment_count):
+        for count in range(1, max_merge + 1):
+            if not _valid_span(
+                segments,
+                segment_index,
+                count,
+                max_merge_gap_seconds=max_gap,
+                max_span_seconds=max_span,
+            ):
+                break
+            span = _span_preview(segments, segment_index, count)
+            line_matches = []
+            for line_index, line in enumerate(lines):
+                match_score = text_similarity(line["line"], span["transcript"])
+                duration_score = _duration_plausibility(line, span)
+                order_score = _order_hint(
+                    segment_index=segment_index,
+                    segment_count=segment_count,
+                    line_index=line_index,
+                    line_count=line_count,
+                )
+                ranking_score = (
+                    match_score
+                    + duration_weight * ((duration_score - 50.0) / 50.0)
+                    + order_weight * order_score
+                )
+                line_matches.append(
+                    {
+                        "line_index": line_index,
+                        "match_score": match_score,
+                        "ranking_score": ranking_score,
+                        "duration_plausibility": duration_score,
+                        "order_hint": order_score,
+                    }
+                )
+            line_matches.sort(
+                key=lambda match: (
+                    match["ranking_score"],
+                    match["match_score"],
+                    -match["line_index"],
+                ),
+                reverse=True,
+            )
+            primary = line_matches[0]
+            if primary["match_score"] < minimum_score:
+                continue
+            proposal = {
+                "type": "assigned",
+                "start_index": segment_index,
+                "count": count,
+                "line_index": primary["line_index"],
+                "match_score": primary["match_score"],
+                "transcript": span["transcript"],
+                "duration_plausibility": primary["duration_plausibility"],
+                "order_hint": primary["order_hint"],
+                "top_matches": [
+                    match
+                    for match in line_matches[:top_k]
+                    if match["match_score"] >= minimum_score
+                ],
+            }
+            proposal["path_utility"] = (
+                (primary["ranking_score"] - 50.0) / 5.0
+                - merge_penalty * (count - 1)
+            )
+            proposals_by_start[segment_index].append(proposal)
+
+    best_scores = [0.0] * (segment_count + 1)
+    choices: list[dict[str, Any] | None] = [None] * segment_count
+    for segment_index in range(segment_count - 1, -1, -1):
+        best_score = best_scores[segment_index + 1] - noise_penalty
+        best_choice = None
+        for proposal in proposals_by_start[segment_index]:
+            next_index = segment_index + int(proposal["count"])
+            proposal_score = float(proposal["path_utility"]) + best_scores[next_index]
+            if proposal_score > best_score:
+                best_score = proposal_score
+                best_choice = proposal
+        best_scores[segment_index] = best_score
+        choices[segment_index] = best_choice
+
+    selected = []
+    segment_index = 0
+    while segment_index < segment_count:
+        choice = choices[segment_index]
+        if choice is None:
+            segment_index += 1
+            continue
+        selected.append(choice)
+        segment_index += int(choice["count"])
+    return selected
+
+
+def _expand_alignment_actions(
+    actions: list[dict[str, Any]],
+    *,
+    base_segments: list[dict[str, Any]],
+    session_id: str,
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
+    take_group_gap = float(settings.get("take_group_gap_seconds", 12.0))
+    group_number = 0
+    previous_primary: dict[str, Any] | None = None
+    expanded = []
+
+    for action in actions:
+        primary_line_index = int(action["line_index"])
+        start_index = int(action["start_index"])
+        count = int(action["count"])
+        start_seconds = float(base_segments[start_index]["start_seconds"])
+        end_seconds = float(
+            base_segments[start_index + count - 1]["end_seconds"]
+        )
+        if (
+            previous_primary is not None
+            and int(previous_primary["line_index"]) == primary_line_index
+            and start_seconds - float(previous_primary["end_seconds"])
+            <= take_group_gap
+        ):
+            take_group_id = str(previous_primary["take_group_id"])
+        else:
+            group_number += 1
+            take_group_id = f"{session_id}__g{group_number:05d}"
+        previous_primary = {
+            "line_index": primary_line_index,
+            "end_seconds": end_seconds,
+            "take_group_id": take_group_id,
+        }
+
+        matches = action.get("top_matches") or [
+            {
+                "line_index": primary_line_index,
+                "match_score": action["match_score"],
+                "duration_plausibility": action.get(
+                    "duration_plausibility", 0.0
+                ),
+                "order_hint": action.get("order_hint", 0.0),
+            }
+        ]
+        for match_rank, match in enumerate(matches, start=1):
+            expanded.append(
+                {
+                    "type": "assigned",
+                    "start_index": start_index,
+                    "count": count,
+                    "line_index": int(match["line_index"]),
+                    "match_score": float(match["match_score"]),
+                    "transcript": action["transcript"],
+                    "duration_plausibility": float(
+                        match.get("duration_plausibility", 0.0)
+                    ),
+                    "order_hint": float(match.get("order_hint", 0.0)),
+                    "segment_match_rank": match_rank,
+                    "is_primary_match": match_rank == 1,
+                    "take_group_id": (
+                        take_group_id if match_rank == 1 else None
+                    ),
+                }
+            )
+    return expanded
+
+
 def _candidate_reliability(
     *,
     line: dict[str, Any],
     match_score: float,
     margin: float,
     settings: dict[str, Any],
+    observed: str | None = None,
+    duplicate_text: bool = False,
 ) -> tuple[bool, str]:
     if is_nonverbal_script(line["line"]):
         return False, "NONVERBAL_SCRIPT"
+    if (
+        observed
+        and not duplicate_text
+        and normalize_text(line["line"]) == normalize_text(observed)
+    ):
+        return True, ""
     if word_count(line["line"]) <= 3:
         minimum_score = float(settings.get("short_line_min_score", 88.0))
         minimum_margin = float(settings.get("short_line_min_margin", 15.0))
@@ -296,6 +544,12 @@ def align_project(
     source_data = load_source_data(project_dir, project)
     line_by_id = {line["line_id"]: line for line in source_data["lines"]}
     settings = dict(project.get("alignment") or {})
+    alignment_mode = str(settings.get("mode", "unordered")).strip().lower()
+    if alignment_mode not in {"unordered", "sequence"}:
+        raise ValueError(
+            "alignment.mode must be either 'unordered' or 'sequence', "
+            f"got {alignment_mode!r}"
+        )
     manifest_session_by_id = {
         entry["session_id"]: entry for entry in manifest["sessions"]
     }
@@ -320,12 +574,33 @@ def align_project(
         session_lines = lines_for_session(source_data, session)
         if not session_lines:
             continue
+        normalized_line_counts = Counter(
+            normalize_text(line["line"]) for line in session_lines
+        )
         print(
             f"[align {session_index}] {session['id']}: "
-            f"{len(base_segments)} segments → {len(session_lines)} lines",
+            f"{len(base_segments)} segments → {len(session_lines)} lines "
+            f"({alignment_mode})",
             flush=True,
         )
-        actions = sequence_align(base_segments, session_lines, settings)
+        if alignment_mode == "sequence":
+            primary_actions = sequence_align(
+                base_segments,
+                session_lines,
+                settings,
+            )
+        else:
+            primary_actions = order_independent_align(
+                base_segments,
+                session_lines,
+                settings,
+            )
+        actions = _expand_alignment_actions(
+            primary_actions,
+            base_segments=base_segments,
+            session_id=session["id"],
+            settings=settings,
+        )
         reliable_coverage: set[int] = set()
         assignment_by_base: dict[int, list[dict[str, Any]]] = defaultdict(list)
         serialized_actions = []
@@ -355,12 +630,24 @@ def align_project(
                 match_score=action["match_score"],
                 margin=margin,
                 settings=settings,
+                observed=segment.get("transcript", ""),
+                duplicate_text=(
+                    normalized_line_counts[normalize_text(line["line"])] > 1
+                ),
             )
+            if not action.get("is_primary_match", True):
+                reliable = False
+                reason = "SEGMENT_BETTER_MATCH_ELSEWHERE"
             technical_score = _technical_score(segment)
             selection_score = (
                 action["match_score"]
                 + 0.10 * technical_score
                 + 5.0 * float(segment.get("asr_probability") or 0.0)
+                + (
+                    float(settings.get("primary_match_bonus", 2.0))
+                    if action.get("is_primary_match", True)
+                    else 0.0
+                )
             )
             candidate = {
                 "line_id": line["line_id"],
@@ -380,6 +667,18 @@ def align_project(
                 "duration_seconds": segment["metrics"]["duration_seconds"],
                 "asr_probability": segment.get("asr_probability"),
                 "base_indices": segment["base_indices"],
+                "alignment_mode": alignment_mode,
+                "is_primary_match": bool(
+                    action.get("is_primary_match", True)
+                ),
+                "segment_match_rank": int(
+                    action.get("segment_match_rank", 1)
+                ),
+                "take_group_id": action.get("take_group_id"),
+                "duration_plausibility": float(
+                    action.get("duration_plausibility", 0.0)
+                ),
+                "order_hint": float(action.get("order_hint", 0.0)),
             }
             if action["match_score"] >= float(
                 settings.get("candidate_min_score", 45.0)
@@ -436,6 +735,7 @@ def align_project(
         alignment_sessions.append(
             {
                 "session_id": session["id"],
+                "alignment_mode": alignment_mode,
                 "script_line_count": len(session_lines),
                 "base_segment_count": len(base_segments),
                 "assignments": serialized_actions,
@@ -614,6 +914,11 @@ def _write_review_workbook(
         "Technical Score",
         "Reliable",
         "Reliability Reason",
+        "Alignment Mode",
+        "Primary Match",
+        "Segment Match Rank",
+        "Take Group",
+        "Duration Plausibility",
         "Source WAV",
         "Start Seconds",
         "End Seconds",
@@ -648,6 +953,11 @@ def _write_review_workbook(
                 candidate["technical_score"],
                 candidate["reliable"],
                 candidate["reliability_reason"],
+                candidate.get("alignment_mode", "sequence"),
+                candidate.get("is_primary_match", True),
+                candidate.get("segment_match_rank", 1),
+                candidate.get("take_group_id") or "",
+                candidate.get("duration_plausibility", 0.0),
                 candidate["source_audio"],
                 candidate["start_seconds"],
                 candidate["end_seconds"],

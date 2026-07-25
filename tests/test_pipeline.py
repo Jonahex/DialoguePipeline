@@ -9,8 +9,10 @@ import numpy as np
 from openpyxl import load_workbook
 
 from dialogue_pipeline.alignment import (
+    _candidate_reliability,
     _write_review_workbook,
     align_project,
+    order_independent_align,
     sequence_align,
     text_similarity,
 )
@@ -160,6 +162,90 @@ def test_text_similarity_and_repeated_take_alignment() -> None:
     actions = sequence_align(segments, lines, settings)
     assert [action["line_index"] for action in actions] == [0, 0, 1, 2]
     assert text_similarity("Where are you going?", "where are you going") > 95
+
+
+def test_order_independent_alignment_handles_reordered_lines_and_takes() -> None:
+    lines = [
+        {"line_id": "a", "line": "Hello there."},
+        {"line_id": "b", "line": "Where are you going?"},
+        {"line_id": "c", "line": "Goodbye friend."},
+    ]
+    segments = [
+        {
+            "start_seconds": 0.0,
+            "end_seconds": 1.0,
+            "transcript": "Goodbye friend.",
+            "asr_probability": 0.98,
+        },
+        {
+            "start_seconds": 1.5,
+            "end_seconds": 2.5,
+            "transcript": "Hello there.",
+            "asr_probability": 0.95,
+        },
+        {
+            "start_seconds": 3.0,
+            "end_seconds": 4.0,
+            "transcript": "Goodbye friend!",
+            "asr_probability": 0.97,
+        },
+        {
+            "start_seconds": 4.5,
+            "end_seconds": 5.8,
+            "transcript": "Where are you going?",
+            "asr_probability": 0.96,
+        },
+    ]
+    settings = {
+        "max_merge_segments": 2,
+        "max_merge_gap_seconds": 2.0,
+        "max_span_seconds": 20.0,
+        "path_min_score": 35.0,
+        "candidate_min_score": 45.0,
+        "candidate_top_k": 3,
+        "noise_penalty": 2.2,
+        "duration_hint_weight": 1.0,
+        "order_hint_weight": 0.0,
+    }
+
+    actions = order_independent_align(segments, lines, settings)
+
+    assert [action["line_index"] for action in actions] == [2, 0, 2, 1]
+    assert all(
+        action["top_matches"][0]["line_index"] == action["line_index"]
+        for action in actions
+    )
+
+
+def test_text_similarity_handles_reordered_and_repeated_take_text() -> None:
+    assert text_similarity("Good afternoon.", "Afternoon Good") > 88
+    assert text_similarity("Take this!", "This Take This") > 88
+    assert text_similarity("Run away! Run away!", "Runaway Runaway") >= 72
+
+
+def test_exact_short_match_is_reliable_unless_script_text_is_duplicated() -> None:
+    settings = {
+        "short_line_min_score": 88.0,
+        "short_line_min_margin": 15.0,
+    }
+    line = {"line": "Goodbye."}
+
+    assert _candidate_reliability(
+        line=line,
+        match_score=100.0,
+        margin=5.0,
+        settings=settings,
+        observed="Goodbye",
+        duplicate_text=False,
+    ) == (True, "")
+    assert _candidate_reliability(
+        line=line,
+        match_score=100.0,
+        margin=5.0,
+        settings=settings,
+        observed="Goodbye",
+        duplicate_text=True,
+    ) == (False, "SHORT_LINE_AMBIGUOUS")
 
 
 def test_sample_accurate_cut_and_finalize(tmp_path: Path) -> None:

@@ -33,6 +33,7 @@ from dialogue_pipeline.segmentation import (
 )
 from dialogue_pipeline.transcription import (
     transcribe_candidate_span,
+    transcribe_project,
     transcribe_segments_project,
 )
 from dialogue_pipeline.util import (
@@ -1133,6 +1134,218 @@ def test_segment_asr_transcribes_empty_base_clip_without_vad_and_caches(
         runtime={},
     )
     assert len(calls) == 1
+
+
+def test_segment_asr_batches_independent_clips_with_configured_size(
+    tmp_path: Path,
+) -> None:
+    segment_records = []
+    for index in range(3):
+        segment_file = tmp_path / f"segment_{index}.wav"
+        _write_tone(segment_file, duration_seconds=0.5)
+        segment_records.append(
+            {
+                "segment_id": f"session__s{index + 1:05d}",
+                "kind": "base",
+                "file": segment_file.name,
+                "source_sha256": "source-hash",
+                "start_sample": index * 24000,
+                "end_sample": (index + 1) * 24000,
+                "start_seconds": index * 0.5,
+                "end_seconds": (index + 1) * 0.5,
+                "transcript": "",
+                "words": [],
+                "word_count": 0,
+                "asr_probability": None,
+                "metrics": {"duration_seconds": 0.5},
+            }
+        )
+    line = {
+        "line_id": "Actor::R2",
+        "sheet": "Actor",
+        "sheet_index": 0,
+        "excel_row": 2,
+        "line": "Hello.",
+    }
+    write_json(tmp_path / "source_lines.json", {"lines": [line]})
+    write_json(
+        tmp_path / "segments_manifest.json",
+        {
+            "sessions": [
+                {
+                    "session_id": "session",
+                    "segments": segment_records,
+                    "derived_segments": [],
+                }
+            ]
+        },
+    )
+    project = {
+        "source_lines": "source_lines.json",
+        "language": "en",
+        "transcription": {
+            "model": "large-v3",
+            "device": "cpu",
+            "compute_type": "int8",
+        },
+        "segment_transcription": {
+            "enabled": True,
+            "batch_size": 2,
+            "prompt_fallback_enabled": False,
+        },
+        "sessions": [
+            {
+                "id": "session",
+                "enabled": True,
+                "sheets": ["Actor"],
+                "excel_rows": [],
+                "line_ids": [],
+            }
+        ],
+    }
+    batch_sizes = []
+
+    class FakeBatchedModel:
+        def transcribe(self, _audio, **kwargs):
+            clips = kwargs["clip_timestamps"]
+            batch_sizes.append(kwargs["batch_size"])
+            decoded = []
+            for index, clip in enumerate(clips):
+                start = clip["start"]
+                decoded.append(
+                    SimpleNamespace(
+                        start=start + 0.05,
+                        end=start + 0.35,
+                        text=f"Hello {index + 1}",
+                        avg_logprob=-0.1,
+                        no_speech_prob=0.01,
+                        words=[
+                            SimpleNamespace(
+                                start=start + 0.05,
+                                end=start + 0.25,
+                                word=" Hello",
+                                probability=0.95,
+                            )
+                        ],
+                    )
+                )
+            return iter(decoded), SimpleNamespace(language="en")
+
+    runtime = {
+        "model": SimpleNamespace(
+            feature_extractor=SimpleNamespace(sampling_rate=16000)
+        ),
+        "batched_model": FakeBatchedModel(),
+    }
+    transcribe_segments_project(
+        project_dir=tmp_path,
+        project=project,
+        runtime=runtime,
+    )
+
+    manifest = read_json(tmp_path / "segments_manifest.json")
+    segments = manifest["sessions"][0]["segments"]
+    assert batch_sizes == [2, 1]
+    assert manifest["segment_transcription"]["batch_size"] == 2
+    assert all(segment["transcript_source"] == "segment_asr" for segment in segments)
+    assert segments[1]["segment_asr"]["primary"]["words"][0]["start"] == pytest.approx(
+        0.05
+    )
+
+
+def test_recording_asr_uses_batched_pipeline_with_default_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "source.wav"
+    _write_tone(audio_path)
+    line = {
+        "line_id": "Actor::R2",
+        "sheet": "Actor",
+        "sheet_index": 0,
+        "excel_row": 2,
+        "line": "Hello.",
+    }
+    write_json(tmp_path / "source_lines.json", {"lines": [line]})
+    write_json(
+        tmp_path / "audio_inventory.json",
+        {
+            "files": [
+                {
+                    "path": str(audio_path.resolve()),
+                    "sha256": "source-hash",
+                }
+            ]
+        },
+    )
+    project = {
+        "source_lines": "source_lines.json",
+        "audio_inventory": "audio_inventory.json",
+        "language": "en",
+        "transcription": {
+            "model": "large-v3",
+            "device": "cpu",
+            "compute_type": "int8",
+        },
+        "sessions": [
+            {
+                "id": "session",
+                "enabled": True,
+                "audio": "source.wav",
+                "sheets": ["Actor"],
+                "excel_rows": [],
+                "line_ids": [],
+            }
+        ],
+    }
+    calls = []
+    fake_segment = SimpleNamespace(
+        id=1,
+        start=0.0,
+        end=0.5,
+        text="Hello",
+        avg_logprob=-0.1,
+        no_speech_prob=0.01,
+        words=[],
+    )
+
+    class FakePipeline:
+        def __init__(self, model):
+            self.model = model
+
+        def transcribe(self, _audio, **kwargs):
+            calls.append(kwargs)
+            return iter([fake_segment]), SimpleNamespace(
+                language="en",
+                language_probability=1.0,
+                duration=1.0,
+                duration_after_vad=1.0,
+            )
+
+    import dialogue_pipeline.transcription as transcription_module
+    import faster_whisper
+
+    monkeypatch.setattr(
+        transcription_module,
+        "_make_model",
+        lambda *_args, **_kwargs: (object(), "cpu", "int8"),
+    )
+    monkeypatch.setattr(
+        faster_whisper,
+        "BatchedInferencePipeline",
+        FakePipeline,
+    )
+    outputs = transcribe_project(
+        project_dir=tmp_path,
+        project=project,
+    )
+
+    assert len(outputs) == 1
+    assert calls[0]["batch_size"] == 16
+    assert calls[0]["without_timestamps"] is False
+    payload = read_json(outputs[0])
+    assert payload["batched_inference"] is True
+    assert payload["batch_size"] == 16
 
 
 def test_prompted_segment_asr_is_evidence_but_cannot_verify_auto_ok(

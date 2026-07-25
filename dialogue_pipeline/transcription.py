@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from rapidfuzz import fuzz
 
 from .project import inventory_by_path, load_source_data
@@ -132,6 +133,15 @@ def _segment_transcription_profile(
                 source_settings.get("beam_size", 5),
             )
         ),
+        "batch_size": max(
+            1,
+            int(
+                settings.get(
+                    "batch_size",
+                    source_settings.get("batch_size", 16),
+                )
+            ),
+        ),
         "condition_on_previous_text": False,
         "vad_filter": False,
     }
@@ -171,14 +181,124 @@ def _ensure_clip_model(
         compute_type=str(profile["compute_type"]),
         download_root=model_root,
     )
+    from faster_whisper import BatchedInferencePipeline
+
     runtime.update(
         {
             "model": model,
+            "batched_model": BatchedInferencePipeline(model=model),
             "device": resolved_device,
             "compute_type": resolved_compute,
             "model_name": str(profile["model"]),
             "requested_identity": identity,
             "model_root": model_root,
+        }
+    )
+
+
+def _decoded_segments_payload(
+    decoded: list[Any],
+    *,
+    info: Any,
+    project: dict[str, Any],
+    runtime: dict[str, Any],
+    prompted: bool,
+    time_offset: float = 0.0,
+) -> dict[str, Any]:
+    transcript_parts: list[str] = []
+    words: list[dict[str, Any]] = []
+    segment_records: list[dict[str, Any]] = []
+    probabilities: list[float] = []
+    for decoded_segment in decoded:
+        text = str(getattr(decoded_segment, "text", "") or "").strip()
+        if text:
+            transcript_parts.append(text)
+        decoded_words = []
+        for decoded_word in getattr(decoded_segment, "words", None) or []:
+            probability = getattr(decoded_word, "probability", None)
+            start = getattr(decoded_word, "start", None)
+            end = getattr(decoded_word, "end", None)
+            word_record = {
+                "start": (
+                    max(0.0, float(start) - time_offset)
+                    if start is not None
+                    else None
+                ),
+                "end": (
+                    max(0.0, float(end) - time_offset)
+                    if end is not None
+                    else None
+                ),
+                "word": str(getattr(decoded_word, "word", "") or ""),
+                "probability": probability,
+            }
+            decoded_words.append(word_record)
+            words.append(word_record)
+            if probability is not None:
+                probabilities.append(float(probability))
+        segment_start = getattr(decoded_segment, "start", None)
+        segment_end = getattr(decoded_segment, "end", None)
+        segment_records.append(
+            {
+                "start": (
+                    max(0.0, float(segment_start) - time_offset)
+                    if segment_start is not None
+                    else None
+                ),
+                "end": (
+                    max(0.0, float(segment_end) - time_offset)
+                    if segment_end is not None
+                    else None
+                ),
+                "text": text,
+                "avg_logprob": getattr(decoded_segment, "avg_logprob", None),
+                "no_speech_prob": getattr(
+                    decoded_segment,
+                    "no_speech_prob",
+                    None,
+                ),
+                "words": decoded_words,
+            }
+        )
+    transcript = " ".join(transcript_parts).strip()
+    return {
+        "transcript": transcript,
+        "word_count": word_count(transcript),
+        "words": words,
+        "asr_probability": (
+            sum(probabilities) / len(probabilities)
+            if probabilities
+            else None
+        ),
+        "segments": segment_records,
+        "language": getattr(info, "language", project.get("language", "en")),
+        "language_probability": getattr(info, "language_probability", None),
+        "model": runtime.get("model_name"),
+        "device": runtime.get("device"),
+        "compute_type": runtime.get("compute_type"),
+        "prompted": prompted,
+    }
+
+
+def _fall_back_clip_runtime_to_cpu(
+    *,
+    profile: dict[str, Any],
+    runtime: dict[str, Any],
+) -> None:
+    model, resolved_device, resolved_compute = _make_model(
+        str(profile["model"]),
+        device="cpu",
+        compute_type="int8",
+        download_root=Path(runtime["model_root"]),
+    )
+    from faster_whisper import BatchedInferencePipeline
+
+    runtime.update(
+        {
+            "model": model,
+            "batched_model": BatchedInferencePipeline(model=model),
+            "device": resolved_device,
+            "compute_type": resolved_compute,
         }
     )
 
@@ -225,74 +345,210 @@ def _decode_clip(
             "continuing on CPU INT8.",
             flush=True,
         )
-        model, resolved_device, resolved_compute = _make_model(
-            str(profile["model"]),
-            device="cpu",
-            compute_type="int8",
-            download_root=Path(runtime["model_root"]),
-        )
-        runtime.update(
-            {
-                "model": model,
-                "device": resolved_device,
-                "compute_type": resolved_compute,
-            }
+        _fall_back_clip_runtime_to_cpu(
+            profile=profile,
+            runtime=runtime,
         )
         decoded, info = run_decode()
 
-    transcript_parts: list[str] = []
-    words: list[dict[str, Any]] = []
-    segment_records: list[dict[str, Any]] = []
-    probabilities: list[float] = []
-    for decoded_segment in decoded:
-        text = str(getattr(decoded_segment, "text", "") or "").strip()
-        if text:
-            transcript_parts.append(text)
-        decoded_words = []
-        for decoded_word in getattr(decoded_segment, "words", None) or []:
-            probability = getattr(decoded_word, "probability", None)
-            word_record = {
-                "start": getattr(decoded_word, "start", None),
-                "end": getattr(decoded_word, "end", None),
-                "word": str(getattr(decoded_word, "word", "") or ""),
-                "probability": probability,
-            }
-            decoded_words.append(word_record)
-            words.append(word_record)
-            if probability is not None:
-                probabilities.append(float(probability))
-        segment_records.append(
-            {
-                "start": getattr(decoded_segment, "start", None),
-                "end": getattr(decoded_segment, "end", None),
-                "text": text,
-                "avg_logprob": getattr(decoded_segment, "avg_logprob", None),
-                "no_speech_prob": getattr(
-                    decoded_segment,
-                    "no_speech_prob",
-                    None,
-                ),
-                "words": decoded_words,
-            }
-        )
-    transcript = " ".join(transcript_parts).strip()
+    return _decoded_segments_payload(
+        decoded,
+        info=info,
+        project=project,
+        runtime=runtime,
+        prompted=bool(prompt),
+    )
+
+
+def _clip_decoding_identity(
+    *,
+    project: dict[str, Any],
+    profile: dict[str, Any],
+    prompt: str | None,
+) -> dict[str, Any]:
     return {
-        "transcript": transcript,
-        "word_count": word_count(transcript),
-        "words": words,
-        "asr_probability": (
-            sum(probabilities) / len(probabilities)
-            if probabilities
-            else None
-        ),
-        "segments": segment_records,
-        "language": getattr(info, "language", project.get("language", "en")),
-        "language_probability": getattr(info, "language_probability", None),
-        "model": runtime.get("model_name"),
-        "device": runtime.get("device"),
-        "compute_type": runtime.get("compute_type"),
-        "prompted": bool(prompt),
+        "model": profile["model"],
+        "device_request": profile["device"],
+        "compute_type_request": profile["compute_type"],
+        "language": project.get("language", "en"),
+        "beam_size": int(profile.get("beam_size", 5)),
+        "batch_size": int(profile.get("batch_size", 16)),
+        "condition_on_previous_text": False,
+        "vad_filter": False,
+        "prompt": prompt or "",
     }
+
+
+def _clip_cache_key(
+    *,
+    cache_identity: dict[str, Any],
+    decoding_identity: dict[str, Any],
+) -> str:
+    return stable_hash(
+        {
+            **cache_identity,
+            "decoding": decoding_identity,
+        }
+    )
+
+
+def _cached_clip_payload(
+    *,
+    cache_path: Path,
+    cache_key: str,
+    force: bool,
+) -> dict[str, Any] | None:
+    if not cache_path.is_file() or force:
+        return None
+    cached = read_json(cache_path)
+    return cached if cached.get("cache_key") == cache_key else None
+
+
+def _clip_payload(
+    *,
+    cache_key: str,
+    cache_identity: dict[str, Any],
+    decoding_identity: dict[str, Any],
+    decoded: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "cache_key": cache_key,
+        "cache_identity": cache_identity,
+        "decoding": decoding_identity,
+        **decoded,
+    }
+
+
+def _decode_clips_batched(
+    *,
+    audio_paths: list[Path],
+    project: dict[str, Any],
+    profile: dict[str, Any],
+    runtime: dict[str, Any],
+    prompt: str | None = None,
+) -> list[dict[str, Any]]:
+    if not audio_paths:
+        return []
+    # Injected test/custom runtimes can expose only WhisperModel.transcribe.
+    # The production runtime always has BatchedInferencePipeline.
+    if runtime.get("batched_model") is None:
+        return [
+            _decode_clip(
+                audio_path=audio_path,
+                project=project,
+                profile=profile,
+                runtime=runtime,
+                prompt=prompt,
+            )
+            for audio_path in audio_paths
+        ]
+
+    from faster_whisper.audio import decode_audio
+
+    sampling_rate = int(runtime["model"].feature_extractor.sampling_rate)
+    waveforms = [
+        decode_audio(str(audio_path), sampling_rate=sampling_rate)
+        for audio_path in audio_paths
+    ]
+    offsets: list[tuple[int, int]] = []
+    cursor = 0
+    for waveform in waveforms:
+        start = cursor
+        cursor += int(waveform.shape[0])
+        offsets.append((start, cursor))
+    combined = (
+        np.concatenate(waveforms)
+        if waveforms
+        else np.empty((0,), dtype=np.float32)
+    )
+    clip_timestamps = [
+        {
+            "start": start / sampling_rate,
+            "end": end / sampling_rate,
+        }
+        for start, end in offsets
+    ]
+    kwargs: dict[str, Any] = {
+        "language": project.get("language", "en"),
+        "beam_size": int(profile.get("beam_size", 5)),
+        "batch_size": min(
+            len(audio_paths),
+            int(profile.get("batch_size", 16)),
+        ),
+        "word_timestamps": True,
+        "without_timestamps": False,
+        "condition_on_previous_text": False,
+        "vad_filter": False,
+        "clip_timestamps": clip_timestamps,
+    }
+    if prompt:
+        kwargs["initial_prompt"] = prompt
+        kwargs["hotwords"] = prompt
+
+    def run_decode() -> tuple[list[Any], Any]:
+        segments_iter, info = runtime["batched_model"].transcribe(
+            combined,
+            **kwargs,
+        )
+        return list(segments_iter), info
+
+    try:
+        decoded, info = run_decode()
+    except Exception as error:
+        if (
+            runtime.get("device") != "cuda"
+            or str(profile.get("device", "auto")) != "auto"
+        ):
+            raise
+        print(
+            f"[segment ASR] CUDA batched inference failed ({error}); "
+            "continuing on CPU INT8.",
+            flush=True,
+        )
+        _fall_back_clip_runtime_to_cpu(
+            profile=profile,
+            runtime=runtime,
+        )
+        decoded, info = run_decode()
+
+    decoded_by_clip: list[list[Any]] = [[] for _ in audio_paths]
+    offset_seconds = [
+        (start / sampling_rate, end / sampling_rate)
+        for start, end in offsets
+    ]
+    for decoded_segment in decoded:
+        start = float(getattr(decoded_segment, "start", 0.0) or 0.0)
+        end = float(getattr(decoded_segment, "end", start) or start)
+        midpoint = (start + end) / 2.0
+        clip_index = next(
+            (
+                index
+                for index, (clip_start, clip_end) in enumerate(offset_seconds)
+                if (
+                    clip_start <= midpoint < clip_end
+                    or (
+                        index == len(offset_seconds) - 1
+                        and midpoint == clip_end
+                    )
+                )
+            ),
+            None,
+        )
+        if clip_index is not None:
+            decoded_by_clip[clip_index].append(decoded_segment)
+
+    return [
+        _decoded_segments_payload(
+            clip_decoded,
+            info=info,
+            project=project,
+            runtime=runtime,
+            prompted=bool(prompt),
+            time_offset=offset_seconds[index][0],
+        )
+        for index, clip_decoded in enumerate(decoded_by_clip)
+    ]
 
 
 def transcribe_clip_cached(
@@ -307,26 +563,22 @@ def transcribe_clip_cached(
     prompt: str | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    decoding_identity = {
-        "model": profile["model"],
-        "device_request": profile["device"],
-        "compute_type_request": profile["compute_type"],
-        "language": project.get("language", "en"),
-        "beam_size": int(profile.get("beam_size", 5)),
-        "condition_on_previous_text": False,
-        "vad_filter": False,
-        "prompt": prompt or "",
-    }
-    cache_key = stable_hash(
-        {
-            **cache_identity,
-            "decoding": decoding_identity,
-        }
+    decoding_identity = _clip_decoding_identity(
+        project=project,
+        profile=profile,
+        prompt=prompt,
     )
-    if cache_path.is_file() and not force:
-        cached = read_json(cache_path)
-        if cached.get("cache_key") == cache_key:
-            return cached
+    cache_key = _clip_cache_key(
+        cache_identity=cache_identity,
+        decoding_identity=decoding_identity,
+    )
+    cached = _cached_clip_payload(
+        cache_path=cache_path,
+        cache_key=cache_key,
+        force=force,
+    )
+    if cached:
+        return cached
 
     _ensure_clip_model(
         project_dir=project_dir,
@@ -334,20 +586,19 @@ def transcribe_clip_cached(
         profile=profile,
         runtime=runtime,
     )
-    decoded = _decode_clip(
-        audio_path=audio_path,
+    decoded = _decode_clips_batched(
+        audio_paths=[audio_path],
         project=project,
         profile=profile,
         runtime=runtime,
         prompt=prompt,
+    )[0]
+    payload = _clip_payload(
+        cache_key=cache_key,
+        cache_identity=cache_identity,
+        decoding_identity=decoding_identity,
+        decoded=decoded,
     )
-    payload = {
-        "schema_version": 1,
-        "cache_key": cache_key,
-        "cache_identity": cache_identity,
-        "decoding": decoding_identity,
-        **decoded,
-    }
     write_json(cache_path, payload)
     return payload
 
@@ -513,12 +764,17 @@ def transcribe_segments_project(
                 or segment["segment_id"] in segment_filter
             )
         ]
+        if segment_filter and not base_segments:
+            continue
         print(
             f"[segment ASR] {session['id']}: "
-            f"{len(base_segments)} independent clips",
+            f"{len(base_segments)} independent clips "
+            f"(batch size {profile['batch_size']})",
             flush=True,
         )
-        for index, segment in enumerate(base_segments, start=1):
+        primary_entries: list[dict[str, Any]] = []
+        pending_entries: list[dict[str, Any]] = []
+        for segment in base_segments:
             audio_path = resolve_project_path(project_dir, segment["file"])
             cache_identity = {
                 "kind": "base_segment",
@@ -530,23 +786,70 @@ def transcribe_segments_project(
                 "export": project.get("export") or {},
             }
             cache_path = cache_root / f"{segment['segment_id']}.json"
-            previous_key = (
-                (segment.get("segment_asr") or {})
-                .get("primary", {})
-                .get("cache_key")
-            )
-            primary = transcribe_clip_cached(
-                project_dir=project_dir,
+            decoding_identity = _clip_decoding_identity(
                 project=project,
-                audio_path=audio_path,
-                cache_path=cache_path,
-                cache_identity=cache_identity,
                 profile=profile,
-                runtime=runtime,
+                prompt=None,
+            )
+            cache_key = _clip_cache_key(
+                cache_identity=cache_identity,
+                decoding_identity=decoding_identity,
+            )
+            primary = _cached_clip_payload(
+                cache_path=cache_path,
+                cache_key=cache_key,
                 force=force,
             )
-            if previous_key and previous_key == primary.get("cache_key") and not force:
+            entry = {
+                "segment": segment,
+                "audio_path": audio_path,
+                "cache_path": cache_path,
+                "cache_identity": cache_identity,
+                "decoding_identity": decoding_identity,
+                "cache_key": cache_key,
+                "primary": primary,
+            }
+            primary_entries.append(entry)
+            if primary:
                 cached += 1
+            else:
+                pending_entries.append(entry)
+
+        if pending_entries:
+            _ensure_clip_model(
+                project_dir=project_dir,
+                project=project,
+                profile=profile,
+                runtime=runtime,
+            )
+        batch_size = int(profile.get("batch_size", 16))
+        for batch_start in range(0, len(pending_entries), batch_size):
+            batch = pending_entries[batch_start : batch_start + batch_size]
+            decoded_batch = _decode_clips_batched(
+                audio_paths=[entry["audio_path"] for entry in batch],
+                project=project,
+                profile=profile,
+                runtime=runtime,
+            )
+            for entry, decoded in zip(batch, decoded_batch):
+                primary = _clip_payload(
+                    cache_key=entry["cache_key"],
+                    cache_identity=entry["cache_identity"],
+                    decoding_identity=entry["decoding_identity"],
+                    decoded=decoded,
+                )
+                write_json(entry["cache_path"], primary)
+                entry["primary"] = primary
+
+        for index, entry in enumerate(primary_entries, start=1):
+            segment = entry["segment"]
+            audio_path = entry["audio_path"]
+            cache_identity = entry["cache_identity"]
+            primary = entry["primary"]
+            if primary is None:
+                raise RuntimeError(
+                    f"Missing batched transcript for {segment['segment_id']}"
+                )
 
             transcript = str(primary.get("transcript") or "").strip()
             probability = primary.get("asr_probability")
@@ -619,6 +922,7 @@ def transcribe_segments_project(
         "model": profile["model"],
         "device": runtime.get("device", profile["device"]),
         "compute_type": runtime.get("compute_type", profile["compute_type"]),
+        "batch_size": profile["batch_size"],
         "processed_segment_count": processed,
         "manifest_cache_hits": cached,
         "prompted_fallback_count": prompted_count,
@@ -693,6 +997,7 @@ def transcribe_project(
     model_name = model_override or settings.get("model", "large-v3")
     device = device_override or settings.get("device", "auto")
     compute_type = settings.get("compute_type", "auto")
+    batch_size = max(1, int(settings.get("batch_size", 16)))
     model_root = resolve_model_cache_root(project_dir, settings)
     model_root.mkdir(parents=True, exist_ok=True)
     transcript_dir = project_dir / "transcripts"
@@ -708,6 +1013,7 @@ def transcribe_project(
         raise ValueError("No enabled sessions matched the requested filter.")
 
     model = None
+    batched_model = None
     resolved_device = device
     resolved_compute = compute_type
     written = []
@@ -732,6 +1038,8 @@ def transcribe_project(
             "device_request": device,
             "compute_type_request": compute_type,
             "language": project.get("language", "en"),
+            "batched_inference": True,
+            "batch_size": batch_size,
             "settings": settings,
         }
         cache_key = stable_hash(cache_key_data)
@@ -756,6 +1064,9 @@ def transcribe_project(
                 compute_type=compute_type,
                 download_root=model_root,
             )
+            from faster_whisper import BatchedInferencePipeline
+
+            batched_model = BatchedInferencePipeline(model=model)
 
         print(
             f"[transcribe {index}/{len(sessions)}] {session['id']} "
@@ -766,6 +1077,8 @@ def transcribe_project(
             "language": project.get("language", "en"),
             "beam_size": int(settings.get("beam_size", 5)),
             "word_timestamps": True,
+            "without_timestamps": False,
+            "batch_size": batch_size,
             "condition_on_previous_text": bool(
                 settings.get("condition_on_previous_text", False)
             ),
@@ -781,7 +1094,10 @@ def transcribe_project(
             kwargs["hotwords"] = hotwords
 
         try:
-            segments_iter, info = model.transcribe(str(audio_path), **kwargs)
+            segments_iter, info = batched_model.transcribe(
+                str(audio_path),
+                **kwargs,
+            )
             segment_records = []
             for segment in segments_iter:
                 words = [
@@ -817,7 +1133,13 @@ def transcribe_project(
                 compute_type="int8",
                 download_root=model_root,
             )
-            segments_iter, info = model.transcribe(str(audio_path), **kwargs)
+            from faster_whisper import BatchedInferencePipeline
+
+            batched_model = BatchedInferencePipeline(model=model)
+            segments_iter, info = batched_model.transcribe(
+                str(audio_path),
+                **kwargs,
+            )
             segment_records = [
                 {
                     "id": segment.id,
@@ -848,6 +1170,8 @@ def transcribe_project(
             "model": model_name,
             "device": resolved_device,
             "compute_type": resolved_compute,
+            "batched_inference": True,
+            "batch_size": batch_size,
             "language": info.language,
             "language_probability": info.language_probability,
             "duration_seconds": info.duration,

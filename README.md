@@ -53,6 +53,8 @@ user-level cache shown by `doctor` (on Windows, normally
 `%LOCALAPPDATA%\DialogueVAPipeline\models`). Set
 `DIALOGUE_VA_MODEL_CACHE` to choose a different shared location, or set
 `transcription.model_cache` in `project.json` for an explicit project override.
+Recording transcription uses batched inference; configure
+`transcription.batch_size` (default `16`) according to available GPU memory.
 Use `--device cpu` when the CUDA 12/cuDNN 9 runtime is unavailable. For a quick
 experiment, override the model:
 
@@ -94,6 +96,11 @@ the recording-level transcript was empty. Segment decoding always uses
 previous take cannot reorder a short phrase and Whisper VAD cannot discard
 clips such as "Yes?". The segment files already contain the configured
 pre/post padding from segmentation.
+
+Independent clips are decoded in batches for substantially better accelerator
+utilization. Configure the number of clips per inference batch with
+`segment_transcription.batch_size`; the default is `16`. Reduce it if GPU
+memory is insufficient.
 
 Unprompted clip ASR is the canonical evidence. When it is empty, low-confidence,
 or has poor ordered similarity, a second script-prompted decode may be stored

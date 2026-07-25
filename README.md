@@ -127,13 +127,15 @@ non-quiet audio with no transcript is kept for review with reason
 
 Multi-sentence lines also use clause-level completeness. Every clause separated
 by `.`, `?`, or `!` must reach `reliable_min_clause_score`, otherwise the
-candidate stays in review with reason `MISSING_SENTENCE`. When successive
-segments assigned to the same line represent successive clauses,
-`fragment_join_enabled` creates an additional full-span candidate. The join is
-accepted only when whole-line similarity, weakest-clause fidelity, and ordered
-similarity improve by the configured `fragment_join_*` thresholds. Original
-fragments remain in the candidate list, and the review workbook shows clause
-and join diagnostics.
+candidate stays in review with reason `MISSING_SENTENCE`; clauses in the wrong
+order receive `SENTENCE_ORDER_MISMATCH`. When a line is split, the fragment
+joiner searches contiguous base-segment windows, including fragments the global
+resolver did not select. It reconstructs each span transcript from the
+session-level Whisper word timestamps, which recovers words straddling a left
+cut boundary. Textless first or last segments are rejected, so a duration hint
+cannot extend a candidate with an empty segment. The join is accepted only when
+whole-line similarity, weakest-clause fidelity, order, and precision pass the
+configured `fragment_join_*` thresholds. Original fragments remain available.
 
 Repeated takes are blocked from `AUTO_OK` by three complementary checks:
 repeated transcript words reduce token precision, merged spans with voiced but

@@ -404,6 +404,30 @@ def test_missing_sentence_prevents_auto_acceptance(
     ) == (False, "MISSING_SENTENCE")
 
 
+def test_reordered_sentences_prevent_auto_acceptance() -> None:
+    expected = (
+        "Hmm... I don't suppose we'll be able to count myself among that "
+        "latter group. Tell me, how goes the war?"
+    )
+    observed = (
+        "Tell me how goes the war Hmm I don't suppose we'll be able to "
+        "count myself among that latter group"
+    )
+
+    sentence = sentence_fidelity(expected, observed)
+
+    assert sentence["missing_clause_count"] == 0
+    assert sentence["clauses_in_order"] is False
+    assert _candidate_reliability(
+        line={"line": expected},
+        match_score=94.0,
+        margin=40.0,
+        settings={},
+        observed=observed,
+        duration_plausibility=70.0,
+    ) == (False, "SENTENCE_ORDER_MISMATCH")
+
+
 def test_adjacent_sentence_fragments_create_complete_take_candidates() -> None:
     line_text = (
         "You've been avoiding the sun, haven't you? "
@@ -464,6 +488,217 @@ def test_adjacent_sentence_fragments_create_complete_take_candidates() -> None:
         == 0
         for action in joined
     )
+
+
+def test_fragment_join_uses_shortest_text_bounded_span() -> None:
+    line_text = (
+        "Slow, but picking up. Lost a lot of good customers when Darius "
+        "let half his workers go."
+    )
+    lines = [{"line_id": "line", "line": line_text}]
+    segments = [
+        {
+            "start_seconds": 0.0,
+            "end_seconds": 1.5,
+            "transcript": "Slow but picking up",
+            "asr_probability": 0.95,
+        },
+        {
+            "start_seconds": 1.8,
+            "end_seconds": 5.0,
+            "transcript": (
+                "Lost a lot of good customers when Darius let half his "
+                "workers go"
+            ),
+            "asr_probability": 0.95,
+        },
+        {
+            "start_seconds": 5.3,
+            "end_seconds": 6.0,
+            "transcript": "",
+            "asr_probability": None,
+        },
+    ]
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": 0,
+            "count": 1,
+            "line_index": 0,
+            "match_score": text_similarity(
+                line_text,
+                segments[0]["transcript"],
+            ),
+            "transcript": segments[0]["transcript"],
+            "duration_plausibility": 50.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        },
+        {
+            "type": "assigned",
+            "start_index": 1,
+            "count": 2,
+            "line_index": 0,
+            "match_score": text_similarity(
+                line_text,
+                segments[1]["transcript"],
+            ),
+            "transcript": segments[1]["transcript"],
+            "duration_plausibility": 80.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        },
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_segments": 3,
+            "fragment_join_max_segments": 3,
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+    )
+
+    assert [(action["start_index"], action["count"]) for action in joined] == [
+        (0, 2)
+    ]
+
+
+def test_fragment_join_recovers_unselected_preceding_sentence_from_word_span() -> None:
+    line_text = (
+        "Some old sailor superstition, maybe. Taunting death. "
+        "Seems more like tempting fate, but what would I know? "
+        "I've never been one for the sea."
+    )
+    lines = [{"line_id": "line", "line": line_text}]
+    segments = [
+        {
+            "start_seconds": 0.0,
+            "end_seconds": 1.0,
+            "transcript": "Old sailor superstition maybe",
+            "asr_probability": 0.95,
+        },
+        {
+            "start_seconds": 1.2,
+            "end_seconds": 2.0,
+            "transcript": "Death Seems",
+            "asr_probability": 0.95,
+        },
+        {
+            "start_seconds": 2.2,
+            "end_seconds": 5.0,
+            "transcript": (
+                "More like tempting fate but what would I know "
+                "I've never been one for the sea"
+            ),
+            "asr_probability": 0.95,
+        },
+    ]
+    normalized_words = line_text.translate(
+        str.maketrans({".": "", ",": "", "?": ""})
+    ).split()
+    word_duration = 4.8 / len(normalized_words)
+    transcription = {
+        "segments": [
+            {
+                "start": 0.0,
+                "end": 5.0,
+                "words": [
+                    {
+                        "start": index * word_duration,
+                        "end": (index + 1) * word_duration,
+                        "word": f" {word}",
+                        "probability": 0.99,
+                    }
+                    for index, word in enumerate(normalized_words)
+                ],
+            }
+        ]
+    }
+    partial = f"{segments[1]['transcript']} {segments[2]['transcript']}"
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": 1,
+            "count": 2,
+            "line_index": 0,
+            "match_score": text_similarity(line_text, partial),
+            "transcript": partial,
+            "duration_plausibility": 80.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_segments": 3,
+            "fragment_join_max_segments": 3,
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+        transcription=transcription,
+    )
+
+    assert len(joined) == 1
+    assert joined[0]["start_index"] == 0
+    assert joined[0]["count"] == 3
+    assert "Taunting" in joined[0]["transcript"]
+    assert (
+        sentence_fidelity(line_text, joined[0]["transcript"])[
+            "missing_clause_count"
+        ]
+        == 0
+    )
+
+
+def test_unordered_alignment_does_not_merge_empty_boundary_segment() -> None:
+    lines = [
+        {
+            "line_id": "line",
+            "line": (
+                "Lost a lot of good customers when Darius let half his "
+                "workers go, and the new ships do not make up for it."
+            ),
+        }
+    ]
+    segments = [
+        {
+            "start_seconds": 0.0,
+            "end_seconds": 4.0,
+            "transcript": lines[0]["line"],
+            "asr_probability": 0.95,
+        },
+        {
+            "start_seconds": 4.3,
+            "end_seconds": 6.0,
+            "transcript": "",
+            "asr_probability": None,
+        },
+    ]
+
+    actions = order_independent_align(
+        segments,
+        lines,
+        {
+            "max_merge_segments": 2,
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+            "path_min_score": 35.0,
+            "candidate_min_score": 45.0,
+            "merge_require_text_boundaries": True,
+        },
+    )
+
+    assert len(actions) == 1
+    assert actions[0]["start_index"] == 0
+    assert actions[0]["count"] == 1
 
 
 def test_untranscribed_audio_in_merge_prevents_auto_acceptance() -> None:

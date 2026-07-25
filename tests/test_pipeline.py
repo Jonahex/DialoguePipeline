@@ -31,8 +31,13 @@ from dialogue_pipeline.segmentation import (
     segment_project,
     split_regions_on_word_gaps,
 )
+from dialogue_pipeline.transcription import (
+    transcribe_candidate_span,
+    transcribe_segments_project,
+)
 from dialogue_pipeline.util import (
     default_model_cache_root,
+    read_json,
     resolve_model_cache_root,
     sha256_file,
     write_json,
@@ -1018,6 +1023,299 @@ def test_local_asr_rescue_accepts_a_better_cached_segment_transcript(
     assert accepted == 1
     assert segment["transcript"] == "Good afternoon"
     assert segment["transcript_source"] == "local_asr_rescue"
+
+
+def test_segment_asr_transcribes_empty_base_clip_without_vad_and_caches(
+    tmp_path: Path,
+) -> None:
+    segment_file = tmp_path / "segment.wav"
+    _write_tone(segment_file)
+    calls = []
+    fake_word = SimpleNamespace(
+        start=0.1,
+        end=0.4,
+        word=" Yes",
+        probability=0.96,
+    )
+    fake_segment = SimpleNamespace(
+        start=0.1,
+        end=0.4,
+        text="Yes",
+        avg_logprob=-0.05,
+        no_speech_prob=0.01,
+        words=[fake_word],
+    )
+
+    class FakeModel:
+        def transcribe(self, *_args, **kwargs):
+            calls.append(kwargs)
+            return iter([fake_segment]), SimpleNamespace(language="en")
+
+    line = {
+        "line_id": "Actor::R2",
+        "sheet": "Actor",
+        "sheet_index": 0,
+        "excel_row": 2,
+        "line": "Yes?",
+    }
+    write_json(tmp_path / "source_lines.json", {"lines": [line]})
+    write_json(
+        tmp_path / "segments_manifest.json",
+        {
+            "sessions": [
+                {
+                    "session_id": "session",
+                    "segments": [
+                        {
+                            "segment_id": "session__s00001",
+                            "kind": "base",
+                            "file": "segment.wav",
+                            "source_sha256": "source-hash",
+                            "start_sample": 0,
+                            "end_sample": 48000,
+                            "start_seconds": 0.0,
+                            "end_seconds": 1.0,
+                            "transcript": "",
+                            "words": [],
+                            "word_count": 0,
+                            "asr_probability": None,
+                            "metrics": {"duration_seconds": 1.0},
+                        }
+                    ],
+                    "derived_segments": [],
+                }
+            ]
+        },
+    )
+    project = {
+        "source_lines": "source_lines.json",
+        "language": "en",
+        "transcription": {
+            "model": "large-v3",
+            "device": "cpu",
+            "compute_type": "int8",
+        },
+        "segment_transcription": {
+            "enabled": True,
+            "prompt_fallback_enabled": False,
+        },
+        "sessions": [
+            {
+                "id": "session",
+                "enabled": True,
+                "sheets": ["Actor"],
+                "excel_rows": [],
+                "line_ids": [],
+            }
+        ],
+    }
+    runtime = {"model": FakeModel()}
+    transcribe_segments_project(
+        project_dir=tmp_path,
+        project=project,
+        runtime=runtime,
+    )
+
+    manifest = read_json(tmp_path / "segments_manifest.json")
+    segment = manifest["sessions"][0]["segments"][0]
+    assert segment["session_transcript"] == ""
+    assert segment["transcript"] == "Yes"
+    assert segment["transcript_source"] == "segment_asr"
+    assert segment["segment_asr"]["primary"]["asr_probability"] == pytest.approx(
+        0.96
+    )
+    assert calls[0]["vad_filter"] is False
+    assert calls[0]["condition_on_previous_text"] is False
+
+    transcribe_segments_project(
+        project_dir=tmp_path,
+        project=project,
+        runtime={},
+    )
+    assert len(calls) == 1
+
+
+def test_prompted_segment_asr_is_evidence_but_cannot_verify_auto_ok(
+    tmp_path: Path,
+) -> None:
+    segment_file = tmp_path / "segment.wav"
+    _write_tone(segment_file)
+    outputs = [
+        SimpleNamespace(
+            start=0.0,
+            end=1.0,
+            text="",
+            avg_logprob=-1.0,
+            no_speech_prob=0.8,
+            words=[],
+        ),
+        SimpleNamespace(
+            start=0.0,
+            end=1.0,
+            text="Yes",
+            avg_logprob=-0.1,
+            no_speech_prob=0.01,
+            words=[
+                SimpleNamespace(
+                    start=0.1,
+                    end=0.4,
+                    word=" Yes",
+                    probability=0.95,
+                )
+            ],
+        ),
+    ]
+
+    class FakeModel:
+        def transcribe(self, *_args, **_kwargs):
+            return iter([outputs.pop(0)]), SimpleNamespace(language="en")
+
+    line = {
+        "line_id": "Actor::R2",
+        "sheet": "Actor",
+        "sheet_index": 0,
+        "excel_row": 2,
+        "line": "Yes?",
+    }
+    write_json(tmp_path / "source_lines.json", {"lines": [line]})
+    write_json(
+        tmp_path / "segments_manifest.json",
+        {
+            "sessions": [
+                {
+                    "session_id": "session",
+                    "segments": [
+                        {
+                            "segment_id": "session__s00001",
+                            "kind": "base",
+                            "file": "segment.wav",
+                            "source_sha256": "source-hash",
+                            "start_sample": 0,
+                            "end_sample": 48000,
+                            "start_seconds": 0.0,
+                            "end_seconds": 1.0,
+                            "transcript": "",
+                            "words": [],
+                            "word_count": 0,
+                            "asr_probability": None,
+                            "metrics": {"duration_seconds": 1.0},
+                        }
+                    ],
+                    "derived_segments": [],
+                }
+            ]
+        },
+    )
+    project = {
+        "source_lines": "source_lines.json",
+        "language": "en",
+        "transcription": {
+            "model": "large-v3",
+            "device": "cpu",
+            "compute_type": "int8",
+        },
+        "segment_transcription": {
+            "enabled": True,
+            "prompt_fallback_enabled": True,
+        },
+        "sessions": [
+            {
+                "id": "session",
+                "enabled": True,
+                "sheets": ["Actor"],
+                "excel_rows": [],
+                "line_ids": [],
+            }
+        ],
+    }
+    runtime = {"model": FakeModel()}
+    transcribe_segments_project(
+        project_dir=tmp_path,
+        project=project,
+        runtime=runtime,
+    )
+    segment = read_json(tmp_path / "segments_manifest.json")["sessions"][0][
+        "segments"
+    ][0]
+
+    assert segment["transcript"] == "Yes"
+    assert segment["transcript_source"] == "segment_asr_prompted"
+    assert segment["segment_asr"]["primary"]["transcript"] == ""
+    assert (
+        segment["segment_asr"]["prompted_fallback"]["transcript"]
+        == "Yes"
+    )
+    exact = transcribe_candidate_span(
+        project_dir=tmp_path,
+        project=project,
+        segment=segment,
+        runtime=runtime,
+    )
+    assert exact["transcript"] == ""
+
+
+def test_merged_candidate_asr_decodes_the_exact_span_once(
+    tmp_path: Path,
+) -> None:
+    segment_file = tmp_path / "merged.wav"
+    _write_tone(segment_file, duration_seconds=2.0)
+    calls = []
+    fake_segment = SimpleNamespace(
+        start=0.0,
+        end=1.8,
+        text="Hello there hello there",
+        avg_logprob=-0.1,
+        no_speech_prob=0.01,
+        words=[],
+    )
+
+    class FakeModel:
+        def transcribe(self, *_args, **kwargs):
+            calls.append(kwargs)
+            return iter([fake_segment]), SimpleNamespace(language="en")
+
+    project = {
+        "language": "en",
+        "transcription": {
+            "model": "large-v3",
+            "device": "cpu",
+            "compute_type": "int8",
+        },
+        "segment_transcription": {"enabled": True},
+        "segmentation": {"fade_ms": 5.0},
+        "export": {
+            "sample_rate": 48000,
+            "channels": 1,
+            "bits_per_sample": 16,
+        },
+    }
+    segment = {
+        "segment_id": "session__m00001_00002",
+        "kind": "merged",
+        "file": "merged.wav",
+        "source_sha256": "source-hash",
+        "start_sample": 0,
+        "end_sample": 96000,
+    }
+    result = transcribe_candidate_span(
+        project_dir=tmp_path,
+        project=project,
+        segment=segment,
+        runtime={"model": FakeModel()},
+    )
+    cached = transcribe_candidate_span(
+        project_dir=tmp_path,
+        project=project,
+        segment=segment,
+        runtime={},
+    )
+
+    assert result["transcript"] == "Hello there hello there"
+    assert cached["cache_key"] == result["cache_key"]
+    assert len(calls) == 1
+    assert calls[0]["vad_filter"] is False
+    assert calls[0]["condition_on_previous_text"] is False
+    assert "initial_prompt" not in calls[0]
 
 
 def test_sample_accurate_cut_and_finalize(tmp_path: Path) -> None:

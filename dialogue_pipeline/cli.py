@@ -12,7 +12,7 @@ from .doctor import run_doctor
 from .finalize import finalize_review
 from .project import create_project, load_project
 from .segmentation import segment_project
-from .transcription import transcribe_project
+from .transcription import transcribe_project, transcribe_segments_project
 from .util import project_file_from_arg
 
 
@@ -81,6 +81,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     segment_parser.add_argument("--force", action="store_true")
 
+    segment_transcribe_parser = subparsers.add_parser(
+        "transcribe-segments",
+        help="Independently transcribe every temporary WAV segment.",
+    )
+    _project_argument(segment_transcribe_parser)
+    segment_transcribe_parser.add_argument(
+        "--session",
+        action="append",
+        default=[],
+        help="Process only this session ID; may be specified multiple times.",
+    )
+    segment_transcribe_parser.add_argument(
+        "--segment",
+        action="append",
+        default=[],
+        help="Process only this exact base Segment ID; may be repeated.",
+    )
+    segment_transcribe_parser.add_argument("--force", action="store_true")
+    segment_transcribe_parser.add_argument("--model")
+    segment_transcribe_parser.add_argument(
+        "--device", choices=["auto", "cuda", "cpu"]
+    )
+
     align_parser = subparsers.add_parser(
         "align",
         help="Align segments and generate A_line_review.xlsx.",
@@ -94,7 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     process_parser = subparsers.add_parser(
-        "process", help="Run transcribe, segment, and align in sequence."
+        "process",
+        help=(
+            "Run recording ASR, segmentation, independent segment ASR, "
+            "and alignment."
+        ),
     )
     _project_argument(process_parser)
     process_parser.add_argument(
@@ -105,6 +132,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     process_parser.add_argument("--force-transcription", action="store_true")
     process_parser.add_argument("--force-segmentation", action="store_true")
+    process_parser.add_argument(
+        "--force-segment-transcription",
+        action="store_true",
+    )
     process_parser.add_argument("--model")
     process_parser.add_argument(
         "--device", choices=["auto", "cuda", "cpu"]
@@ -195,6 +226,18 @@ def dispatch(args: argparse.Namespace) -> int:
         )
         _print_json({"segments_manifest": output})
         return 0
+    if args.command == "transcribe-segments":
+        output = transcribe_segments_project(
+            project_dir=project_dir,
+            project=project,
+            session_filter=set(args.session) or None,
+            segment_filter=set(args.segment) or None,
+            force=args.force,
+            model_override=args.model,
+            device_override=args.device,
+        )
+        _print_json({"segments_manifest": output})
+        return 0
     if args.command == "align":
         _print_json(
             align_project(
@@ -220,11 +263,21 @@ def dispatch(args: argparse.Namespace) -> int:
             session_filter=session_filter,
             force=args.force_segmentation,
         )
+        transcribe_segments_project(
+            project_dir=project_dir,
+            project=project,
+            session_filter=session_filter,
+            force=args.force_segment_transcription,
+            model_override=args.model,
+            device_override=args.device,
+        )
         _print_json(
             align_project(
                 project_dir=project_dir,
                 project=project,
                 session_filter=session_filter,
+                segment_model_override=args.model,
+                segment_device_override=args.device,
             )
         )
         return 0

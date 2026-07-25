@@ -19,6 +19,10 @@ from rapidfuzz import fuzz
 
 from .project import load_source_data
 from .segmentation import materialize_derived_segment
+from .transcription import (
+    transcribe_candidate_span,
+    transcribe_segments_project,
+)
 from .util import (
     is_nonverbal_script,
     is_vocalization_script,
@@ -1723,11 +1727,24 @@ def align_project(
     project_dir: Path,
     project: dict[str, Any],
     session_filter: set[str] | None = None,
+    segment_model_override: str | None = None,
+    segment_device_override: str | None = None,
 ) -> dict[str, Path]:
     manifest_path = project_dir / "segments_manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(
             f"Missing segment manifest: {manifest_path}. Run segment first."
+        )
+    segment_asr_settings = dict(project.get("segment_transcription") or {})
+    segment_asr_runtime: dict[str, Any] = {}
+    if bool(segment_asr_settings.get("enabled", False)):
+        transcribe_segments_project(
+            project_dir=project_dir,
+            project=project,
+            session_filter=session_filter,
+            model_override=segment_model_override,
+            device_override=segment_device_override,
+            runtime=segment_asr_runtime,
         )
     manifest = read_json(manifest_path)
     source_data = load_source_data(project_dir, project)
@@ -1773,15 +1790,16 @@ def align_project(
         normalized_line_counts = Counter(
             normalize_text(line["line"]) for line in session_lines
         )
-        _apply_local_asr_rescue(
-            project_dir=project_dir,
-            project=project,
-            session=session,
-            session_lines=session_lines,
-            base_segments=base_segments,
-            settings=settings,
-            runtime=rescue_runtime,
-        )
+        if not bool(segment_asr_settings.get("enabled", False)):
+            _apply_local_asr_rescue(
+                project_dir=project_dir,
+                project=project,
+                session=session,
+                session_lines=session_lines,
+                base_segments=base_segments,
+                settings=settings,
+                runtime=rescue_runtime,
+            )
         print(
             f"[align {session_index}] {session['id']}: "
             f"{len(base_segments)} segments → {len(session_lines)} lines "
@@ -1857,12 +1875,96 @@ def align_project(
                 start_index=action["start_index"],
                 count=action["count"],
             )
-            observed_transcript = str(
+            preliminary_transcript = str(
                 action.get("transcript")
                 or segment.get("transcript")
                 or ""
             )
-            if "confidence_margin" in action:
+            observed_transcript = preliminary_transcript
+            match_score = float(action["match_score"])
+            exact_span_asr_verified = False
+            exact_span_asr_error = ""
+            transcript_source = segment.get(
+                "transcript_source",
+                action.get("transcript_source", "session_asr"),
+            )
+            verification_enabled = bool(
+                segment_asr_settings.get("enabled", False)
+                and segment_asr_settings.get(
+                    "candidate_verification_enabled",
+                    True,
+                )
+            )
+            verification_min_score = float(
+                segment_asr_settings.get(
+                    "candidate_verification_min_match_score",
+                    settings.get("candidate_min_score", 45.0),
+                )
+            )
+            verification_required = bool(
+                verification_enabled
+                and not is_vocalization_script(line["line"])
+                and match_score >= verification_min_score
+            )
+            if verification_required:
+                try:
+                    exact_asr = transcribe_candidate_span(
+                        project_dir=project_dir,
+                        project=project,
+                        segment=segment,
+                        runtime=segment_asr_runtime,
+                        model_override=segment_model_override,
+                        device_override=segment_device_override,
+                    )
+                    exact_text = str(
+                        exact_asr.get("transcript") or ""
+                    ).strip()
+                    if exact_text:
+                        observed_transcript = exact_text
+                        match_score = text_similarity(
+                            line["line"],
+                            observed_transcript,
+                        )
+                        exact_span_asr_verified = True
+                        transcript_source = "exact_span_asr"
+                        segment["transcript"] = observed_transcript
+                        segment["word_count"] = int(
+                            exact_asr.get("word_count")
+                            if exact_asr.get("word_count") is not None
+                            else word_count(observed_transcript)
+                        )
+                        segment["words"] = list(
+                            exact_asr.get("words") or []
+                        )
+                        segment["asr_probability"] = exact_asr.get(
+                            "asr_probability"
+                        )
+                        segment["transcript_source"] = transcript_source
+                    else:
+                        exact_span_asr_error = "EMPTY_TRANSCRIPT"
+                except Exception as error:
+                    exact_span_asr_error = str(error)
+                    print(
+                        f"[candidate ASR] {segment['segment_id']} failed: "
+                        f"{error}",
+                        flush=True,
+                    )
+
+            if exact_span_asr_verified:
+                all_scores = sorted(
+                    (
+                        text_similarity(
+                            other_line["line"],
+                            observed_transcript,
+                        ),
+                        other_line["line_id"],
+                    )
+                    for other_line in session_lines
+                    if other_line["line_id"] != line["line_id"]
+                )
+                second_score = all_scores[-1][0] if all_scores else 0.0
+                margin = match_score - second_score
+            elif "confidence_margin" in action:
                 margin = float(action["confidence_margin"])
             else:
                 all_scores = sorted(
@@ -1877,7 +1979,7 @@ def align_project(
                     if other_line["line_id"] != line["line_id"]
                 )
                 second_score = all_scores[-1][0] if all_scores else 0.0
-                margin = action["match_score"] - second_score
+                margin = match_score - second_score
             duplicate_policy = str(
                 settings.get("duplicate_line_policy", "review")
             ).lower()
@@ -1922,7 +2024,7 @@ def align_project(
             )
             reliable, reason = _candidate_reliability(
                 line=line,
-                match_score=action["match_score"],
+                match_score=match_score,
                 margin=margin,
                 settings=settings,
                 observed=observed_transcript,
@@ -1938,8 +2040,32 @@ def align_project(
                     else None
                 ),
             )
+            if verification_required and not exact_span_asr_verified:
+                reliable = False
+                reason = "EXACT_SPAN_ASR_FAILED"
+            candidate_is_primary = bool(
+                action.get("is_primary_match", True)
+            )
+            if exact_span_asr_verified:
+                best_other_score = max(
+                    (
+                        text_similarity(
+                            other_line["line"],
+                            observed_transcript,
+                        )
+                        for other_line in session_lines
+                        if (
+                            other_line["line_id"] != line["line_id"]
+                            and normalize_text(other_line["line"])
+                            != normalize_text(line["line"])
+                        )
+                    ),
+                    default=0.0,
+                )
+                if best_other_score > match_score + 0.01:
+                    candidate_is_primary = False
             if (
-                not action.get("is_primary_match", True)
+                not candidate_is_primary
                 and not reusable_duplicate
             ):
                 reliable = False
@@ -1949,7 +2075,7 @@ def align_project(
                 reason = str(action["forced_review_reason"])
             technical_score = _technical_score(segment)
             selection_score = (
-                action["match_score"]
+                match_score
                 + 0.10 * technical_score
                 + 5.0 * float(segment.get("asr_probability") or 0.0)
                 + float(
@@ -1962,7 +2088,7 @@ def align_project(
                 )
                 + (
                     float(settings.get("primary_match_bonus", 2.0))
-                    if action.get("is_primary_match", True)
+                    if candidate_is_primary
                     else 0.0
                 )
             )
@@ -1972,7 +2098,7 @@ def align_project(
                 "segment_id": segment["segment_id"],
                 "segment_file": segment["file"],
                 "transcript": observed_transcript,
-                "match_score": action["match_score"],
+                "match_score": match_score,
                 "ordered_similarity": fidelity["ordered_similarity"],
                 "token_coverage": fidelity["token_coverage"],
                 "token_precision": fidelity["token_precision"],
@@ -1992,9 +2118,7 @@ def align_project(
                 "asr_probability": segment.get("asr_probability"),
                 "base_indices": segment["base_indices"],
                 "alignment_mode": alignment_mode,
-                "is_primary_match": bool(
-                    action.get("is_primary_match", True)
-                ),
+                "is_primary_match": candidate_is_primary,
                 "segment_match_rank": int(
                     action.get("segment_match_rank", 1)
                 ),
@@ -2004,13 +2128,12 @@ def align_project(
                 ),
                 "order_hint": float(action.get("order_hint", 0.0)),
                 "duplicate_resolution": action.get("duplicate_resolution"),
-                "transcript_source": segment.get(
-                    "transcript_source",
-                    action.get("transcript_source", "session_asr"),
-                ),
+                "transcript_source": transcript_source,
                 "local_asr_rescued": bool(
                     (segment.get("local_asr_rescue") or {}).get("accepted")
                 ),
+                "exact_span_asr_verified": exact_span_asr_verified,
+                "exact_span_asr_error": exact_span_asr_error,
                 "unsafe_untranscribed_merge": unsafe_untranscribed_merge,
                 "fragment_join": bool(action.get("fragment_join", False)),
                 "fragment_source_count": int(
@@ -2018,7 +2141,7 @@ def align_project(
                 ),
             }
             if (
-                action["match_score"]
+                match_score
                 >= float(settings.get("candidate_min_score", 45.0))
                 or action.get("force_candidate", False)
             ):
@@ -2311,6 +2434,8 @@ def _write_review_workbook(
         "Duplicate Resolution",
         "Transcript Source",
         "Local ASR Rescued",
+        "Exact Span ASR Verified",
+        "Exact Span ASR Error",
         "Source WAV",
         "Start Seconds",
         "End Seconds",
@@ -2363,6 +2488,8 @@ def _write_review_workbook(
                 candidate.get("duplicate_resolution") or "",
                 candidate.get("transcript_source", "session_asr"),
                 candidate.get("local_asr_rescued", False),
+                candidate.get("exact_span_asr_verified", False),
+                candidate.get("exact_span_asr_error", ""),
                 candidate["source_audio"],
                 candidate["start_seconds"],
                 candidate["end_seconds"],
@@ -2473,9 +2600,17 @@ def _write_review_workbook(
             "AUTO_OK requires every sentence-sized clause to be represented in "
             "the transcript and in script order. The pipeline searches contiguous "
             "base-segment windows for a complete take, reconstructs their text "
-            "from session word timestamps, and creates a linked Fragment Join "
-            "candidate. Textless boundary segments are excluded; original "
+            "from session word timestamps for discovery, and creates a linked "
+            "Fragment Join candidate. The exact merged WAV is then transcribed "
+            "independently. Textless boundary segments are excluded; original "
             "fragments remain available for manual review.",
+        ),
+        (
+            "Exact-span ASR",
+            "Every AUTO_OK candidate must have an unprompted transcript of the "
+            "exact WAV linked in the workbook. Script-prompted fallback text can "
+            "help find a candidate but cannot verify it. See Exact Span ASR "
+            "Verified and Exact Span ASR Error in the Candidates sheet.",
         ),
         (
             "Repeated takes",

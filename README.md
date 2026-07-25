@@ -82,7 +82,32 @@ separates adjacent lines and repeated takes whose pauses are shorter than the
 main silence threshold; alignment can still merge the pieces when they belong
 to one line.
 
-### 4. Align and generate the review package
+### 4. Transcribe the temporary segments
+
+```powershell
+.\run_pipeline.ps1 transcribe-segments --project MaleElfYoung\PipelineWork
+```
+
+Every base WAV is decoded independently, including voiced segments for which
+the recording-level transcript was empty. Segment decoding always uses
+`condition_on_previous_text: false` and `vad_filter: false`, so context from a
+previous take cannot reorder a short phrase and Whisper VAD cannot discard
+clips such as "Yes?". The segment files already contain the configured
+pre/post padding from segmentation.
+
+Unprompted clip ASR is the canonical evidence. When it is empty, low-confidence,
+or has poor ordered similarity, a second script-prompted decode may be stored
+as matching assistance. Prompted text alone is never sufficient for
+`AUTO_OK`. Results are cached under `segment_transcripts` using the source
+hash, exact sample bounds, model, and decoding settings. The Whisper model
+itself still uses the shared user-level model cache.
+
+This command is optional to type manually: `align` ensures that enabled segment
+transcription is current, and `process` runs it explicitly after segmentation.
+For a targeted retry, pass one or more exact IDs with
+`--segment <segment_id>`; `--force` ignores a matching clip cache.
+
+### 5. Align and generate the review package
 
 ```powershell
 .\run_pipeline.ps1 align --project MaleElfYoung\PipelineWork
@@ -118,7 +143,8 @@ that legacy mode.
 Candidate discovery deliberately tolerates reordered or imperfect ASR text,
 but `AUTO_OK` uses separate transcript-fidelity gates. The `Candidates` sheet
 shows ordered similarity, fuzzy-token coverage, fuzzy-token precision, and
-extra-word count. Lines of three words or fewer default to complete coverage
+extra-word count, along with exact-span ASR verification status. Lines of three
+words or fewer default to complete coverage
 and precision plus `short_line_min_ordered_score`; longer lines use the more
 tolerant `reliable_min_ordered_score`, `reliable_min_token_coverage`, and
 `reliable_min_token_precision`. A merged span containing substantial,
@@ -144,10 +170,17 @@ untranscribed pieces receive `MERGED_UNTRANSCRIBED_AUDIO`, and candidates below
 duration gate covers short segments where ASR collapses two or more audible
 performances into a single exact transcript.
 
-`local_asr_rescue.enabled` retries uncertain short base segments individually
-using the strongest nearby script candidates as prompts. Accepted retries must
-improve both script similarity and word confidence, are cached in
-`segments_manifest.json`, and are identified in the `Candidates` sheet.
+Before a candidate can become `AUTO_OK`, the exact WAV that would be exported
+must have an unprompted independent transcript. Base candidates reuse their
+base-clip result; serious merged candidates are decoded again as one continuous
+span and cached separately. The resulting exact-span text—not the concatenated
+base transcripts or script-prompted fallback—drives the final similarity,
+clause, extra-word, and repetition gates. Empty or failed verification receives
+`EXACT_SPAN_ASR_FAILED`.
+
+`local_asr_rescue` remains supported for older projects when
+`segment_transcription.enabled` is false, but new projects use the all-segment
+stage above.
 
 `nonverbal_policy` controls parenthesized directions and recognized
 vocalizations such as coughs, grunts, and death rattles. They are always
@@ -172,7 +205,7 @@ weak candidates without changing the line status.
 - `"reuse"`: permit one exact segment to satisfy duplicate text. Pair this with
   `export.allow_segment_reuse: true` or `finalize --allow-segment-reuse`.
 
-### 5. Finalize selected files
+### 6. Finalize selected files
 
 Validate without copying:
 
@@ -210,7 +243,8 @@ final export intentionally.
 
 ## One-command processing
 
-After reviewing `project.json`, run transcription, segmentation, and alignment:
+After reviewing `project.json`, run recording transcription, segmentation,
+independent segment transcription, and alignment:
 
 ```powershell
 .\run_pipeline.ps1 process --project MaleElfYoung\PipelineWork

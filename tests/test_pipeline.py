@@ -14,6 +14,7 @@ from dialogue_pipeline.alignment import (
     _candidate_reliability,
     _has_unsafe_untranscribed_merge,
     _multisentence_fragment_join_actions,
+    _reroute_actions_to_exact_asr_primary_matches,
     align_project,
     order_independent_align,
     sentence_fidelity,
@@ -271,6 +272,98 @@ def test_missing_single_sentence_boundary_prevents_auto_acceptance() -> None:
         observed=missing_end,
         duration_plausibility=80.0,
     ) == (False, "MISSING_LINE_END")
+
+
+def test_single_missing_or_extra_opening_word_prevents_auto_acceptance() -> None:
+    missing_expected = "Good, I've had enough of you for one day."
+    missing_observed = "I've had enough of you for one day."
+    prepended_expected = (
+        "About time. Do you know how long I've been waiting for this?"
+    )
+    prepended_observed = (
+        "Innkeeper. About time. Do you know how long I've been waiting "
+        "for this?"
+    )
+
+    missing_fidelity = transcript_fidelity(
+        missing_expected,
+        missing_observed,
+    )
+    prepended_fidelity = transcript_fidelity(
+        prepended_expected,
+        prepended_observed,
+    )
+    assert missing_fidelity["prefix_missing_token_count"] == 1
+    assert missing_fidelity["leading_missing_token_count"] == 1
+    assert prepended_fidelity["leading_extra_token_count"] == 1
+    assert _candidate_reliability(
+        line={"line": missing_expected},
+        match_score=text_similarity(missing_expected, missing_observed),
+        margin=20.0,
+        settings={},
+        observed=missing_observed,
+        duration_plausibility=80.0,
+    ) == (False, "MISSING_LINE_START")
+    assert _candidate_reliability(
+        line={"line": prepended_expected},
+        match_score=text_similarity(prepended_expected, prepended_observed),
+        margin=20.0,
+        settings={},
+        observed=prepended_observed,
+        duration_plausibility=80.0,
+    ) == (False, "EXTRA_LINE_START")
+
+
+def test_repeated_short_clauses_keep_their_earliest_positions() -> None:
+    line = (
+        "No, no! A staff! That's it! Should have turned you into a staff! "
+        "Then you'd actually be useful."
+    )
+
+    fidelity = sentence_fidelity(line, line)
+
+    assert fidelity["missing_clause_count"] == 0
+    assert fidelity["clauses_in_order"] is True
+    assert fidelity["clause_positions"] == sorted(
+        fidelity["clause_positions"]
+    )
+
+
+def test_exact_asr_can_reroute_join_to_better_script_line() -> None:
+    actions = [
+        {
+            "start_index": 10,
+            "count": 3,
+            "line_index": 0,
+            "primary_line_index": 0,
+            "match_score": 94.0,
+            "confidence_margin": 5.0,
+            "segment_match_rank": 1,
+            "is_primary_match": True,
+            "fragment_join": True,
+            "fragment_source_count": 3,
+            "fragment_join_provisional": True,
+        }
+    ]
+
+    rerouted = _reroute_actions_to_exact_asr_primary_matches(
+        actions,
+        materialized_by_span={
+            (10, 3): {"segment_id": "session__m00011_00013"}
+        },
+        exact_scores_by_segment={
+            "session__m00011_00013": [94.0, 100.0]
+        },
+        minimum_score=45.0,
+    )
+
+    corrected = next(
+        action for action in rerouted if action["line_index"] == 1
+    )
+    assert corrected["is_primary_match"] is True
+    assert corrected["primary_line_index"] == 1
+    assert corrected["fragment_join"] is True
+    assert corrected["match_score"] == 100.0
 
 
 def test_exact_short_match_is_reliable_unless_script_text_is_duplicated() -> None:

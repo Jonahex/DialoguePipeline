@@ -176,13 +176,17 @@ to be useful only as a tie-breaker.
 Candidate discovery deliberately tolerates reordered or imperfect ASR text,
 but `AUTO_OK` uses separate transcript-fidelity gates. Detailed diagnostics
 remain in `alignment.json`, including ordered similarity, fuzzy-token coverage,
-fuzzy-token precision, anchored prefix/suffix coverage, extra-word count, and
+fuzzy-token precision, anchored prefix/suffix coverage, leading/trailing token
+edits, extra-word count, and
 exact-span ASR verification status. Lines of three words or fewer default to complete coverage
 and precision plus `short_line_min_ordered_score`; longer lines use the more
 tolerant `reliable_min_ordered_score`, `reliable_min_token_coverage`, and
 `reliable_min_token_precision`, but must also preserve the beginning and end
 of the script line. Missing boundaries receive `MISSING_LINE_START`,
-`MISSING_LINE_END`, or `MISSING_LINE_BOUNDARIES`. Common equivalent spoken
+`MISSING_LINE_END`, or `MISSING_LINE_BOUNDARIES`; words spoken before or after
+the line receive `EXTRA_LINE_START` or `EXTRA_LINE_END`. By default,
+`reliable_max_boundary_missing_tokens` is `0`, so even one omitted word in the
+opening or closing comparison window prevents automatic acceptance. Common equivalent spoken
 forms are canonicalized before scoring, including contractions such as
 `could've`/`could have`, `I've`/`I have`, and colloquialisms such as
 `c'mon`/`come on`. A merged span containing substantial,
@@ -205,6 +209,9 @@ token coverage, clause fidelity, order, and precision thresholds. A second
 provisional path admits spans that clearly improve the selected fragment but
 whose preliminary fragment transcripts still miss a short clause. Those spans
 are independently transcribed as exact WAVs before reliability is decided.
+If exact-span ASR shows that such a span belongs to a different script line than
+the preliminary fragment text suggested, the candidate is reassigned to that
+better line.
 Inline performance cues such as `(laugh)` and `(hiccup)` are not treated as
 spoken words during matching. Original fragments remain available.
 

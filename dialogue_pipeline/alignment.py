@@ -121,6 +121,103 @@ def _fuzzy_token_match_count(
     return len(matched_expected)
 
 
+def _ordered_token_edit_operations(
+    expected_tokens: list[str],
+    observed_tokens: list[str],
+    *,
+    token_min_similarity: float,
+) -> list[str]:
+    """Align tokens while preserving insertions/deletions at line boundaries."""
+
+    expected_count = len(expected_tokens)
+    observed_count = len(observed_tokens)
+    costs = [
+        [0.0] * (observed_count + 1)
+        for _ in range(expected_count + 1)
+    ]
+    operations = [
+        [""] * (observed_count + 1)
+        for _ in range(expected_count + 1)
+    ]
+    for expected_index in range(1, expected_count + 1):
+        costs[expected_index][0] = float(expected_index)
+        operations[expected_index][0] = "delete"
+    for observed_index in range(1, observed_count + 1):
+        costs[0][observed_index] = float(observed_index)
+        operations[0][observed_index] = "insert"
+
+    for expected_index in range(1, expected_count + 1):
+        for observed_index in range(1, observed_count + 1):
+            similarity = fuzz.ratio(
+                expected_tokens[expected_index - 1],
+                observed_tokens[observed_index - 1],
+            )
+            if similarity >= token_min_similarity:
+                diagonal_operation = "match"
+                diagonal_cost = (
+                    costs[expected_index - 1][observed_index - 1]
+                    + 0.25 * (100.0 - similarity) / 100.0
+                )
+                diagonal_priority = 0
+            else:
+                diagonal_operation = "substitute"
+                diagonal_cost = (
+                    costs[expected_index - 1][observed_index - 1] + 1.0
+                )
+                diagonal_priority = 3
+            choices = [
+                (diagonal_cost, diagonal_priority, diagonal_operation),
+                (
+                    costs[expected_index - 1][observed_index] + 1.0,
+                    1,
+                    "delete",
+                ),
+                (
+                    costs[expected_index][observed_index - 1] + 1.0,
+                    2,
+                    "insert",
+                ),
+            ]
+            cost, _, operation = min(choices)
+            costs[expected_index][observed_index] = cost
+            operations[expected_index][observed_index] = operation
+
+    result = []
+    expected_index = expected_count
+    observed_index = observed_count
+    while expected_index or observed_index:
+        operation = operations[expected_index][observed_index]
+        result.append(operation)
+        if operation in {"match", "substitute"}:
+            expected_index -= 1
+            observed_index -= 1
+        elif operation == "delete":
+            expected_index -= 1
+        else:
+            observed_index -= 1
+    result.reverse()
+    return result
+
+
+def _boundary_edit_counts(operations: list[str]) -> dict[str, int]:
+    try:
+        first_match = operations.index("match")
+        last_match = len(operations) - 1 - operations[::-1].index("match")
+    except ValueError:
+        first_match = len(operations)
+        last_match = -1
+    leading = operations[:first_match]
+    trailing = operations[last_match + 1 :]
+    return {
+        "leading_missing_token_count": leading.count("delete"),
+        "leading_extra_token_count": leading.count("insert"),
+        "leading_substitution_count": leading.count("substitute"),
+        "trailing_missing_token_count": trailing.count("delete"),
+        "trailing_extra_token_count": trailing.count("insert"),
+        "trailing_substitution_count": trailing.count("substitute"),
+    }
+
+
 def transcript_fidelity(
     expected: str,
     observed: str,
@@ -146,6 +243,16 @@ def transcript_fidelity(
             "extra_word_count": len(observed_tokens),
             "prefix_token_coverage": 0.0,
             "suffix_token_coverage": 0.0,
+            "prefix_missing_token_count": len(expected_tokens),
+            "suffix_missing_token_count": len(expected_tokens),
+            "start_token_similarity": 0.0,
+            "end_token_similarity": 0.0,
+            "leading_missing_token_count": len(expected_tokens),
+            "leading_extra_token_count": len(observed_tokens),
+            "leading_substitution_count": 0,
+            "trailing_missing_token_count": len(expected_tokens),
+            "trailing_extra_token_count": len(observed_tokens),
+            "trailing_substitution_count": 0,
         }
 
     matched_count = _fuzzy_token_match_count(
@@ -171,6 +278,13 @@ def transcript_fidelity(
         observed_tokens[-observed_boundary_size:],
         token_min_similarity=token_min_similarity,
     )
+    boundary_edits = _boundary_edit_counts(
+        _ordered_token_edit_operations(
+            expected_tokens,
+            observed_tokens,
+            token_min_similarity=token_min_similarity,
+        )
+    )
     return {
         "ordered_similarity": fuzz.ratio(
             expected_normalized,
@@ -181,6 +295,17 @@ def transcript_fidelity(
         "extra_word_count": len(observed_tokens) - matched_count,
         "prefix_token_coverage": prefix_match_count / boundary_size,
         "suffix_token_coverage": suffix_match_count / boundary_size,
+        "prefix_missing_token_count": boundary_size - prefix_match_count,
+        "suffix_missing_token_count": boundary_size - suffix_match_count,
+        "start_token_similarity": fuzz.ratio(
+            expected_tokens[0],
+            observed_tokens[0],
+        ),
+        "end_token_similarity": fuzz.ratio(
+            expected_tokens[-1],
+            observed_tokens[-1],
+        ),
+        **boundary_edits,
     }
 
 
@@ -232,17 +357,33 @@ def sentence_fidelity(
             float(clause_fidelity["token_coverage"])
         )
         clause_word_counts.append(word_count(clause))
-        alignment = (
-            fuzz.partial_ratio_alignment(
-                normalize_spoken_text(clause),
-                observed_normalized,
+        clause_tokens = normalize_spoken_text(clause).split()
+        observed_tokens = observed_normalized.split()
+        best_position = -1
+        best_alignment_score = -1.0
+        if clause_tokens and observed_tokens:
+            minimum_window = max(1, len(clause_tokens) - 2)
+            maximum_window = min(
+                len(observed_tokens),
+                len(clause_tokens) + 2,
             )
-            if observed_normalized
-            else None
-        )
-        clause_positions.append(
-            int(alignment.dest_start) if alignment is not None else -1
-        )
+            clause_text = " ".join(clause_tokens)
+            for window_size in range(minimum_window, maximum_window + 1):
+                for start in range(
+                    0,
+                    len(observed_tokens) - window_size + 1,
+                ):
+                    window_text = " ".join(
+                        observed_tokens[start : start + window_size]
+                    )
+                    alignment_score = fuzz.ratio(
+                        clause_text,
+                        window_text,
+                    )
+                    if alignment_score > best_alignment_score:
+                        best_alignment_score = alignment_score
+                        best_position = start
+        clause_positions.append(best_position)
     minimum_score = min(clause_scores) if clause_scores else 0.0
     missing_clauses = [
         score < minimum_clause_score
@@ -515,7 +656,7 @@ def order_independent_align(
 
     segment_count = len(segments)
     line_count = len(lines)
-    max_merge = int(settings.get("max_merge_segments", 10))
+    max_merge = int(settings.get("max_merge_segments", 8))
     max_gap = float(settings.get("max_merge_gap_seconds", 2.5))
     max_span = float(settings.get("max_span_seconds", 35.0))
     minimum_score = float(settings.get("candidate_min_score", 45.0))
@@ -794,7 +935,7 @@ def _multisentence_fragment_join_actions(
     # can no longer make recovery narrower than max_merge_segments.
     maximum_segments = max(
         2,
-        int(settings.get("max_merge_segments", 10)),
+        int(settings.get("max_merge_segments", 8)),
         int(settings.get("fragment_join_max_segments", 0)),
     )
     maximum_actions_per_line = max(
@@ -820,6 +961,10 @@ def _multisentence_fragment_join_actions(
     )
     minimum_boundary_coverage = float(
         settings.get("reliable_min_boundary_token_coverage", 0.60)
+    )
+    maximum_boundary_missing_tokens = max(
+        0,
+        int(settings.get("reliable_max_boundary_missing_tokens", 0)),
     )
     provisional_minimum_match = float(
         settings.get(
@@ -868,6 +1013,20 @@ def _multisentence_fragment_join_actions(
     word_index = _transcription_word_index(transcription)
     joined = []
 
+    def has_complete_boundaries(fidelity: dict[str, Any]) -> bool:
+        return bool(
+            int(fidelity["prefix_missing_token_count"])
+            <= maximum_boundary_missing_tokens
+            and int(fidelity["suffix_missing_token_count"])
+            <= maximum_boundary_missing_tokens
+            and int(fidelity["leading_missing_token_count"]) == 0
+            and int(fidelity["leading_extra_token_count"]) == 0
+            and int(fidelity["leading_substitution_count"]) == 0
+            and int(fidelity["trailing_missing_token_count"]) == 0
+            and int(fidelity["trailing_extra_token_count"]) == 0
+            and int(fidelity["trailing_substitution_count"]) == 0
+        )
+
     def score_preview(
         line_text: str,
         preview: dict[str, Any],
@@ -915,6 +1074,7 @@ def _multisentence_fragment_join_actions(
         return (
             int(sentence["missing_clause_count"]) == 0,
             bool(sentence["clauses_in_order"]),
+            has_complete_boundaries(fidelity),
             min(
                 float(fidelity["prefix_token_coverage"]),
                 float(fidelity["suffix_token_coverage"]),
@@ -989,6 +1149,7 @@ def _multisentence_fragment_join_actions(
                 >= minimum_boundary_coverage
                 and float(scored["fidelity"]["suffix_token_coverage"])
                 >= minimum_boundary_coverage
+                and has_complete_boundaries(scored["fidelity"])
                 and minimum_length_ratio
                 <= length_ratio
                 <= maximum_length_ratio
@@ -1170,6 +1331,7 @@ def _multisentence_fragment_join_actions(
                         combined_fidelity["suffix_token_coverage"]
                     )
                     >= minimum_boundary_coverage
+                    and has_complete_boundaries(combined_fidelity)
                 )
                 provisional_preview = bool(
                     combined_match >= provisional_minimum_match
@@ -1281,6 +1443,7 @@ def _multisentence_fragment_join_actions(
             return (
                 int(scored["sentence"]["missing_clause_count"]) == 0,
                 bool(scored["sentence"]["clauses_in_order"]),
+                has_complete_boundaries(scored["fidelity"]),
                 min(
                     float(scored["fidelity"]["prefix_token_coverage"]),
                     float(scored["fidelity"]["suffix_token_coverage"]),
@@ -1396,6 +1559,95 @@ def _expand_alignment_actions(
             )
     return expanded
 
+
+def _reroute_actions_to_exact_asr_primary_matches(
+    actions: list[dict[str, Any]],
+    *,
+    materialized_by_span: dict[tuple[int, int], dict[str, Any]],
+    exact_scores_by_segment: dict[str, list[float]],
+    minimum_score: float,
+) -> list[dict[str, Any]]:
+    """Ensure exact-span ASR can correct a preview-time line assignment."""
+
+    actions_by_span: dict[
+        tuple[int, int],
+        list[dict[str, Any]],
+    ] = defaultdict(list)
+    for action in actions:
+        actions_by_span[
+            (int(action["start_index"]), int(action["count"]))
+        ].append(action)
+
+    augmented = list(actions)
+    for span_key, span_actions in actions_by_span.items():
+        segment = materialized_by_span.get(span_key)
+        if segment is None:
+            continue
+        scores = exact_scores_by_segment.get(str(segment["segment_id"]))
+        if not scores:
+            continue
+        best_line_index = max(
+            range(len(scores)),
+            key=lambda line_index: scores[line_index],
+        )
+        best_score = float(scores[best_line_index])
+        if best_score < minimum_score:
+            continue
+        second_score = max(
+            (
+                float(score)
+                for line_index, score in enumerate(scores)
+                if line_index != best_line_index
+            ),
+            default=0.0,
+        )
+        representative = next(
+            (
+                action
+                for action in span_actions
+                if bool(action.get("is_primary_match", False))
+            ),
+            span_actions[0],
+        )
+        best_action = next(
+            (
+                action
+                for action in span_actions
+                if int(action["line_index"]) == best_line_index
+            ),
+            None,
+        )
+        if best_action is None:
+            best_action = dict(representative)
+            augmented.append(best_action)
+        best_action.update(
+            {
+                "line_index": best_line_index,
+                "primary_line_index": best_line_index,
+                "match_score": best_score,
+                "confidence_margin": best_score - second_score,
+                "segment_match_rank": 1,
+                "is_primary_match": True,
+                "take_group_id": representative.get("take_group_id"),
+                "fragment_join": bool(
+                    representative.get("fragment_join", False)
+                ),
+                "fragment_source_count": int(
+                    representative.get("fragment_source_count", 0)
+                ),
+                "fragment_join_provisional": bool(
+                    representative.get("fragment_join_provisional", False)
+                ),
+            }
+        )
+    return sorted(
+        augmented,
+        key=lambda action: (
+            int(action["start_index"]),
+            int(action["count"]),
+            int(action["line_index"]),
+        ),
+    )
 
 
 def _candidate_reliability(
@@ -1516,6 +1768,44 @@ def _candidate_reliability(
         and not bool(sentence["clauses_in_order"])
     ):
         return False, "SENTENCE_ORDER_MISMATCH"
+    maximum_boundary_missing_tokens = max(
+        0,
+        int(settings.get("reliable_max_boundary_missing_tokens", 0)),
+    )
+    leading_extra = int(fidelity["leading_extra_token_count"]) > 0
+    trailing_extra = int(fidelity["trailing_extra_token_count"]) > 0
+    leading_anchor_mismatch = bool(
+        int(fidelity["leading_missing_token_count"]) > 0
+        or int(fidelity["leading_substitution_count"]) > 0
+    )
+    trailing_anchor_mismatch = bool(
+        int(fidelity["trailing_missing_token_count"]) > 0
+        or int(fidelity["trailing_substitution_count"]) > 0
+    )
+    if leading_extra and not leading_anchor_mismatch:
+        return False, "EXTRA_LINE_START"
+    if trailing_extra and not trailing_anchor_mismatch:
+        return False, "EXTRA_LINE_END"
+    leading_boundary_mismatch = bool(
+        leading_anchor_mismatch
+        or int(fidelity["prefix_missing_token_count"])
+        > maximum_boundary_missing_tokens
+    )
+    trailing_boundary_mismatch = bool(
+        trailing_anchor_mismatch
+        or int(fidelity["suffix_missing_token_count"])
+        > maximum_boundary_missing_tokens
+    )
+    if leading_boundary_mismatch and trailing_boundary_mismatch:
+        return False, "MISSING_LINE_BOUNDARIES"
+    if leading_boundary_mismatch:
+        return False, "MISSING_LINE_START"
+    if trailing_boundary_mismatch:
+        return False, "MISSING_LINE_END"
+    if leading_extra:
+        return False, "EXTRA_LINE_START"
+    if trailing_extra:
+        return False, "EXTRA_LINE_END"
     minimum_boundary_coverage = float(
         settings.get("reliable_min_boundary_token_coverage", 0.60)
     )
@@ -1753,6 +2043,12 @@ def align_project(
                     text_similarity(line["line"], exact_text)
                     for line in session_lines
                 ]
+        actions = _reroute_actions_to_exact_asr_primary_matches(
+            actions,
+            materialized_by_span=materialized_by_span,
+            exact_scores_by_segment=exact_scores_by_segment,
+            minimum_score=float(settings.get("candidate_min_score", 45.0)),
+        )
         reliable_coverage: set[int] = set()
         assignment_by_base: dict[int, list[dict[str, Any]]] = defaultdict(list)
         serialized_actions = []
@@ -2007,6 +2303,24 @@ def align_project(
                 ],
                 "suffix_token_coverage": fidelity[
                     "suffix_token_coverage"
+                ],
+                "prefix_missing_token_count": fidelity[
+                    "prefix_missing_token_count"
+                ],
+                "suffix_missing_token_count": fidelity[
+                    "suffix_missing_token_count"
+                ],
+                "leading_missing_token_count": fidelity[
+                    "leading_missing_token_count"
+                ],
+                "leading_extra_token_count": fidelity[
+                    "leading_extra_token_count"
+                ],
+                "trailing_missing_token_count": fidelity[
+                    "trailing_missing_token_count"
+                ],
+                "trailing_extra_token_count": fidelity[
+                    "trailing_extra_token_count"
                 ],
                 "extra_word_count": fidelity["extra_word_count"],
                 "clause_count": sentence["clause_count"],

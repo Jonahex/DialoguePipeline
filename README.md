@@ -202,13 +202,18 @@ overlap or neighbor the global resolver's selection. This also covers a
 single-clause line cut at a comma or another internal pause. The joiner compares
 the independent base-segment transcripts with the session-level Whisper word
 timestamps and uses the more complete, ordered evidence. By default it can
-recover lines spread across as many as six segments. Textless first or last
+recover lines spread across as many as ten segments. Textless first or last
 segments are rejected, so a duration hint cannot extend a candidate with an
 empty segment. Strict joins must pass the configured whole-line similarity,
 token coverage, clause fidelity, order, and precision thresholds. A second
 provisional path admits spans that clearly improve the selected fragment but
 whose preliminary fragment transcripts still miss a short clause. Those spans
 are independently transcribed as exact WAVs before reliability is decided.
+Near-complete secondary line matches can also seed recovery; the default
+`fragment_join_secondary_seed_min_match_score` is `80`. When a very short
+opening or closing clause is audible but Whisper cannot identify it reliably,
+the joined span remains available for playback with
+`UNCERTAIN_BOUNDARY_AUDIO` instead of being silently pruned or auto-accepted.
 If exact-span ASR shows that such a span belongs to a different script line than
 the preliminary fragment text suggested, the candidate is reassigned to that
 better line.
@@ -248,8 +253,9 @@ when a nonverbal line is selected.
 `duplicate_line_policy` supports:
 
 - `"review"`: keep identical script text manual.
-- `"weak_order"`: assign distinct chronological take groups to duplicate rows
-  only when enough groups exist.
+- `"weak_order"`: assign distinct chronological take groups to duplicate rows.
+  If nearby takes collapse into one group but there are enough distinct spans,
+  distribute those spans chronologically instead of leaving later rows missing.
 - `"reuse"`: permit one exact segment to satisfy duplicate text. Pair this with
   `export.allow_segment_reuse: true` or `finalize --allow-segment-reuse`.
 

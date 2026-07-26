@@ -866,17 +866,26 @@ def _apply_duplicate_line_policy(
             else:
                 clusters[-1].append(action)
             previous_end = end_seconds
-        if len(clusters) < len(indexes):
-            continue
+        assignment_groups = clusters
+        if len(assignment_groups) < len(indexes):
+            # Identical script rows are acoustically indistinguishable. When
+            # all nearby takes form one cluster but there are still enough
+            # distinct spans, weak order should distribute the spans instead
+            # of leaving every later duplicate row missing.
+            if len(matching_actions) < len(indexes):
+                continue
+            assignment_groups = [
+                [action] for action in matching_actions
+            ]
 
-        for cluster_index, cluster in enumerate(clusters):
-            if len(clusters) == 1:
+        for cluster_index, cluster in enumerate(assignment_groups):
+            if len(assignment_groups) == 1:
                 duplicate_index = indexes[0]
             else:
                 duplicate_position = round(
                     cluster_index
                     * (len(indexes) - 1)
-                    / (len(clusters) - 1)
+                    / (len(assignment_groups) - 1)
                 )
                 duplicate_index = indexes[duplicate_position]
             for action in cluster:
@@ -923,8 +932,61 @@ def _multisentence_fragment_join_actions(
 ) -> list[dict[str, Any]]:
     if not bool(settings.get("fragment_join_enabled", True)):
         return []
+    secondary_seed_minimum_score = float(
+        settings.get("fragment_join_secondary_seed_min_match_score", 80.0)
+    )
+    recovery_actions = list(actions)
+    recovery_keys = {
+        (
+            int(action["line_index"]),
+            int(action["start_index"]),
+            int(action["count"]),
+        )
+        for action in recovery_actions
+    }
+    for action in actions:
+        primary_line_index = int(action["line_index"])
+        for match in action.get("top_matches") or []:
+            line_index = int(match["line_index"])
+            match_score = float(match.get("match_score", 0.0))
+            key = (
+                line_index,
+                int(action["start_index"]),
+                int(action["count"]),
+            )
+            if (
+                line_index == primary_line_index
+                or match_score < secondary_seed_minimum_score
+                or key in recovery_keys
+            ):
+                continue
+            secondary = dict(action)
+            secondary.update(
+                {
+                    "line_index": line_index,
+                    "match_score": match_score,
+                    "duration_plausibility": float(
+                        match.get(
+                            "duration_plausibility",
+                            action.get("duration_plausibility", 0.0),
+                        )
+                    ),
+                    "order_hint": float(
+                        match.get(
+                            "order_hint",
+                            action.get("order_hint", 0.0),
+                        )
+                    ),
+                    "confidence_margin": float(
+                        match.get("confidence_margin", 0.0)
+                    ),
+                    "fragment_secondary_seed": True,
+                }
+            )
+            recovery_actions.append(secondary)
+            recovery_keys.add(key)
     ordered_actions = sorted(
-        actions,
+        recovery_actions,
         key=lambda action: (
             int(action["start_index"]),
             int(action["count"]),
@@ -1006,7 +1068,7 @@ def _multisentence_fragment_join_actions(
             int(action["start_index"]),
             int(action["count"]),
         )
-        for action in actions
+        for action in recovery_actions
     }
     evaluated: set[tuple[int, int, int]] = set()
     preview_cache: dict[tuple[int, int], list[dict[str, Any]]] = {}
@@ -1283,6 +1345,71 @@ def _multisentence_fragment_join_actions(
                     float(metric["fidelity"]["token_coverage"])
                     for metric in fragment_metrics
                 )
+                fragment_has_complete_boundaries = any(
+                    has_complete_boundaries(metric["fidelity"])
+                    for metric in fragment_metrics
+                )
+                boundary_completeness_gain = bool(
+                    has_complete_boundaries(combined_fidelity)
+                    and not fragment_has_complete_boundaries
+                )
+                line_clauses = script_clauses(line["line"])
+                comparison_start = min(
+                    int(action["start_index"])
+                    for action in comparison_actions
+                )
+                comparison_end = max(
+                    int(action["start_index"])
+                    + int(action["count"])
+                    - 1
+                    for action in comparison_actions
+                )
+                leading_boundary_was_incomplete = any(
+                    int(
+                        metric["fidelity"]["leading_missing_token_count"]
+                    )
+                    > 0
+                    or int(
+                        metric["fidelity"]["leading_substitution_count"]
+                    )
+                    > 0
+                    for metric in fragment_metrics
+                )
+                trailing_boundary_was_incomplete = any(
+                    int(
+                        metric["fidelity"]["trailing_missing_token_count"]
+                    )
+                    > 0
+                    or int(
+                        metric["fidelity"]["trailing_substitution_count"]
+                    )
+                    > 0
+                    for metric in fragment_metrics
+                )
+                short_leading_clause = bool(
+                    line_clauses and word_count(line_clauses[0]) <= 2
+                )
+                short_trailing_clause = bool(
+                    line_clauses and word_count(line_clauses[-1]) <= 2
+                )
+                boundary_audio_rescue = bool(
+                    combined_match
+                    >= float(settings.get("candidate_min_score", 45.0))
+                    and (
+                        (
+                            start_index < comparison_start
+                            and end_index <= comparison_end
+                            and short_leading_clause
+                            and leading_boundary_was_incomplete
+                        )
+                        or (
+                            end_index > comparison_end
+                            and start_index >= comparison_start
+                            and short_trailing_clause
+                            and trailing_boundary_was_incomplete
+                        )
+                    )
+                )
                 match_gain = combined_match - fragment_match
                 coverage_gain = (
                     float(combined_fidelity["token_coverage"])
@@ -1296,6 +1423,8 @@ def _multisentence_fragment_join_actions(
                     match_gain < minimum_match_gain
                     and coverage_gain < minimum_coverage_gain
                     and missing_clause_gain <= 0
+                    and not boundary_completeness_gain
+                    and not boundary_audio_rescue
                 ):
                     continue
                 clause_gain = (
@@ -1303,10 +1432,12 @@ def _multisentence_fragment_join_actions(
                     - fragment_clause_score
                 )
                 if (
-                    len(script_clauses(line["line"])) >= 2
+                    len(line_clauses) >= 2
                     and clause_gain < minimum_clause_gain
                     and missing_clause_gain <= 0
                     and coverage_gain < minimum_coverage_gain
+                    and not boundary_completeness_gain
+                    and not boundary_audio_rescue
                 ):
                     continue
                 strict_preview = bool(
@@ -1335,12 +1466,26 @@ def _multisentence_fragment_join_actions(
                 )
                 provisional_preview = bool(
                     combined_match >= provisional_minimum_match
-                    and float(combined_fidelity["token_coverage"])
-                    >= provisional_minimum_token_coverage
+                    and (
+                        float(combined_fidelity["token_coverage"])
+                        >= provisional_minimum_token_coverage
+                        or (
+                            boundary_audio_rescue
+                            and float(combined_fidelity["token_coverage"])
+                            >= 0.50
+                        )
+                    )
                     and float(combined_fidelity["ordered_similarity"])
                     >= provisional_minimum_ordered_score
-                    and float(combined_fidelity["token_precision"])
-                    >= provisional_minimum_token_precision
+                    and (
+                        float(combined_fidelity["token_precision"])
+                        >= provisional_minimum_token_precision
+                        or (
+                            boundary_audio_rescue
+                            and float(combined_fidelity["token_precision"])
+                            >= 0.50
+                        )
+                    )
                     and (
                         combined_sentence["missing_clause_count"] > 0
                         or bool(combined_sentence["clauses_in_order"])
@@ -1422,6 +1567,11 @@ def _multisentence_fragment_join_actions(
                         "fragment_join": True,
                         "fragment_source_count": count,
                         "fragment_join_provisional": not strict_preview,
+                        "forced_review_reason": (
+                            "UNCERTAIN_BOUNDARY_AUDIO"
+                            if boundary_audio_rescue and not strict_preview
+                            else ""
+                        ),
                     }
                 )
                 existing.add(key)
@@ -1554,6 +1704,11 @@ def _expand_alignment_actions(
                     "fragment_join_provisional": bool(
                         action.get("fragment_join_provisional", False)
                         and match_rank == 1
+                    ),
+                    "forced_review_reason": (
+                        str(action.get("forced_review_reason") or "")
+                        if match_rank == 1
+                        else ""
                     ),
                 }
             )

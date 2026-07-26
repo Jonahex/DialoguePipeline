@@ -24,6 +24,7 @@ STRUCTURALLY_INCOMPLETE_REASONS = {
     "SEGMENT_BETTER_MATCH_ELSEWHERE",
     "SENTENCE_ORDER_MISMATCH",
     "SHORT_LINE_LOW_SCORE",
+    "UNCERTAIN_BOUNDARY_AUDIO",
 }
 
 
@@ -104,6 +105,20 @@ def prune_line_candidates(
         for candidate in unique
         if float(candidate.get("match_score", 0.0)) >= cutoff
     ]
+    if not any(candidate.get("reliable", False) for candidate in retained):
+        best_fragment_join = next(
+            (
+                candidate
+                for candidate in unique
+                if bool(candidate.get("fragment_join", False))
+            ),
+            None,
+        )
+        if (
+            best_fragment_join is not None
+            and best_fragment_join not in retained
+        ):
+            retained.append(best_fragment_join)
     if not any(candidate.get("reliable", False) for candidate in retained):
         reliable_best = next(
             (candidate for candidate in unique if candidate.get("reliable", False)),

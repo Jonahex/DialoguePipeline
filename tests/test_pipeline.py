@@ -633,6 +633,190 @@ def test_adjacent_sentence_fragments_create_complete_take_candidates() -> None:
     assert len(limited) == 1
 
 
+def test_boundary_completion_can_join_repeated_short_clauses() -> None:
+    line_text = "No! Don't be dead... Don't be dead..."
+    lines = [{"line_id": "line", "line": line_text}]
+    segments = [
+        {
+            "start_seconds": 0.0,
+            "end_seconds": 0.8,
+            "transcript": "No!",
+            "asr_probability": 0.95,
+        },
+        {
+            "start_seconds": 0.9,
+            "end_seconds": 2.9,
+            "transcript": "Don't be dead! Don't be dead!",
+            "asr_probability": 0.95,
+        },
+    ]
+    actions = [
+        {
+            "start_index": index,
+            "count": 1,
+            "line_index": 0,
+            "match_score": text_similarity(
+                line_text,
+                segment["transcript"],
+            ),
+            "transcript": segment["transcript"],
+            "duration_plausibility": 70.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+        for index, segment in enumerate(segments)
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+    )
+
+    assert len(joined) == 1
+    assert joined[0]["start_index"] == 0
+    assert joined[0]["count"] == 2
+    assert joined[0]["match_score"] == 100.0
+
+
+def test_secondary_near_complete_match_can_seed_fragment_join() -> None:
+    lines = [
+        {"line_id": "short", "line": "You should leave."},
+        {"line_id": "target", "line": "You should leave. Now."},
+        {"line_id": "now", "line": "Now."},
+    ]
+    segments = [
+        {
+            "start_seconds": 0.0,
+            "end_seconds": 1.2,
+            "transcript": "You should leave.",
+            "asr_probability": 0.95,
+        },
+        {
+            "start_seconds": 1.2,
+            "end_seconds": 2.0,
+            "transcript": "Now.",
+            "asr_probability": 0.95,
+        },
+    ]
+    actions = [
+        {
+            "start_index": 0,
+            "count": 1,
+            "line_index": 0,
+            "match_score": 100.0,
+            "transcript": segments[0]["transcript"],
+            "duration_plausibility": 80.0,
+            "order_hint": 0.0,
+            "top_matches": [
+                {"line_index": 0, "match_score": 100.0},
+                {
+                    "line_index": 1,
+                    "match_score": text_similarity(
+                        lines[1]["line"],
+                        segments[0]["transcript"],
+                    ),
+                },
+            ],
+        },
+        {
+            "start_index": 1,
+            "count": 1,
+            "line_index": 2,
+            "match_score": 100.0,
+            "transcript": segments[1]["transcript"],
+            "duration_plausibility": 80.0,
+            "order_hint": 0.0,
+            "top_matches": [
+                {"line_index": 2, "match_score": 100.0}
+            ],
+        },
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+    )
+
+    recovered = next(action for action in joined if action["line_index"] == 1)
+    assert recovered["transcript"] == "You should leave. Now."
+    assert recovered["fragment_join_provisional"] is False
+
+
+def test_uncertain_short_boundary_audio_is_kept_for_review() -> None:
+    line_text = "No... escape..."
+    lines = [
+        {"line_id": "target", "line": line_text},
+        {"line_id": "other", "line": "Oh, come on! I need it more!"},
+    ]
+    segments = [
+        {
+            "start_seconds": 0.0,
+            "end_seconds": 0.9,
+            "transcript": "Oh",
+            "asr_probability": 0.08,
+        },
+        {
+            "start_seconds": 0.9,
+            "end_seconds": 2.7,
+            "transcript": "Escape.",
+            "asr_probability": 0.43,
+        },
+    ]
+    actions = [
+        {
+            "start_index": 0,
+            "count": 1,
+            "line_index": 1,
+            "match_score": text_similarity(
+                lines[1]["line"],
+                segments[0]["transcript"],
+            ),
+            "transcript": segments[0]["transcript"],
+            "duration_plausibility": 50.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        },
+        {
+            "start_index": 1,
+            "count": 1,
+            "line_index": 0,
+            "match_score": text_similarity(
+                line_text,
+                segments[1]["transcript"],
+            ),
+            "transcript": segments[1]["transcript"],
+            "duration_plausibility": 50.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        },
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+    )
+
+    recovered = next(action for action in joined if action["line_index"] == 0)
+    assert recovered["start_index"] == 0
+    assert recovered["count"] == 2
+    assert recovered["forced_review_reason"] == "UNCERTAIN_BOUNDARY_AUDIO"
+
+
 def test_fragment_join_uses_shortest_text_bounded_span() -> None:
     line_text = (
         "Slow, but picking up. Lost a lot of good customers when Darius "
@@ -1421,6 +1605,43 @@ def test_duplicate_weak_order_assigns_separate_take_groups() -> None:
     assert all(action["duplicate_resolved"] for action in actions)
 
 
+def test_duplicate_weak_order_distributes_nearby_distinct_takes() -> None:
+    lines = [
+        {"line_id": "a", "line": "I'll bury you!"},
+        {"line_id": "b", "line": "I'll bury you!"},
+    ]
+    segments = [
+        {"start_seconds": 0.0, "end_seconds": 1.0},
+        {"start_seconds": 1.2, "end_seconds": 2.2},
+    ]
+    actions = [
+        {
+            "start_index": index,
+            "count": 1,
+            "line_index": 0,
+            "match_score": 100.0,
+            "top_matches": [
+                {"line_index": 0, "match_score": 100.0},
+                {"line_index": 1, "match_score": 100.0},
+            ],
+        }
+        for index in range(2)
+    ]
+
+    _apply_duplicate_line_policy(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "duplicate_line_policy": "weak_order",
+            "take_group_gap_seconds": 12.0,
+        },
+    )
+
+    assert [action["line_index"] for action in actions] == [0, 1]
+    assert all(action["duplicate_resolved"] for action in actions)
+
+
 def test_line_review_types_nonverbal_lines_and_uses_audible_unmatched_pool(
     tmp_path: Path,
 ) -> None:
@@ -1534,6 +1755,40 @@ def test_review_candidates_keep_primary_top_score_cluster() -> None:
         "segment1",
         "segment2",
         "segment3",
+    ]
+
+
+def test_review_candidates_keep_best_fragment_join_when_none_are_reliable() -> None:
+    retained = prune_line_candidates(
+        [
+            {
+                "segment_id": "partial",
+                "session_id": "session",
+                "base_indices": [1],
+                "match_score": 91.0,
+                "selection_score": 91.0,
+                "is_primary_match": True,
+                "reliable": False,
+                "reliability_reason": "MISSING_SENTENCE",
+                "fragment_join": False,
+            },
+            {
+                "segment_id": "joined",
+                "session_id": "session",
+                "base_indices": [0, 1],
+                "match_score": 73.0,
+                "selection_score": 73.0,
+                "is_primary_match": True,
+                "reliable": False,
+                "reliability_reason": "UNCERTAIN_BOUNDARY_AUDIO",
+                "fragment_join": True,
+            },
+        ]
+    )
+
+    assert [candidate["segment_id"] for candidate in retained] == [
+        "partial",
+        "joined",
     ]
 
 

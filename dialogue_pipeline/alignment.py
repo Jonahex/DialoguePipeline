@@ -4,7 +4,6 @@ import math
 import re
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -29,25 +28,11 @@ from .util import (
     is_vocalization_script,
     normalize_text,
     read_json,
-    resolve_model_cache_root,
     resolve_project_path,
-    stable_hash,
     word_count,
     write_json,
 )
 from .workbook_io import lines_for_session
-
-
-@dataclass
-class TraceNode:
-    previous: "TraceNode | None"
-    action: dict[str, Any] | None
-
-
-@dataclass
-class StateRecord:
-    score: float
-    trace: TraceNode
 
 
 def text_similarity(expected: str, observed: str) -> float:
@@ -408,17 +393,6 @@ def _transcription_word_index(
     }
 
 
-def _update_state(
-    states: list[dict[int, StateRecord]],
-    segment_index: int,
-    line_index: int,
-    candidate: StateRecord,
-) -> None:
-    existing = states[segment_index].get(line_index)
-    if existing is None or candidate.score > existing.score:
-        states[segment_index][line_index] = candidate
-
-
 def _nonverbal_policy(settings: dict[str, Any]) -> str:
     policy = str(settings.get("nonverbal_policy", "review")).strip().lower()
     if policy not in {"review", "skip", "weak_order"}:
@@ -449,118 +423,6 @@ def _restore_source_line_indexes(
         for match in action.get("top_matches") or []:
             match["line_index"] = source_indexes[int(match["line_index"])]
     return actions
-
-
-def sequence_align(
-    segments: list[dict[str, Any]],
-    lines: list[dict[str, Any]],
-    settings: dict[str, Any],
-) -> list[dict[str, Any]]:
-    lines, source_indexes = _text_matchable_lines(lines)
-    segment_count = len(segments)
-    line_count = len(lines)
-    if not segments or not lines:
-        return []
-    states: list[dict[int, StateRecord]] = [
-        {} for _ in range(segment_count + 1)
-    ]
-    root = TraceNode(previous=None, action=None)
-    states[0][0] = StateRecord(score=0.0, trace=root)
-
-    max_merge = int(settings.get("max_merge_segments", 3))
-    max_gap = float(settings.get("max_merge_gap_seconds", 2.5))
-    max_span = float(settings.get("max_span_seconds", 35.0))
-    lookahead = int(settings.get("lookahead_lines", 8))
-    minimum_path_score = float(settings.get("path_min_score", 35.0))
-    noise_penalty = float(settings.get("noise_penalty", 2.2))
-    skip_penalty = float(settings.get("skip_line_penalty", 1.8))
-    repeat_penalty = float(settings.get("repeat_take_penalty", 0.8))
-
-    for segment_index in range(segment_count):
-        for next_line, state in list(states[segment_index].items()):
-            noise_node = TraceNode(
-                previous=state.trace,
-                action={
-                    "type": "unmatched",
-                    "start_index": segment_index,
-                    "count": 1,
-                },
-            )
-            _update_state(
-                states,
-                segment_index + 1,
-                next_line,
-                StateRecord(state.score - noise_penalty, noise_node),
-            )
-            if next_line >= line_count:
-                continue
-
-            for count in range(1, max_merge + 1):
-                if not _valid_span(
-                    segments,
-                    segment_index,
-                    count,
-                    max_merge_gap_seconds=max_gap,
-                    max_span_seconds=max_span,
-                ):
-                    break
-                span = _span_preview(segments, segment_index, count)
-                last_target = min(line_count, next_line + lookahead + 1)
-                for target_line in range(next_line, last_target):
-                    match_score = text_similarity(
-                        lines[target_line]["line"], span["transcript"]
-                    )
-                    if match_score < minimum_path_score:
-                        continue
-                    contribution = (match_score - 50.0) / 5.0
-                    base_score = (
-                        state.score
-                        + contribution
-                        - (target_line - next_line) * skip_penalty
-                    )
-                    action = {
-                        "type": "assigned",
-                        "start_index": segment_index,
-                        "count": count,
-                        "line_index": target_line,
-                        "match_score": match_score,
-                        "transcript": span["transcript"],
-                    }
-                    advance_node = TraceNode(previous=state.trace, action=action)
-                    _update_state(
-                        states,
-                        segment_index + count,
-                        target_line + 1,
-                        StateRecord(base_score, advance_node),
-                    )
-                    repeat_action = dict(action)
-                    repeat_action["repeat_transition"] = True
-                    repeat_node = TraceNode(
-                        previous=state.trace, action=repeat_action
-                    )
-                    _update_state(
-                        states,
-                        segment_index + count,
-                        target_line,
-                        StateRecord(base_score - repeat_penalty, repeat_node),
-                    )
-
-    if not states[segment_count]:
-        return []
-    _, best_state = max(
-        states[segment_count].items(),
-        key=lambda item: item[1].score - (line_count - item[0]) * skip_penalty,
-    )
-    actions = []
-    node: TraceNode | None = best_state.trace
-    while node and node.action is not None:
-        actions.append(node.action)
-        node = node.previous
-    actions.reverse()
-    return _restore_source_line_indexes(
-        [action for action in actions if action["type"] == "assigned"],
-        source_indexes,
-    )
 
 
 def _duration_plausibility(
@@ -611,10 +473,7 @@ def order_independent_align(
     max_merge = int(settings.get("max_merge_segments", 3))
     max_gap = float(settings.get("max_merge_gap_seconds", 2.5))
     max_span = float(settings.get("max_span_seconds", 35.0))
-    minimum_score = max(
-        float(settings.get("path_min_score", 35.0)),
-        float(settings.get("candidate_min_score", 45.0)),
-    )
+    minimum_score = float(settings.get("candidate_min_score", 45.0))
     top_k = max(1, int(settings.get("candidate_top_k", 8)))
     noise_penalty = float(settings.get("noise_penalty", 2.2))
     merge_penalty = float(settings.get("merge_span_penalty", 0.2))
@@ -1665,234 +1524,6 @@ def _has_unsafe_untranscribed_merge(
     return False
 
 
-def _apply_local_asr_rescue(
-    *,
-    project_dir: Path,
-    project: dict[str, Any],
-    session: dict[str, Any],
-    session_lines: list[dict[str, Any]],
-    base_segments: list[dict[str, Any]],
-    settings: dict[str, Any],
-    runtime: dict[str, Any],
-) -> int:
-    rescue = dict(settings.get("local_asr_rescue") or {})
-    if not bool(rescue.get("enabled", False)):
-        return 0
-
-    eligible_lines = [
-        line
-        for line in session_lines
-        if not is_vocalization_script(line["line"])
-        and word_count(line["line"])
-        <= int(rescue.get("max_candidate_words", 8))
-    ]
-    if not eligible_lines:
-        return 0
-
-    maximum_segments = max(0, int(rescue.get("max_segments_per_session", 80)))
-    maximum_duration = float(rescue.get("max_segment_seconds", 6.0))
-    maximum_words = int(rescue.get("max_observed_words", 6))
-    trigger_score = float(rescue.get("trigger_score", 88.0))
-    trigger_probability = float(rescue.get("trigger_probability", 0.65))
-    minimum_probability = float(rescue.get("minimum_probability", 0.55))
-    minimum_gain = float(rescue.get("minimum_score_gain", 6.0))
-    minimum_score = float(rescue.get("minimum_score", 72.0))
-    prompt_top_k = max(1, int(rescue.get("prompt_top_k", 8)))
-    prompt_characters = max(100, int(rescue.get("prompt_characters", 800)))
-
-    transcription_settings = dict(project.get("transcription") or {})
-    model_name = str(
-        rescue.get("model")
-        or transcription_settings.get("model")
-        or "large-v3"
-    )
-    device = str(
-        rescue.get("device")
-        or transcription_settings.get("device")
-        or "auto"
-    )
-    compute_type = str(transcription_settings.get("compute_type", "auto"))
-    model_root = resolve_model_cache_root(project_dir, transcription_settings)
-    model_root.mkdir(parents=True, exist_ok=True)
-
-    attempted = 0
-    accepted = 0
-    for segment in base_segments:
-        if attempted >= maximum_segments:
-            break
-        transcript = str(segment.get("transcript") or "").strip()
-        if not transcript:
-            continue
-        duration = float(segment.get("end_seconds", 0.0)) - float(
-            segment.get("start_seconds", 0.0)
-        )
-        if duration > maximum_duration:
-            continue
-        observed_words = int(segment.get("word_count") or word_count(transcript))
-        probability = segment.get("asr_probability")
-        scored_lines = sorted(
-            [
-                (
-                    text_similarity(line["line"], transcript),
-                    line,
-                )
-                for line in eligible_lines
-            ],
-            key=lambda item: item[0],
-        )
-        old_score = scored_lines[-1][0] if scored_lines else 0.0
-        if (
-            observed_words > maximum_words
-            and old_score >= trigger_score
-            and probability is not None
-            and float(probability) >= trigger_probability
-        ):
-            continue
-        if (
-            old_score >= trigger_score
-            and probability is not None
-            and float(probability) >= trigger_probability
-        ):
-            continue
-
-        candidates = [
-            line for _, line in reversed(scored_lines[-prompt_top_k:])
-        ]
-        cache_key = stable_hash(
-            {
-                "segment_id": segment["segment_id"],
-                "source_sha256": segment.get("source_sha256"),
-                "transcript": transcript,
-                "model": model_name,
-                "device": device,
-                "compute_type": compute_type,
-                "settings": rescue,
-                "candidate_line_ids": [line["line_id"] for line in candidates],
-            }
-        )
-        previous = segment.get("local_asr_rescue") or {}
-        if previous.get("cache_key") == cache_key:
-            continue
-
-        if runtime.get("model") is None:
-            from .transcription import _make_model
-
-            print(
-                f"[local ASR rescue] Loading {model_name} from {model_root}",
-                flush=True,
-            )
-            model, resolved_device, resolved_compute = _make_model(
-                model_name,
-                device=device,
-                compute_type=compute_type,
-                download_root=model_root,
-            )
-            runtime.update(
-                {
-                    "model": model,
-                    "device": resolved_device,
-                    "compute_type": resolved_compute,
-                    "model_name": model_name,
-                }
-            )
-
-        prompt = " | ".join(line["line"] for line in candidates)[
-            :prompt_characters
-        ]
-        segment_path = resolve_project_path(project_dir, segment["file"])
-        attempted += 1
-        try:
-            segments_iter, _ = runtime["model"].transcribe(
-                str(segment_path),
-                language=project.get("language", "en"),
-                beam_size=int(rescue.get("beam_size", 5)),
-                word_timestamps=True,
-                condition_on_previous_text=False,
-                vad_filter=False,
-                initial_prompt=prompt,
-                hotwords=prompt,
-            )
-            rescue_parts = []
-            rescue_probabilities = []
-            for rescue_segment in segments_iter:
-                text = str(rescue_segment.text or "").strip()
-                if text:
-                    rescue_parts.append(text)
-                for rescue_word in rescue_segment.words or []:
-                    if rescue_word.probability is not None:
-                        rescue_probabilities.append(
-                            float(rescue_word.probability)
-                        )
-            rescued_transcript = " ".join(rescue_parts).strip()
-            rescued_probability = (
-                sum(rescue_probabilities) / len(rescue_probabilities)
-                if rescue_probabilities
-                else None
-            )
-            new_scores = sorted(
-                (
-                    text_similarity(line["line"], rescued_transcript),
-                    line["line_id"],
-                )
-                for line in eligible_lines
-            )
-            new_score = new_scores[-1][0] if new_scores else 0.0
-            accepted_rescue = bool(
-                rescued_transcript
-                and rescued_probability is not None
-                and rescued_probability >= minimum_probability
-                and new_score >= minimum_score
-                and new_score >= old_score + minimum_gain
-            )
-            segment["local_asr_rescue"] = {
-                "cache_key": cache_key,
-                "accepted": accepted_rescue,
-                "transcript": rescued_transcript,
-                "asr_probability": rescued_probability,
-                "old_best_score": old_score,
-                "new_best_score": new_score,
-                "candidate_line_ids": [
-                    line["line_id"] for line in candidates
-                ],
-                "model": model_name,
-                "device": runtime.get("device"),
-                "compute_type": runtime.get("compute_type"),
-            }
-            if accepted_rescue:
-                segment.setdefault("original_transcript", transcript)
-                segment.setdefault(
-                    "original_asr_probability",
-                    segment.get("asr_probability"),
-                )
-                segment["transcript"] = rescued_transcript
-                segment["word_count"] = word_count(rescued_transcript)
-                segment["asr_probability"] = rescued_probability
-                segment["transcript_source"] = "local_asr_rescue"
-                accepted += 1
-        except Exception as error:
-            segment["local_asr_rescue"] = {
-                "cache_key": cache_key,
-                "accepted": False,
-                "error": str(error),
-                "candidate_line_ids": [
-                    line["line_id"] for line in candidates
-                ],
-                "model": model_name,
-            }
-            print(
-                f"[local ASR rescue] {session['id']} "
-                f"{segment['segment_id']} failed: {error}",
-                flush=True,
-            )
-    if attempted:
-        print(
-            f"[local ASR rescue] {session['id']}: "
-            f"{accepted}/{attempted} improved",
-            flush=True,
-        )
-    return accepted
-
-
 def align_project(
     *,
     project_dir: Path,
@@ -1922,12 +1553,6 @@ def align_project(
     line_by_id = {line["line_id"]: line for line in source_data["lines"]}
     settings = dict(project.get("alignment") or {})
     nonverbal_policy = _nonverbal_policy(settings)
-    alignment_mode = str(settings.get("mode", "unordered")).strip().lower()
-    if alignment_mode not in {"unordered", "sequence"}:
-        raise ValueError(
-            "alignment.mode must be either 'unordered' or 'sequence', "
-            f"got {alignment_mode!r}"
-        )
     manifest_session_by_id = {
         entry["session_id"]: entry for entry in manifest["sessions"]
     }
@@ -1935,7 +1560,6 @@ def align_project(
     candidates: list[dict[str, Any]] = []
     unmatched_rows: list[dict[str, Any]] = []
     alignment_sessions = []
-    rescue_runtime: dict[str, Any] = {}
 
     selected_sessions = [
         item
@@ -1961,34 +1585,16 @@ def align_project(
         normalized_line_counts = Counter(
             normalize_text(line["line"]) for line in session_lines
         )
-        if not bool(segment_asr_settings.get("enabled", False)):
-            _apply_local_asr_rescue(
-                project_dir=project_dir,
-                project=project,
-                session=session,
-                session_lines=session_lines,
-                base_segments=base_segments,
-                settings=settings,
-                runtime=rescue_runtime,
-            )
         print(
             f"[align {session_index}] {session['id']}: "
-            f"{len(base_segments)} segments → {len(session_lines)} lines "
-            f"({alignment_mode})",
+            f"{len(base_segments)} segments → {len(session_lines)} lines",
             flush=True,
         )
-        if alignment_mode == "sequence":
-            primary_actions = sequence_align(
-                base_segments,
-                session_lines,
-                settings,
-            )
-        else:
-            primary_actions = order_independent_align(
-                base_segments,
-                session_lines,
-                settings,
-            )
+        primary_actions = order_independent_align(
+            base_segments,
+            session_lines,
+            settings,
+        )
         _apply_duplicate_line_policy(
             primary_actions,
             lines=session_lines,
@@ -2335,7 +1941,6 @@ def align_project(
                 "duration_seconds": segment["metrics"]["duration_seconds"],
                 "asr_probability": segment.get("asr_probability"),
                 "base_indices": segment["base_indices"],
-                "alignment_mode": alignment_mode,
                 "is_primary_match": candidate_is_primary,
                 "segment_match_rank": int(
                     action.get("segment_match_rank", 1)
@@ -2347,9 +1952,6 @@ def align_project(
                 "order_hint": float(action.get("order_hint", 0.0)),
                 "duplicate_resolution": action.get("duplicate_resolution"),
                 "transcript_source": transcript_source,
-                "local_asr_rescued": bool(
-                    (segment.get("local_asr_rescue") or {}).get("accepted")
-                ),
                 "exact_span_asr_verified": exact_span_asr_verified,
                 "exact_span_asr_error": exact_span_asr_error,
                 "unsafe_untranscribed_merge": unsafe_untranscribed_merge,
@@ -2415,7 +2017,6 @@ def align_project(
         alignment_sessions.append(
             {
                 "session_id": session["id"],
-                "alignment_mode": alignment_mode,
                 "nonverbal_policy": nonverbal_policy,
                 "script_line_count": len(session_lines),
                 "base_segment_count": len(base_segments),
@@ -2644,14 +2245,12 @@ def _write_review_workbook(
         "Technical Score",
         "Reliable",
         "Reliability Reason",
-        "Alignment Mode",
         "Primary Match",
         "Segment Match Rank",
         "Take Group",
         "Duration Plausibility",
         "Duplicate Resolution",
         "Transcript Source",
-        "Local ASR Rescued",
         "Exact Span ASR Verified",
         "Exact Span ASR Error",
         "Source WAV",
@@ -2698,14 +2297,12 @@ def _write_review_workbook(
                 candidate["technical_score"],
                 candidate["reliable"],
                 candidate["reliability_reason"],
-                candidate.get("alignment_mode", "sequence"),
                 candidate.get("is_primary_match", True),
                 candidate.get("segment_match_rank", 1),
                 candidate.get("take_group_id") or "",
                 candidate.get("duration_plausibility", 0.0),
                 candidate.get("duplicate_resolution") or "",
                 candidate.get("transcript_source", "session_asr"),
-                candidate.get("local_asr_rescued", False),
                 candidate.get("exact_span_asr_verified", False),
                 candidate.get("exact_span_asr_error", ""),
                 candidate["source_audio"],

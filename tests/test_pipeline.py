@@ -12,7 +12,6 @@ from openpyxl import load_workbook
 
 from dialogue_pipeline.alignment import (
     _apply_duplicate_line_policy,
-    _apply_local_asr_rescue,
     _candidate_reliability,
     _has_unsafe_untranscribed_merge,
     _multisentence_fragment_join_actions,
@@ -21,7 +20,6 @@ from dialogue_pipeline.alignment import (
     align_project,
     order_independent_align,
     sentence_fidelity,
-    sequence_align,
     text_similarity,
     transcript_fidelity,
 )
@@ -136,50 +134,7 @@ def test_sample_workbook_schema() -> None:
     assert len({line["target_filename"] for line in result["lines"]}) == 457
 
 
-def test_text_similarity_and_repeated_take_alignment() -> None:
-    lines = [
-        {"line_id": "a", "line": "Hello there."},
-        {"line_id": "b", "line": "Where are you going?"},
-        {"line_id": "c", "line": "Goodbye."},
-    ]
-    segments = [
-        {
-            "start_seconds": 0.0,
-            "end_seconds": 1.0,
-            "transcript": "Hello there.",
-            "asr_probability": 0.95,
-        },
-        {
-            "start_seconds": 1.5,
-            "end_seconds": 2.5,
-            "transcript": "Hello there!",
-            "asr_probability": 0.94,
-        },
-        {
-            "start_seconds": 3.0,
-            "end_seconds": 4.0,
-            "transcript": "Where are you going?",
-            "asr_probability": 0.96,
-        },
-        {
-            "start_seconds": 4.5,
-            "end_seconds": 5.2,
-            "transcript": "Goodbye.",
-            "asr_probability": 0.98,
-        },
-    ]
-    settings = {
-        "max_merge_segments": 2,
-        "max_merge_gap_seconds": 2.0,
-        "max_span_seconds": 20.0,
-        "lookahead_lines": 3,
-        "path_min_score": 35.0,
-        "noise_penalty": 2.2,
-        "skip_line_penalty": 1.8,
-        "repeat_take_penalty": 0.8,
-    }
-    actions = sequence_align(segments, lines, settings)
-    assert [action["line_index"] for action in actions] == [0, 0, 1, 2]
+def test_text_similarity() -> None:
     assert text_similarity("Where are you going?", "where are you going") > 95
 
 
@@ -219,7 +174,6 @@ def test_order_independent_alignment_handles_reordered_lines_and_takes() -> None
         "max_merge_segments": 2,
         "max_merge_gap_seconds": 2.0,
         "max_span_seconds": 20.0,
-        "path_min_score": 35.0,
         "candidate_min_score": 45.0,
         "candidate_top_k": 3,
         "noise_penalty": 2.2,
@@ -980,7 +934,6 @@ def test_unordered_alignment_does_not_merge_empty_boundary_segment() -> None:
             "max_merge_segments": 2,
             "max_merge_gap_seconds": 1.0,
             "max_span_seconds": 10.0,
-            "path_min_score": 35.0,
             "candidate_min_score": 45.0,
             "merge_require_text_boundaries": True,
         },
@@ -1211,9 +1164,8 @@ def test_review_workbook_does_not_preselect_nonverbal_lines(
     workbook.close()
 
 
-@pytest.mark.parametrize("aligner", [sequence_align, order_independent_align])
-def test_text_aligners_exclude_nonverbal_lines(aligner) -> None:
-    actions = aligner(
+def test_text_aligner_excludes_nonverbal_lines() -> None:
+    actions = order_independent_align(
         [
             {
                 "start_seconds": 0.0,
@@ -1234,80 +1186,12 @@ def test_text_aligners_exclude_nonverbal_lines(aligner) -> None:
         ],
         {
             "max_merge_segments": 1,
-            "path_min_score": 35.0,
             "candidate_min_score": 35.0,
-            "lookahead_lines": 8,
         },
     )
 
     assert actions
     assert {action["line_index"] for action in actions} == {1}
-
-
-def test_local_asr_rescue_accepts_a_better_cached_segment_transcript(
-    tmp_path: Path,
-) -> None:
-    segment_file = tmp_path / "segment.wav"
-    _write_tone(segment_file)
-    fake_word = SimpleNamespace(probability=0.95)
-    fake_segment = SimpleNamespace(
-        text="Good afternoon",
-        words=[fake_word, fake_word],
-    )
-
-    class FakeModel:
-        def transcribe(self, *_args, **_kwargs):
-            return iter([fake_segment]), SimpleNamespace()
-
-    segment = {
-        "segment_id": "session__s00001",
-        "file": "segment.wav",
-        "source_sha256": "abc",
-        "start_seconds": 0.0,
-        "end_seconds": 1.0,
-        "transcript": "Afternon",
-        "word_count": 1,
-        "asr_probability": 0.3,
-    }
-    project = {
-        "language": "en",
-        "transcription": {
-            "model": "large-v3",
-            "device": "cpu",
-            "compute_type": "int8",
-        },
-    }
-
-    accepted = _apply_local_asr_rescue(
-        project_dir=tmp_path,
-        project=project,
-        session={"id": "session"},
-        session_lines=[
-            {
-                "line_id": "a",
-                "line": "Good afternoon.",
-            }
-        ],
-        base_segments=[segment],
-        settings={
-            "local_asr_rescue": {
-                "enabled": True,
-                "trigger_score": 101.0,
-                "minimum_probability": 0.5,
-                "minimum_score_gain": 0.0,
-                "minimum_score": 72.0,
-            }
-        },
-        runtime={
-            "model": FakeModel(),
-            "device": "cpu",
-            "compute_type": "int8",
-        },
-    )
-
-    assert accepted == 1
-    assert segment["transcript"] == "Good afternoon"
-    assert segment["transcript_source"] == "local_asr_rescue"
 
 
 def test_segment_asr_transcribes_empty_base_clip_without_vad_and_caches(
@@ -2015,6 +1899,8 @@ def test_sample_accurate_cut_and_finalize(tmp_path: Path) -> None:
     candidate_headers = {
         cell.value: cell.column for cell in candidates_sheet[1] if cell.value
     }
+    assert "Alignment Mode" not in candidate_headers
+    assert "Local ASR Rescued" not in candidate_headers
     assert (
         candidates_sheet.cell(
             2,
@@ -2250,16 +2136,12 @@ def test_segmentation_and_alignment_integration(tmp_path: Path) -> None:
             "max_merge_segments": 2,
             "max_merge_gap_seconds": 1.0,
             "max_span_seconds": 10.0,
-            "lookahead_lines": 2,
-            "path_min_score": 35.0,
             "candidate_min_score": 45.0,
             "reliable_min_score": 72.0,
             "reliable_min_margin": 8.0,
             "short_line_min_score": 88.0,
             "short_line_min_margin": 15.0,
             "noise_penalty": 2.2,
-            "skip_line_penalty": 1.8,
-            "repeat_take_penalty": 0.8,
         },
         "export": {
             "extension": ".wav",

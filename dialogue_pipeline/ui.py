@@ -123,6 +123,7 @@ class DialogueReviewApp:
             style.theme_use("vista")
         style.configure("Title.TLabel", font=("Segoe UI", 24, "bold"))
         style.configure("Heading.TLabel", font=("Segoe UI", 13, "bold"))
+        style.configure("FieldName.TLabel", font=("Segoe UI", 9, "bold"))
         style.configure("Muted.TLabel", foreground="#475569")
         style.configure("Primary.TButton", font=("Segoe UI", 11, "bold"))
 
@@ -441,26 +442,67 @@ class DialogueReviewApp:
             )
         for status, color in STATUS_COLORS.items():
             self.line_tree.tag_configure(status, background=color)
-        line_scrollbar = ttk.Scrollbar(
+        self.line_vertical_scrollbar = ttk.Scrollbar(
             left,
             orient="vertical",
             command=self.line_tree.yview,
         )
-        self.line_tree.configure(yscrollcommand=line_scrollbar.set)
-        self.line_tree.pack(side="left", fill="both", expand=True)
-        line_scrollbar.pack(side="right", fill="y")
+        self.line_horizontal_scrollbar = ttk.Scrollbar(
+            left,
+            orient="horizontal",
+            command=self.line_tree.xview,
+        )
+        self.line_tree.configure(
+            yscrollcommand=self.line_vertical_scrollbar.set,
+            xscrollcommand=self.line_horizontal_scrollbar.set,
+        )
+        left.grid_rowconfigure(0, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+        self.line_tree.grid(row=0, column=0, sticky="nsew")
+        self.line_vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.line_horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
         self.line_tree.bind("<<TreeviewSelect>>", self._tree_line_selected)
         self.line_tree.bind("<ButtonRelease-1>", self._line_table_clicked)
         self.line_tree.bind("<Motion>", self._line_table_motion)
+
+        selected_details = ttk.Frame(right, padding=(4, 2, 4, 6))
+        selected_details.grid(row=0, column=0, columnspan=2, sticky="ew")
+        selected_details.grid_columnconfigure(1, weight=1)
+        detail_fields = [
+            ("Context", "selected_context_label"),
+            ("Line", "selected_line_label"),
+            ("Acting note", "selected_acting_note_label"),
+        ]
+        for row, (title, attribute) in enumerate(detail_fields):
+            ttk.Label(
+                selected_details,
+                text=f"{title}:",
+                style="FieldName.TLabel",
+                anchor="nw",
+            ).grid(row=row, column=0, sticky="nw", padx=(0, 10), pady=2)
+            value_label = ttk.Label(
+                selected_details,
+                text="—",
+                anchor="nw",
+                justify="left",
+                wraplength=600,
+            )
+            value_label.grid(row=row, column=1, sticky="ew", pady=2)
+            setattr(self, attribute, value_label)
 
         self.candidate_description = ttk.Label(
             right,
             text="",
             wraplength=650,
             style="Muted.TLabel",
-            padding=(4, 4, 4, 10),
+            padding=(4, 2, 4, 8),
         )
-        self.candidate_description.pack(anchor="w", fill="x")
+        self.candidate_description.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+        )
         candidate_columns = ("segment", "transcript", "score", "audio", "selection")
         self.candidate_tree = ttk.Treeview(
             right,
@@ -485,14 +527,29 @@ class DialogueReviewApp:
                 anchor=anchor,
             )
         self.candidate_tree.tag_configure("selected", background="#bbf7d0")
-        candidate_scrollbar = ttk.Scrollbar(
+        self.candidate_vertical_scrollbar = ttk.Scrollbar(
             right,
             orient="vertical",
             command=self.candidate_tree.yview,
         )
-        self.candidate_tree.configure(yscrollcommand=candidate_scrollbar.set)
-        self.candidate_tree.pack(side="left", fill="both", expand=True)
-        candidate_scrollbar.pack(side="right", fill="y")
+        self.candidate_horizontal_scrollbar = ttk.Scrollbar(
+            right,
+            orient="horizontal",
+            command=self.candidate_tree.xview,
+        )
+        self.candidate_tree.configure(
+            yscrollcommand=self.candidate_vertical_scrollbar.set,
+            xscrollcommand=self.candidate_horizontal_scrollbar.set,
+        )
+        right.grid_rowconfigure(2, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+        self.candidate_tree.grid(row=2, column=0, sticky="nsew")
+        self.candidate_vertical_scrollbar.grid(row=2, column=1, sticky="ns")
+        self.candidate_horizontal_scrollbar.grid(
+            row=3,
+            column=0,
+            sticky="ew",
+        )
         self.candidate_tree.bind("<ButtonRelease-1>", self._candidate_table_clicked)
         self.candidate_tree.bind("<Motion>", self._candidate_table_motion)
         self.render_lines()
@@ -637,15 +694,23 @@ class DialogueReviewApp:
             self.candidate_tree.delete(*children)
         line = self._selected_line()
         if line is None:
+            self.selected_context_label.configure(text="—")
+            self.selected_line_label.configure(text="—")
+            self.selected_acting_note_label.configure(text="—")
             self.candidate_description.configure(
                 text="Select a line to review its candidates."
             )
             return
 
+        self.selected_context_label.configure(text=line.get("context") or "—")
+        self.selected_line_label.configure(text=line["line_text"] or "—")
+        self.selected_acting_note_label.configure(
+            text=line.get("acting_note") or "—"
+        )
         description = (
             "Unmatched audible segments are shown for nonverbal lines."
             if line["type"] == "nonverbal"
-            else line["line_text"]
+            else ""
         )
         self.candidate_description.configure(text=description)
 
@@ -664,10 +729,13 @@ class DialogueReviewApp:
                 candidates,
                 key=lambda candidate: float(candidate.get("score", 0.0)),
                 reverse=True,
-            )
+        )
         if not candidates:
             self.candidate_description.configure(
-                text=description + "\n\nNo candidate segments are available."
+                text=(
+                    f"{description}\n\n" if description else ""
+                )
+                + "No candidate segments are available."
             )
             return
 

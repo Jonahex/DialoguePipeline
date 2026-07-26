@@ -43,7 +43,10 @@ background while showing the pipeline log.
 The review screen lists script lines on the left and candidate segments on the
 right. Filter lines by status, click a line-column header to sort, use the `▶`
 cells to audition one WAV at a time, and select or unselect a take. Selections
-are saved immediately to `line_review.json`. Nonverbal lines use the
+are saved immediately to `line_review.json`. The selected line's context, full
+text, and acting note are shown above the candidate table. Both tables have
+permanently allocated vertical and horizontal scrollbars in addition to mouse
+wheel scrolling. Nonverbal lines use the
 name-sorted shared pool of audible segments that are not retained candidates
 for any normal dialogue line. `Finalize Selected Lines` copies every selected
 take to its target filename.

@@ -1078,9 +1078,9 @@ def test_line_review_types_nonverbal_lines_and_uses_audible_unmatched_pool(
         "sheet_index": 0,
         "excel_row": 3,
         "quest": "",
-        "context": "",
+        "context": "Standing near the market.",
         "line": "(cough)",
-        "acting_note": "",
+        "acting_note": "A restrained cough.",
         "emotion": "",
         "target_filename": "cough_target",
     }
@@ -1109,6 +1109,8 @@ def test_line_review_types_nonverbal_lines_and_uses_audible_unmatched_pool(
     loaded = load_line_review(review_path)
 
     assert loaded["lines"][0]["type"] == "nonverbal"
+    assert loaded["lines"][0]["context"] == "Standing near the market."
+    assert loaded["lines"][0]["acting_note"] == "A restrained cough."
     assert loaded["lines"][0]["status"] == "REVIEW"
     assert loaded["lines"][0]["selected_segment_id"] is None
     assert loaded["lines"][0]["candidates"] == []

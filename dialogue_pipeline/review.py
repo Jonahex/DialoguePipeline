@@ -243,7 +243,9 @@ def build_line_review(
                 "line_id": str(source_line["line_id"]),
                 "sheet": str(source_line["sheet"]),
                 "excel_row": int(source_line["excel_row"]),
+                "context": str(source_line.get("context") or ""),
                 "line_text": str(source_line["line"]),
+                "acting_note": str(source_line.get("acting_note") or ""),
                 "target_filename": str(source_line["target_filename"]),
                 "type": line_type,
                 "status": status,
@@ -296,12 +298,16 @@ def validate_line_review(data: Any) -> dict[str, Any]:
     for index, line in enumerate(data["lines"], start=1):
         if not isinstance(line, dict):
             raise ValueError(f"Review line {index} must be an object")
+        line.setdefault("context", "")
+        line.setdefault("acting_note", "")
         missing = {
             key
             for key in (
                 "line_id",
                 "sheet",
+                "context",
                 "line_text",
+                "acting_note",
                 "target_filename",
                 "type",
                 "status",

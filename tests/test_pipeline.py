@@ -8,15 +8,12 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from openpyxl import load_workbook
 
 from dialogue_pipeline.alignment import (
     _apply_duplicate_line_policy,
     _candidate_reliability,
     _has_unsafe_untranscribed_merge,
     _multisentence_fragment_join_actions,
-    _vocalization_review_actions,
-    _write_review_workbook,
     align_project,
     order_independent_align,
     sentence_fidelity,
@@ -25,6 +22,11 @@ from dialogue_pipeline.alignment import (
 )
 from dialogue_pipeline.audio import cut_pcm_wav, prepare_pcm_segmentation_source
 from dialogue_pipeline.finalize import finalize_review
+from dialogue_pipeline.review import (
+    build_line_review,
+    load_line_review,
+    save_line_review,
+)
 from dialogue_pipeline.segmentation import (
     segment_project,
     split_regions_on_word_gaps,
@@ -1065,63 +1067,8 @@ def test_duplicate_weak_order_assigns_separate_take_groups() -> None:
     assert all(action["duplicate_resolved"] for action in actions)
 
 
-def test_nonverbal_review_policy_does_not_supply_random_candidates() -> None:
-    actions = _vocalization_review_actions(
-        base_segments=[
-            {
-                "start_seconds": 0.0,
-                "end_seconds": 0.8,
-                "transcript": "completely unrelated",
-                "word_count": 2,
-            }
-        ],
-        lines=[{"line_id": "a", "line": "(cough)"}],
-        session_id="session",
-        settings={"nonverbal_policy": "review"},
-        existing_actions=[],
-    )
-
-    assert actions == []
-
-
-def test_vocalization_weak_order_policy_supplies_review_candidates() -> None:
-    actions = _vocalization_review_actions(
-        base_segments=[
-            {
-                "start_seconds": 0.0,
-                "end_seconds": 0.8,
-                "transcript": "eaargh",
-                "word_count": 1,
-            }
-        ],
-        lines=[{"line_id": "a", "line": "Aaaarraaagh..."}],
-        session_id="session",
-        settings={
-            "nonverbal_policy": "weak_order",
-            "vocalization_alignment": {
-                "enabled": True,
-                "candidates_per_line": 1,
-            }
-        },
-        existing_actions=[],
-    )
-
-    assert len(actions) == 1
-    assert actions[0]["force_candidate"] is True
-    assert actions[0]["forced_review_reason"] == "VOCALIZATION_REVIEW"
-
-
-@pytest.mark.parametrize(
-    ("policy", "expected_status"),
-    [
-        ("review", "NONVERBAL_REVIEW"),
-        ("skip", "SKIP"),
-    ],
-)
-def test_review_workbook_does_not_preselect_nonverbal_lines(
+def test_line_review_types_nonverbal_lines_and_uses_audible_unmatched_pool(
     tmp_path: Path,
-    policy: str,
-    expected_status: str,
 ) -> None:
     line = {
         "line_id": "Sheet::R3",
@@ -1135,33 +1082,68 @@ def test_review_workbook_does_not_preselect_nonverbal_lines(
         "emotion": "",
         "target_filename": "cough_target",
     }
-    review_path = tmp_path / f"{policy}.xlsx"
-    _write_review_workbook(
-        review_path=review_path,
-        project_dir=tmp_path,
+    review_path = tmp_path / "line_review.json"
+    review = build_line_review(
         source_lines=[line],
         candidates_by_line={},
-        unmatched_rows=[],
-        nonverbal_policy=policy,
+        unmatched_segments=[
+            {
+                "segment_id": "audible",
+                "segment_file": "audible.wav",
+                "transcript": "",
+                "technical_score": 80.0,
+                "audible": True,
+            },
+            {
+                "segment_id": "quiet",
+                "segment_file": "quiet.wav",
+                "transcript": "",
+                "technical_score": 90.0,
+                "audible": False,
+            },
+        ],
+    )
+    save_line_review(review_path, review)
+    loaded = load_line_review(review_path)
+
+    assert loaded["lines"][0]["type"] == "nonverbal"
+    assert loaded["lines"][0]["status"] == "REVIEW"
+    assert loaded["lines"][0]["selected_segment_id"] is None
+    assert loaded["lines"][0]["candidates"] == []
+    assert [
+        segment["segment_id"] for segment in loaded["unmatched_segments"]
+    ] == ["audible"]
+
+
+def test_finalize_omits_unselected_lines(tmp_path: Path) -> None:
+    line = {
+        "line_id": "Sheet::R3",
+        "sheet": "Sheet",
+        "sheet_index": 0,
+        "excel_row": 3,
+        "line": "No take was selected.",
+        "target_filename": "unselected",
+    }
+    review_path = tmp_path / "line_review.json"
+    save_line_review(
+        review_path,
+        build_line_review(
+            source_lines=[line],
+            candidates_by_line={},
+            unmatched_segments=[],
+        ),
+    )
+    write_json(tmp_path / "segments_manifest.json", {"sessions": []})
+
+    result = finalize_review(
+        project_dir=tmp_path,
+        project={"export": {}},
+        review_path=review_path,
+        output_dir=tmp_path / "final",
     )
 
-    workbook = load_workbook(review_path, read_only=False, data_only=False)
-    lines_sheet = workbook["Lines"]
-    headers = {
-        cell.value: cell.column for cell in lines_sheet[1] if cell.value
-    }
-    assert lines_sheet.cell(2, headers["Candidate Count"]).value == 0
-    assert lines_sheet.cell(2, headers["Suggested Best Segment"]).value is None
-    assert lines_sheet.cell(2, headers["Selected Segment"]).value is None
-    assert lines_sheet.cell(2, headers["Status"]).value == expected_status
-    assert lines_sheet.cell(2, headers["Candidate Summary"]).value
-    summary_statuses = {
-        lines_sheet.cell(row, 1).value
-        for row in range(1, lines_sheet.max_row + 1)
-    }
-    assert "NONVERBAL_REVIEW" in summary_statuses
-    assert len(lines_sheet._charts) == 1
-    workbook.close()
+    assert result["export_count"] == 0
+    assert result["error_count"] == 0
 
 
 def test_text_aligner_excludes_nonverbal_lines() -> None:
@@ -1847,13 +1829,11 @@ def test_sample_accurate_cut_and_finalize(tmp_path: Path) -> None:
         "base_indices": [0],
         "rank": 1,
     }
-    review_path = tmp_path / "A_line_review.xlsx"
-    _write_review_workbook(
-        review_path=review_path,
-        project_dir=tmp_path,
+    review_path = tmp_path / "line_review.json"
+    review_data = build_line_review(
         source_lines=[line],
         candidates_by_line={line["line_id"]: [candidate]},
-        unmatched_rows=[
+        unmatched_segments=[
             {
                 "segment_id": candidate["segment_id"],
                 "segment_file": candidate["segment_file"],
@@ -1871,52 +1851,25 @@ def test_sample_accurate_cut_and_finalize(tmp_path: Path) -> None:
                 "suggested_line_2_text": "",
                 "suggested_line_2_score": 0.0,
                 "technical_flags": "",
+                "technical_score": 80.0,
+                "audible": True,
             }
         ],
     )
-    workbook = load_workbook(review_path, read_only=False, data_only=False)
-    lines_sheet = workbook["Lines"]
-    headers = {
-        cell.value: cell.column for cell in lines_sheet[1] if cell.value
-    }
-    assert lines_sheet.cell(2, headers["Candidate 1"]).value == "session__s00001"
-    assert lines_sheet.cell(2, headers["Suggested Best Segment"]).value == (
+    save_line_review(review_path, review_data)
+    loaded_review = load_line_review(review_path)
+    assert loaded_review["lines"][0]["type"] == "normal"
+    assert loaded_review["lines"][0]["status"] == "AUTO_OK"
+    assert loaded_review["lines"][0]["suggested_segment_id"] == (
         "session__s00001"
     )
-    assert lines_sheet.cell(2, headers["Selected Segment"]).value == (
+    assert loaded_review["lines"][0]["selected_segment_id"] == (
         "session__s00001"
     )
-    assert lines_sheet.cell(2, headers["Candidate 1"]).hyperlink is not None
-    assert (
-        lines_sheet.cell(2, headers["Suggested Best Segment"]).hyperlink
-        is not None
+    assert loaded_review["lines"][0]["candidates"][0]["score"] == 100.0
+    assert loaded_review["unmatched_segments"][0]["segment_id"] == (
+        "session__s00001"
     )
-    assert lines_sheet.cell(2, headers["Selected Segment"]).hyperlink is not None
-    assert len(lines_sheet._charts) == 1
-    assert lines_sheet["B7"].value.startswith("=COUNTIF(")
-    assert "Unmatched Segments" in workbook.sheetnames
-    candidates_sheet = workbook["Candidates"]
-    candidate_headers = {
-        cell.value: cell.column for cell in candidates_sheet[1] if cell.value
-    }
-    assert "Alignment Mode" not in candidate_headers
-    assert "Local ASR Rescued" not in candidate_headers
-    assert (
-        candidates_sheet.cell(
-            2,
-            candidate_headers["Minimum Clause Score"],
-        ).value
-        == 100.0
-    )
-    assert (
-        candidates_sheet.cell(2, candidate_headers["Fragment Join"]).value
-        is False
-    )
-    unmatched_sheet = workbook["Unmatched Segments"]
-    assert unmatched_sheet["A2"].value == "session__s00001"
-    assert unmatched_sheet["A2"].hyperlink is not None
-    assert unmatched_sheet["B2"].hyperlink is not None
-    workbook.close()
 
     manifest = {
         "schema_version": 1,
@@ -1999,13 +1952,14 @@ def test_finalize_can_optionally_reuse_one_segment(tmp_path: Path) -> None:
                 "rank": 1,
             }
         ]
-    review_path = tmp_path / "review.xlsx"
-    _write_review_workbook(
-        review_path=review_path,
-        project_dir=tmp_path,
-        source_lines=lines,
-        candidates_by_line=candidates,
-        unmatched_rows=[],
+    review_path = tmp_path / "line_review.json"
+    save_line_review(
+        review_path,
+        build_line_review(
+            source_lines=lines,
+            candidates_by_line=candidates,
+            unmatched_segments=[],
+        ),
     )
     write_json(
         tmp_path / "segments_manifest.json",
@@ -2242,16 +2196,11 @@ def test_segmentation_and_alignment_integration(tmp_path: Path) -> None:
         session_filter={"session"},
     )
     assert outputs["review"].is_file()
+    assert outputs["review"].name == "line_review.json"
     assert "unmatched" not in outputs
     assert not stale_unmatched.exists()
-    workbook = load_workbook(outputs["review"], read_only=False, data_only=False)
-    lines_sheet = workbook["Lines"]
-    headers = {
-        cell.value: cell.column for cell in lines_sheet[1] if cell.value
-    }
-    assert lines_sheet.cell(2, headers["Selected Segment"]).value
-    assert lines_sheet.cell(3, headers["Selected Segment"]).value
-    assert lines_sheet.cell(2, headers["Candidate 1"]).hyperlink is not None
-    assert len(lines_sheet._charts) == 1
-    assert "Unmatched Segments" in workbook.sheetnames
-    workbook.close()
+    review = load_line_review(outputs["review"])
+    assert review["lines"][0]["selected_segment_id"]
+    assert review["lines"][1]["selected_segment_id"]
+    assert review["lines"][0]["candidates"]
+    assert "unmatched_segments" in review

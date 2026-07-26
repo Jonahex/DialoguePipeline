@@ -9,17 +9,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from openpyxl import load_workbook
-
+from .review import load_line_review
 from .util import read_json, resolve_project_path
-
-
-def _header_map(worksheet) -> dict[str, int]:
-    return {
-        str(cell.value or "").strip(): cell.column
-        for cell in worksheet[1]
-        if str(cell.value or "").strip()
-    }
 
 
 def _safe_target_filename(value: str, extension: str) -> str:
@@ -77,17 +68,7 @@ def finalize_review(
         raise FileNotFoundError(manifest_path)
     manifest = read_json(manifest_path)
     segments = _segment_lookup(manifest)
-    workbook = load_workbook(review_path, read_only=True, data_only=True)
-    if "Lines" not in workbook.sheetnames:
-        workbook.close()
-        raise ValueError(f"Review workbook has no Lines sheet: {review_path}")
-    worksheet = workbook["Lines"]
-    headers = _header_map(worksheet)
-    required = {"Line ID", "Target Filename", "Selected Segment", "Status"}
-    missing_headers = sorted(required - headers.keys())
-    if missing_headers:
-        workbook.close()
-        raise ValueError("Missing review columns: " + ", ".join(missing_headers))
+    review_data = load_line_review(review_path)
 
     extension = str(project.get("export", {}).get("extension", ".wav"))
     expected_format = {
@@ -106,101 +87,76 @@ def finalize_review(
     selected_ids = []
     target_names = []
 
-    try:
-        for row_number in range(2, worksheet.max_row + 1):
-            line_id = str(
-                worksheet.cell(row_number, headers["Line ID"]).value or ""
-            ).strip()
-            target_value = str(
-                worksheet.cell(row_number, headers["Target Filename"]).value or ""
-            ).strip()
-            selected_id = str(
-                worksheet.cell(row_number, headers["Selected Segment"]).value or ""
-            ).strip()
-            status = str(
-                worksheet.cell(row_number, headers["Status"]).value or ""
-            ).strip().upper()
-            if not line_id:
-                continue
-            if not target_value and not selected_id and not status:
-                continue
-            if status == "SKIP":
-                continue
-            if not selected_id:
-                errors.append(
-                    {
-                        "line_id": line_id,
-                        "error": "NO_SELECTED_SEGMENT",
-                        "detail": f"Lines row {row_number}",
-                    }
-                )
-                continue
-            segment = segments.get(selected_id)
-            if segment is None:
-                errors.append(
-                    {
-                        "line_id": line_id,
-                        "error": "UNKNOWN_SEGMENT",
-                        "detail": selected_id,
-                    }
-                )
-                continue
-            try:
-                target_name = _safe_target_filename(target_value, extension)
-            except ValueError as error:
-                errors.append(
-                    {
-                        "line_id": line_id,
-                        "error": "INVALID_TARGET_FILENAME",
-                        "detail": str(error),
-                    }
-                )
-                continue
-
-            segment_path = resolve_project_path(project_dir, segment["file"])
-            if not segment_path.is_file():
-                errors.append(
-                    {
-                        "line_id": line_id,
-                        "error": "SEGMENT_FILE_MISSING",
-                        "detail": str(segment_path),
-                    }
-                )
-                continue
-            wave_format = _probe_wave(segment_path)
-            mismatches = {
-                key: (wave_format[key], expected)
-                for key, expected in expected_format.items()
-                if wave_format[key] != expected
-            }
-            if mismatches:
-                errors.append(
-                    {
-                        "line_id": line_id,
-                        "error": "FORMAT_MISMATCH",
-                        "detail": repr(mismatches),
-                    }
-                )
-                continue
-
-            destination = output_dir / target_name
-            exports.append(
+    for line in review_data["lines"]:
+        line_id = str(line["line_id"]).strip()
+        target_value = str(line["target_filename"]).strip()
+        selected_id = str(line.get("selected_segment_id") or "").strip()
+        if not selected_id:
+            continue
+        segment = segments.get(selected_id)
+        if segment is None:
+            errors.append(
                 {
                     "line_id": line_id,
-                    "target_filename": target_name,
-                    "selected_segment_id": selected_id,
-                    "segment_file": str(segment_path),
-                    "output_file": str(destination),
-                    "source_audio": segment["source_audio"],
-                    "start_seconds": segment["start_seconds"],
-                    "end_seconds": segment["end_seconds"],
-                    "transcript": segment.get("transcript", ""),
+                    "error": "UNKNOWN_SEGMENT",
+                    "detail": selected_id,
                 }
             )
-            selected_ids.append(selected_id)
-            target_names.append(target_name.lower())
-    finally:
-        workbook.close()
+            continue
+        try:
+            target_name = _safe_target_filename(target_value, extension)
+        except ValueError as error:
+            errors.append(
+                {
+                    "line_id": line_id,
+                    "error": "INVALID_TARGET_FILENAME",
+                    "detail": str(error),
+                }
+            )
+            continue
+
+        segment_path = resolve_project_path(project_dir, segment["file"])
+        if not segment_path.is_file():
+            errors.append(
+                {
+                    "line_id": line_id,
+                    "error": "SEGMENT_FILE_MISSING",
+                    "detail": str(segment_path),
+                }
+            )
+            continue
+        wave_format = _probe_wave(segment_path)
+        mismatches = {
+            key: (wave_format[key], expected)
+            for key, expected in expected_format.items()
+            if wave_format[key] != expected
+        }
+        if mismatches:
+            errors.append(
+                {
+                    "line_id": line_id,
+                    "error": "FORMAT_MISMATCH",
+                    "detail": repr(mismatches),
+                }
+            )
+            continue
+
+        destination = output_dir / target_name
+        exports.append(
+            {
+                "line_id": line_id,
+                "target_filename": target_name,
+                "selected_segment_id": selected_id,
+                "segment_file": str(segment_path),
+                "output_file": str(destination),
+                "source_audio": segment["source_audio"],
+                "start_seconds": segment["start_seconds"],
+                "end_seconds": segment["end_seconds"],
+                "transcript": segment.get("transcript", ""),
+            }
+        )
+        selected_ids.append(selected_id)
+        target_names.append(target_name.lower())
 
     if not allow_segment_reuse:
         duplicate_segment_ids = {

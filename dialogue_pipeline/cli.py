@@ -11,6 +11,7 @@ from .alignment import align_project
 from .doctor import run_doctor
 from .finalize import finalize_review
 from .project import create_project, load_project
+from .review import REVIEW_FILE_NAME
 from .segmentation import segment_project
 from .transcription import transcribe_project, transcribe_segments_project
 from .util import project_file_from_arg
@@ -29,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="dialogue-pipeline",
         description=(
             "Split long voice recordings, align takes to an Excel script, "
-            "generate a review workbook, and finalize selected assets."
+            "generate review data, and finalize selected assets."
         ),
     )
     parser.add_argument(
@@ -106,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     align_parser = subparsers.add_parser(
         "align",
-        help="Align segments and generate A_line_review.xlsx.",
+        help=f"Align segments and generate {REVIEW_FILE_NAME}.",
     )
     _project_argument(align_parser)
     align_parser.add_argument(
@@ -143,13 +144,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     finalize_parser = subparsers.add_parser(
         "finalize",
-        help="Copy user-selected segments to final spreadsheet filenames.",
+        help="Copy user-selected segments to final script filenames.",
     )
     _project_argument(finalize_parser)
     finalize_parser.add_argument(
         "--review",
         type=Path,
-        help="Review workbook; defaults to <project>/A_line_review.xlsx.",
+        help=f"Review data; defaults to <project>/{REVIEW_FILE_NAME}.",
     )
     finalize_parser.add_argument("--output", required=True, type=Path)
     finalize_parser.add_argument("--overwrite", action="store_true")
@@ -285,7 +286,7 @@ def dispatch(args: argparse.Namespace) -> int:
         review_path = (
             args.review.resolve()
             if args.review
-            else project_dir / "A_line_review.xlsx"
+            else project_dir / REVIEW_FILE_NAME
         )
         result = finalize_review(
             project_dir=project_dir,

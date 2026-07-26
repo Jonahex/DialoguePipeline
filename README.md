@@ -1,8 +1,8 @@
 # Dialogue VA Pipeline
 
-Local command-line tools for turning long voice-actor recordings into reviewable
-per-take WAV files and then copying selected takes to the exact filenames from an
-Excel script.
+Local desktop and command-line tools for turning long voice-actor recordings
+into reviewable per-take WAV files and then copying selected takes to the exact
+filenames from an Excel script.
 
 The pipeline never modifies the source workbook or source recordings.
 
@@ -25,6 +25,27 @@ Check the installation:
 ```powershell
 .\run_pipeline.ps1 doctor
 ```
+
+## Desktop app
+
+Launch the complete create/review/finalize workflow with:
+
+```powershell
+.\run_ui.ps1
+```
+
+`Open Project` accepts a project directory containing `project.json` and
+`line_review.json`. `Create New Project` asks for the lines workbook, recorded
+WAV directory, and a destination project directory, then runs inventory,
+transcription, segmentation, segment transcription, and alignment in the
+background while showing the pipeline log.
+
+The review screen lists script lines on the left and candidate segments on the
+right. Filter lines by status, sort them, audition one WAV at a time, and select
+or unselect a take. Selections are saved immediately to `line_review.json`.
+Nonverbal lines use the shared pool of audible segments that were not reliable
+matches for normal dialogue. `Finalize Selected Lines` copies every selected
+take to its target filename.
 
 ## Commands
 
@@ -122,17 +143,15 @@ For a targeted retry, pass one or more exact IDs with
 
 Outputs:
 
-- `A_line_review.xlsx`: every script line, linked top-three candidates,
-  transcripts, linked suggested/selected takes, an editable `Selected Segment`,
-  a formula-driven status pie chart below the line table, and an
-  `Unmatched Segments` sheet with linked unmapped audio and script suggestions.
+- `line_review.json`: every script line, its type and status, sorted candidate
+  segments and transcripts, selected segment, plus the pool of audible
+  unmatched segments used to review nonverbal lines.
 - `alignment.json`: machine-readable alignment details.
 
-Click a candidate link to audition it. Copy an entire `Candidate 1`,
-`Candidate 2`, or `Candidate 3` cell into `Lines!Selected Segment` to preserve
-both its Segment ID and hyperlink. Segment IDs from the `Candidates` sheet or
-the `Unmatched Segments` sheet also work.
-Set `Status` to `SKIP` only when a line should intentionally be omitted.
+Use the desktop app to audition and change selections. Normal lines are
+`AUTO_OK`, `REVIEW`, or `MISSING` after alignment. Selecting a candidate changes
+the status to `MANUALLY_REVIEWED`; unselecting it changes the status to
+`REVIEW`.
 
 Every valid audio span is scored against every line enabled for the session; a
 global interval resolver then chooses non-overlapping spans without requiring
@@ -143,10 +162,10 @@ default and may be set to a small positive value when recording order is known
 to be useful only as a tie-breaker.
 
 Candidate discovery deliberately tolerates reordered or imperfect ASR text,
-but `AUTO_OK` uses separate transcript-fidelity gates. The `Candidates` sheet
-shows ordered similarity, fuzzy-token coverage, fuzzy-token precision, and
-extra-word count, along with exact-span ASR verification status. Lines of three
-words or fewer default to complete coverage
+but `AUTO_OK` uses separate transcript-fidelity gates. Detailed diagnostics
+remain in `alignment.json`, including ordered similarity, fuzzy-token coverage,
+fuzzy-token precision, extra-word count, and exact-span ASR verification
+status. Lines of three words or fewer default to complete coverage
 and precision plus `short_line_min_ordered_score`; longer lines use the more
 tolerant `reliable_min_ordered_score`, `reliable_min_token_coverage`, and
 `reliable_min_token_precision`. A merged span containing substantial,
@@ -185,20 +204,11 @@ base transcripts or script-prompted fallback—drives the final similarity,
 clause, extra-word, and repetition gates. Empty or failed verification receives
 `EXACT_SPAN_ASR_FAILED`.
 
-`nonverbal_policy` controls parenthesized directions and recognized
-vocalizations such as coughs, grunts, and death rattles. They are always
-excluded from normal text matching:
-
-- `"review"` (default): create a `NONVERBAL_REVIEW` row with no suggested or
-  selected segment. Audition the `Unmatched Segments` sheet and copy the
-  intended Segment ID manually.
-- `"skip"`: create the row with `SKIP` status and no candidate.
-- `"weak_order"`: add manual-only phonetic/duration/order-hint candidates.
-  These hints are intentionally never auto-selected and may be inaccurate.
-
-The optional `vocalization_alignment` thresholds apply only when
-`nonverbal_policy` is `"weak_order"`; its `enabled` switch can disable those
-weak candidates without changing the line status.
+Parenthesized directions and recognized vocalizations such as coughs, grunts,
+and death rattles have line type `nonverbal`. They are excluded from normal
+text matching, start in `REVIEW`, and are never auto-selected. The desktop app
+shows all audible segments that were not reliable candidates for normal lines
+when a nonverbal line is selected.
 
 `duplicate_line_policy` supports:
 
@@ -236,9 +246,9 @@ To intentionally reuse one selected segment for multiple target filenames:
   --allow-segment-reuse
 ```
 
-The finalizer reads only `Selected Segment`; `Suggested Best Segment` is
-informational. It validates target names, WAV format, missing selections,
-segment reuse, target collisions, and existing output files.
+The finalizer reads only `selected_segment_id` from `line_review.json`.
+Unselected lines are omitted. It validates target names, WAV format, segment
+reuse, target collisions, and existing output files.
 
 Use `--allow-incomplete` to export valid selections while retaining errors in
 `finalization_errors.tsv`. Use `--overwrite` only when replacing an existing

@@ -7,17 +7,10 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-from openpyxl import Workbook
-from openpyxl.chart import PieChart, Reference
-from openpyxl.chart.label import DataLabelList
-from openpyxl.chart.series import DataPoint
-from openpyxl.chart.shapes import GraphicalProperties
-from openpyxl.formatting.rule import FormulaRule
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
 from rapidfuzz import fuzz
 
 from .project import load_source_data
+from .review import REVIEW_FILE_NAME, build_line_review
 from .segmentation import materialize_derived_segment
 from .transcription import (
     transcribe_candidate_spans,
@@ -28,7 +21,6 @@ from .util import (
     is_vocalization_script,
     normalize_text,
     read_json,
-    resolve_project_path,
     word_count,
     write_json,
 )
@@ -391,16 +383,6 @@ def _transcription_word_index(
         "starts": [item[0] for item in words],
         "maximum_duration": maximum_duration,
     }
-
-
-def _nonverbal_policy(settings: dict[str, Any]) -> str:
-    policy = str(settings.get("nonverbal_policy", "review")).strip().lower()
-    if policy not in {"review", "skip", "weak_order"}:
-        raise ValueError(
-            "alignment.nonverbal_policy must be 'review', 'skip', or "
-            f"'weak_order', got {policy!r}"
-        )
-    return policy
 
 
 def _text_matchable_lines(
@@ -1255,129 +1237,6 @@ def _expand_alignment_actions(
     return expanded
 
 
-def _vocalization_key(value: str) -> str:
-    normalized = re.sub(r"[^a-z]+", "", normalize_text(value))
-    normalized = re.sub(r"(.)\1+", r"\1", normalized)
-    return normalized.replace("gh", "h")
-
-
-def _vocalization_review_actions(
-    *,
-    base_segments: list[dict[str, Any]],
-    lines: list[dict[str, Any]],
-    session_id: str,
-    settings: dict[str, Any],
-    existing_actions: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    if _nonverbal_policy(settings) != "weak_order":
-        return []
-    vocalization = dict(settings.get("vocalization_alignment") or {})
-    if not bool(vocalization.get("enabled", True)):
-        return []
-
-    line_indexes = [
-        index
-        for index, line in enumerate(lines)
-        if is_vocalization_script(line["line"])
-    ]
-    if not line_indexes:
-        return []
-    maximum_duration = float(vocalization.get("max_segment_seconds", 4.0))
-    maximum_words = int(vocalization.get("max_transcript_words", 3))
-    candidates_per_line = max(
-        1,
-        int(vocalization.get("candidates_per_line", 3)),
-    )
-    sequence_weight = float(vocalization.get("weak_order_weight", 4.0))
-    eligible_segments = [
-        (index, segment)
-        for index, segment in enumerate(base_segments)
-        if (
-            float(segment.get("end_seconds", 0.0))
-            - float(segment.get("start_seconds", 0.0))
-            <= maximum_duration
-            and int(
-                segment.get("word_count")
-                or word_count(str(segment.get("transcript") or ""))
-            )
-            <= maximum_words
-        )
-    ]
-    if not eligible_segments:
-        return []
-
-    existing = {
-        (
-            int(action["line_index"]),
-            int(action["start_index"]),
-            int(action["count"]),
-        )
-        for action in existing_actions
-    }
-    actions = []
-    for line_index in line_indexes:
-        line = lines[line_index]
-        expected_key = _vocalization_key(line["line"])
-        matches = []
-        for segment_index, segment in eligible_segments:
-            transcript = str(segment.get("transcript") or "")
-            observed_key = _vocalization_key(transcript)
-            phonetic_score = (
-                max(
-                    fuzz.ratio(expected_key, observed_key),
-                    fuzz.partial_ratio(expected_key, observed_key),
-                )
-                if expected_key and observed_key
-                else 0.0
-            )
-            text_score = text_similarity(line["line"], transcript)
-            order_score = _order_hint(
-                segment_index=segment_index,
-                segment_count=len(base_segments),
-                line_index=line_index,
-                line_count=len(lines),
-            )
-            score = min(
-                100.0,
-                max(text_score, 0.85 * phonetic_score)
-                + sequence_weight * order_score,
-            )
-            matches.append((score, segment_index, transcript, order_score))
-        matches.sort(reverse=True)
-        for match_rank, (
-            score,
-            segment_index,
-            transcript,
-            order_score,
-        ) in enumerate(matches[:candidates_per_line], start=1):
-            key = (line_index, segment_index, 1)
-            if key in existing:
-                continue
-            actions.append(
-                {
-                    "type": "assigned",
-                    "start_index": segment_index,
-                    "count": 1,
-                    "line_index": line_index,
-                    "primary_line_index": line_index,
-                    "match_score": score,
-                    "transcript": transcript,
-                    "duration_plausibility": 0.0,
-                    "order_hint": order_score,
-                    "confidence_margin": 0.0,
-                    "segment_match_rank": match_rank,
-                    "is_primary_match": False,
-                    "take_group_id": (
-                        f"{session_id}__v{line_index + 1:05d}"
-                    ),
-                    "force_candidate": True,
-                    "forced_review_reason": "VOCALIZATION_REVIEW",
-                    "duplicate_resolution": None,
-                    "duplicate_resolved": False,
-                }
-            )
-    return actions
-
 
 def _candidate_reliability(
     *,
@@ -1552,7 +1411,6 @@ def align_project(
     source_data = load_source_data(project_dir, project)
     line_by_id = {line["line_id"]: line for line in source_data["lines"]}
     settings = dict(project.get("alignment") or {})
-    nonverbal_policy = _nonverbal_policy(settings)
     manifest_session_by_id = {
         entry["session_id"]: entry for entry in manifest["sessions"]
     }
@@ -1628,15 +1486,6 @@ def align_project(
             base_segments=base_segments,
             session_id=session["id"],
             settings=settings,
-        )
-        actions.extend(
-            _vocalization_review_actions(
-                base_segments=base_segments,
-                lines=session_lines,
-                session_id=session["id"],
-                settings=settings,
-                existing_actions=actions,
-            )
         )
         verification_enabled = bool(
             segment_asr_settings.get("enabled", False)
@@ -2011,13 +1860,27 @@ def align_project(
                     "suggested_line_2_text": second[2],
                     "suggested_line_2_score": second[0],
                     "technical_flags": _technical_flags(segment),
+                    "technical_score": _technical_score(segment),
+                    "audible": (
+                        float(segment["metrics"]["duration_seconds"]) >= 0.15
+                        and float(
+                            segment["metrics"].get("rms_dbfs")
+                            if segment["metrics"].get("rms_dbfs") is not None
+                            else -999.0
+                        )
+                        >= float(
+                            settings.get(
+                                "untranscribed_merge_min_rms_dbfs",
+                                -45.0,
+                            )
+                        )
+                    ),
                 }
             )
 
         alignment_sessions.append(
             {
                 "session_id": session["id"],
-                "nonverbal_policy": nonverbal_policy,
                 "script_line_count": len(session_lines),
                 "base_segment_count": len(base_segments),
                 "assignments": serialized_actions,
@@ -2037,7 +1900,6 @@ def align_project(
 
     alignment_payload = {
         "schema_version": 1,
-        "nonverbal_policy": nonverbal_policy,
         "sessions": alignment_sessions,
         "candidate_count": len(candidates),
         "unmatched_count": len(unmatched_rows),
@@ -2055,14 +1917,14 @@ def align_project(
     write_json(alignment_path, alignment_payload)
     write_json(manifest_path, manifest)
 
-    review_path = project_dir / "A_line_review.xlsx"
-    _write_review_workbook(
-        review_path=review_path,
-        project_dir=project_dir,
-        source_lines=source_data["lines"],
-        candidates_by_line=by_line,
-        unmatched_rows=unmatched_rows,
-        nonverbal_policy=nonverbal_policy,
+    review_path = project_dir / REVIEW_FILE_NAME
+    write_json(
+        review_path,
+        build_line_review(
+            source_lines=source_data["lines"],
+            candidates_by_line=by_line,
+            unmatched_segments=unmatched_rows,
+        ),
     )
     (project_dir / "B_unmatched_segments.tsv").unlink(missing_ok=True)
     return {
@@ -2082,684 +1944,3 @@ def _technical_flags(segment: dict[str, Any]) -> str:
     if not segment.get("transcript", "").strip():
         flags.append("NO_TRANSCRIPT")
     return ",".join(flags)
-
-
-def _write_review_workbook(
-    *,
-    review_path: Path,
-    project_dir: Path,
-    source_lines: list[dict[str, Any]],
-    candidates_by_line: dict[str, list[dict[str, Any]]],
-    unmatched_rows: list[dict[str, Any]],
-    nonverbal_policy: str = "review",
-) -> None:
-    nonverbal_policy = _nonverbal_policy(
-        {"nonverbal_policy": nonverbal_policy}
-    )
-    workbook = Workbook()
-    lines_sheet = workbook.active
-    lines_sheet.title = "Lines"
-    candidates_sheet = workbook.create_sheet("Candidates")
-    unmatched_sheet = workbook.create_sheet("Unmatched Segments")
-    instructions_sheet = workbook.create_sheet("Instructions")
-
-    line_headers = [
-        "Line ID",
-        "Sheet",
-        "Excel Row",
-        "Quest",
-        "Context",
-        "Line to Speak",
-        "Acting Note",
-        "Facial Emotion",
-        "Target Filename",
-        "Candidate Count",
-        "Candidate 1",
-        "Candidate 2",
-        "Candidate 3",
-        "Suggested Best Segment",
-        "Selected Segment",
-        "Status",
-        "Candidate Summary",
-        "User Notes",
-    ]
-    lines_sheet.append(line_headers)
-    for line in source_lines:
-        is_nonverbal = is_vocalization_script(line["line"])
-        line_candidates = candidates_by_line.get(line["line_id"], [])
-        best = line_candidates[0] if line_candidates else None
-        reliable_best = next(
-            (candidate for candidate in line_candidates if candidate["reliable"]),
-            None,
-        )
-        if is_nonverbal:
-            status = (
-                "SKIP"
-                if nonverbal_policy == "skip"
-                else "NONVERBAL_REVIEW"
-            )
-        else:
-            status = (
-                "AUTO_OK"
-                if reliable_best
-                else ("REVIEW" if line_candidates else "MISSING")
-            )
-        suggested = best["segment_id"] if best else ""
-        selected = reliable_best["segment_id"] if reliable_best else ""
-        top_candidates = line_candidates[:3]
-        summary = "\n".join(
-            (
-                f"#{candidate['rank']} {candidate['segment_id']} | "
-                f"match={candidate['match_score']:.1f} | "
-                f"ordered={candidate.get('ordered_similarity', 0.0):.1f} | "
-                f"coverage={candidate.get('token_coverage', 0.0):.0%} | "
-                f"precision={candidate.get('token_precision', 0.0):.0%} | "
-                f"weakest-clause="
-                f"{candidate.get('minimum_clause_score', 0.0):.1f} | "
-                + (
-                    f"joined={candidate.get('fragment_source_count', 0)} | "
-                    if candidate.get("fragment_join")
-                    else ""
-                )
-                + f"margin={candidate['confidence_margin']:.1f} | "
-                f"{candidate['transcript']}"
-            )
-            for candidate in line_candidates
-        )
-        if is_nonverbal and nonverbal_policy == "review":
-            summary = (
-                "Excluded from text matching. Audition the Unmatched Segments "
-                "sheet and copy the intended Segment ID here manually."
-            )
-        elif is_nonverbal and nonverbal_policy == "skip":
-            summary = (
-                "Skipped by alignment.nonverbal_policy. Change the status and "
-                "select a segment manually if this asset is required."
-            )
-        elif is_nonverbal and nonverbal_policy == "weak_order":
-            summary = (
-                "Weak phonetic/duration/order hints only; audition every "
-                "candidate before selecting."
-                + (f"\n{summary}" if summary else "")
-            )
-        lines_sheet.append(
-            [
-                line["line_id"],
-                line["sheet"],
-                line["excel_row"],
-                line["quest"],
-                line["context"],
-                line["line"],
-                line["acting_note"],
-                line["emotion"],
-                line["target_filename"],
-                len(line_candidates),
-                *[
-                    (
-                        top_candidates[index]["segment_id"]
-                        if index < len(top_candidates)
-                        else ""
-                    )
-                    for index in range(3)
-                ],
-                suggested,
-                selected,
-                status,
-                summary,
-                "",
-            ]
-        )
-        output_row = lines_sheet.max_row
-        link_targets = [
-            (11, top_candidates[0] if len(top_candidates) > 0 else None),
-            (12, top_candidates[1] if len(top_candidates) > 1 else None),
-            (13, top_candidates[2] if len(top_candidates) > 2 else None),
-            (14, best),
-            (15, reliable_best),
-        ]
-        for column, candidate in link_targets:
-            if candidate:
-                _set_segment_hyperlink(
-                    lines_sheet.cell(output_row, column),
-                    project_dir,
-                    candidate["segment_file"],
-                )
-
-    candidate_headers = [
-        "Line ID",
-        "Rank",
-        "Segment ID",
-        "Segment File",
-        "Transcript",
-        "Match Score",
-        "Ordered Similarity",
-        "Token Coverage",
-        "Token Precision",
-        "Extra Words",
-        "Clause Count",
-        "Minimum Clause Score",
-        "Missing Clauses",
-        "Fragment Join",
-        "Joined Fragments",
-        "Confidence Margin",
-        "Technical Score",
-        "Reliable",
-        "Reliability Reason",
-        "Primary Match",
-        "Segment Match Rank",
-        "Take Group",
-        "Duration Plausibility",
-        "Duplicate Resolution",
-        "Transcript Source",
-        "Exact Span ASR Verified",
-        "Exact Span ASR Error",
-        "Source WAV",
-        "Start Seconds",
-        "End Seconds",
-        "Duration Seconds",
-        "ASR Confidence",
-        "Unsafe Untranscribed Merge",
-    ]
-    candidates_sheet.append(candidate_headers)
-    line_order = {
-        line["line_id"]: index for index, line in enumerate(source_lines)
-    }
-    all_candidates = sorted(
-        (
-            candidate
-            for line_candidates in candidates_by_line.values()
-            for candidate in line_candidates
-        ),
-        key=lambda candidate: (
-            line_order.get(candidate["line_id"], 10**9),
-            candidate["rank"],
-        ),
-    )
-    for candidate in all_candidates:
-        candidates_sheet.append(
-            [
-                candidate["line_id"],
-                candidate["rank"],
-                candidate["segment_id"],
-                candidate["segment_file"],
-                candidate["transcript"],
-                candidate["match_score"],
-                candidate.get("ordered_similarity", 0.0),
-                candidate.get("token_coverage", 0.0),
-                candidate.get("token_precision", 0.0),
-                candidate.get("extra_word_count", 0),
-                candidate.get("clause_count", 0),
-                candidate.get("minimum_clause_score", 0.0),
-                candidate.get("missing_clause_count", 0),
-                candidate.get("fragment_join", False),
-                candidate.get("fragment_source_count", 0),
-                candidate["confidence_margin"],
-                candidate["technical_score"],
-                candidate["reliable"],
-                candidate["reliability_reason"],
-                candidate.get("is_primary_match", True),
-                candidate.get("segment_match_rank", 1),
-                candidate.get("take_group_id") or "",
-                candidate.get("duration_plausibility", 0.0),
-                candidate.get("duplicate_resolution") or "",
-                candidate.get("transcript_source", "session_asr"),
-                candidate.get("exact_span_asr_verified", False),
-                candidate.get("exact_span_asr_error", ""),
-                candidate["source_audio"],
-                candidate["start_seconds"],
-                candidate["end_seconds"],
-                candidate["duration_seconds"],
-                candidate["asr_probability"],
-                candidate.get("unsafe_untranscribed_merge", False),
-            ]
-        )
-        file_cell = candidates_sheet.cell(candidates_sheet.max_row, 4)
-        _set_segment_hyperlink(
-            file_cell,
-            project_dir,
-            candidate["segment_file"],
-        )
-
-    unmatched_headers = [
-        "Segment ID",
-        "Segment File",
-        "Source WAV",
-        "Start Seconds",
-        "End Seconds",
-        "Duration Seconds",
-        "Transcript",
-        "ASR Confidence",
-        "Reason",
-        "Suggested Line 1",
-        "Suggested Line 1 Text",
-        "Suggested Line 1 Score",
-        "Suggested Line 2",
-        "Suggested Line 2 Text",
-        "Suggested Line 2 Score",
-        "Technical Flags",
-    ]
-    unmatched_sheet.append(unmatched_headers)
-    for unmatched in unmatched_rows:
-        unmatched_sheet.append(
-            [
-                unmatched["segment_id"],
-                unmatched["segment_file"],
-                unmatched["source_wav"],
-                unmatched["start_seconds"],
-                unmatched["end_seconds"],
-                unmatched["duration_seconds"],
-                unmatched["transcript"],
-                unmatched["asr_confidence"],
-                unmatched["reason"],
-                unmatched["suggested_line_1"],
-                unmatched["suggested_line_1_text"],
-                unmatched["suggested_line_1_score"],
-                unmatched["suggested_line_2"],
-                unmatched["suggested_line_2_text"],
-                unmatched["suggested_line_2_score"],
-                unmatched["technical_flags"],
-            ]
-        )
-        row = unmatched_sheet.max_row
-        _set_segment_hyperlink(
-            unmatched_sheet.cell(row, 1),
-            project_dir,
-            unmatched["segment_file"],
-        )
-        _set_segment_hyperlink(
-            unmatched_sheet.cell(row, 2),
-            project_dir,
-            unmatched["segment_file"],
-        )
-
-    instructions = [
-        ("Purpose", "Choose one temporary segment for every line that should be exported."),
-        (
-            "Editable field",
-            "Click a linked candidate to audition it. Copy the whole Candidate 1, "
-            "Candidate 2, or Candidate 3 cell into Lines!Selected Segment so both "
-            "the Segment ID and its file link follow the selection. Segment IDs "
-            "from the Candidates or Unmatched Segments sheet are also accepted.",
-        ),
-        (
-            "Unmatched audio",
-            "The Unmatched Segments sheet contains audio that could not be mapped "
-            "reliably. Its Segment ID and Segment File cells are linked to the WAV.",
-        ),
-        (
-            "Nonverbal lines",
-            (
-                "NONVERBAL_REVIEW lines are excluded from text matching and "
-                "have no automatic selection. Audition Unmatched Segments and "
-                "copy the intended Segment ID into Selected Segment."
-                if nonverbal_policy == "review"
-                else (
-                    "Nonverbal lines start as SKIP. Change Status and select a "
-                    "segment manually for any nonverbal asset that is required."
-                    if nonverbal_policy == "skip"
-                    else (
-                        "NONVERBAL_REVIEW candidates use weak phonetic, duration, "
-                        "and order hints only. Audition every candidate."
-                    )
-                )
-            ),
-        ),
-        (
-            "Duplicate lines",
-            "Duplicate Resolution identifies candidates assigned with weak take "
-            "order. A reused segment requires export.allow_segment_reuse or the "
-            "finalize --allow-segment-reuse option.",
-        ),
-        (
-            "Multi-sentence lines",
-            "AUTO_OK requires every sentence-sized clause to be represented in "
-            "the transcript and in script order. The pipeline searches contiguous "
-            "base-segment windows for a complete take, reconstructs their text "
-            "from session word timestamps for discovery, and creates a linked "
-            "Fragment Join candidate. The exact merged WAV is then transcribed "
-            "independently. Textless boundary segments are excluded; original "
-            "fragments remain available for manual review.",
-        ),
-        (
-            "Exact-span ASR",
-            "Every AUTO_OK candidate must have an unprompted transcript of the "
-            "exact WAV linked in the workbook. Script-prompted fallback text can "
-            "help find a candidate but cannot verify it. See Exact Span ASR "
-            "Verified and Exact Span ASR Error in the Candidates sheet.",
-        ),
-        (
-            "Repeated takes",
-            "AUTO_OK rejects transcripts containing excess repeated words, merges "
-            "with voiced but untranscribed pieces, and candidates unusually long "
-            "for the script text. The last case is labeled POSSIBLE_REPEATED_TAKES "
-            "because ASR can collapse repeated performances into one transcript.",
-        ),
-        (
-            "Status",
-            "AUTO_OK was filled automatically; REVIEW, NONVERBAL_REVIEW, and "
-            "MISSING require attention. Set Status to SKIP to intentionally "
-            "omit a line.",
-        ),
-        (
-            "Finalization",
-            "The finalizer reads Selected Segment only. Suggested Best is informational.",
-        ),
-    ]
-    instructions_sheet.append(["Topic", "Instruction"])
-    for row in instructions:
-        instructions_sheet.append(list(row))
-
-    _style_workbook(
-        lines_sheet,
-        candidates_sheet,
-        unmatched_sheet,
-        instructions_sheet,
-    )
-    review_path.parent.mkdir(parents=True, exist_ok=True)
-    workbook.save(review_path)
-
-
-def _set_segment_hyperlink(cell, project_dir: Path, segment_file: str) -> None:
-    segment_path = resolve_project_path(project_dir, segment_file)
-    try:
-        cell.hyperlink = segment_path.as_uri()
-        cell.style = "Hyperlink"
-    except ValueError:
-        pass
-
-
-def _style_workbook(
-    lines_sheet,
-    candidates_sheet,
-    unmatched_sheet,
-    instructions_sheet,
-) -> None:
-    navy = "1F4E78"
-    pale_blue = "D9EAF7"
-    yellow = "FFF2CC"
-    green = "E2F0D9"
-    red = "FCE4D6"
-    gray = "E7E6E6"
-    white = "FFFFFF"
-    thin_gray = Side(style="thin", color="D9E2F3")
-    header_fill = PatternFill("solid", fgColor=navy)
-    header_font = Font(color=white, bold=True)
-
-    for sheet in (
-        lines_sheet,
-        candidates_sheet,
-        unmatched_sheet,
-        instructions_sheet,
-    ):
-        sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = sheet.dimensions
-        sheet.sheet_view.showGridLines = False
-        for cell in sheet[1]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-            cell.border = Border(bottom=thin_gray)
-        sheet.row_dimensions[1].height = 28
-
-    selected_column = 15
-    status_column = 16
-    candidate_summary_column = 17
-    notes_column = 18
-    lines_data_last_row = lines_sheet.max_row
-    for row in range(2, lines_sheet.max_row + 1):
-        lines_sheet.cell(row, selected_column).fill = PatternFill(
-            "solid", fgColor=yellow
-        )
-        lines_sheet.cell(row, notes_column).fill = PatternFill(
-            "solid", fgColor=yellow
-        )
-        lines_sheet.cell(row, candidate_summary_column).alignment = Alignment(
-            wrap_text=True, vertical="top"
-        )
-        for column in (4, 5, 6, 7, 8, 11, 12, 13, 14, 15):
-            lines_sheet.cell(row, column).alignment = Alignment(
-                wrap_text=True, vertical="top"
-            )
-    lines_sheet.conditional_formatting.add(
-        f"P2:P{lines_data_last_row}",
-        FormulaRule(formula=['P2="AUTO_OK"'], fill=PatternFill("solid", fgColor=green)),
-    )
-    lines_sheet.conditional_formatting.add(
-        f"P2:P{lines_data_last_row}",
-        FormulaRule(formula=['P2="REVIEW"'], fill=PatternFill("solid", fgColor=yellow)),
-    )
-    lines_sheet.conditional_formatting.add(
-        f"P2:P{lines_data_last_row}",
-        FormulaRule(formula=['P2="MISSING"'], fill=PatternFill("solid", fgColor=red)),
-    )
-    lines_sheet.conditional_formatting.add(
-        f"P2:P{lines_data_last_row}",
-        FormulaRule(
-            formula=['P2="NONVERBAL_REVIEW"'],
-            fill=PatternFill("solid", fgColor=pale_blue),
-        ),
-    )
-    lines_sheet.conditional_formatting.add(
-        f"P2:P{lines_data_last_row}",
-        FormulaRule(formula=['P2="SKIP"'], fill=PatternFill("solid", fgColor=gray)),
-    )
-    lines_widths = {
-        1: 34,
-        2: 24,
-        3: 10,
-        4: 25,
-        5: 55,
-        6: 55,
-        7: 34,
-        8: 18,
-        9: 42,
-        10: 14,
-        11: 42,
-        12: 42,
-        13: 42,
-        14: 42,
-        15: 42,
-        status_column: 22,
-        candidate_summary_column: 85,
-        notes_column: 35,
-    }
-    for column, width in lines_widths.items():
-        lines_sheet.column_dimensions[get_column_letter(column)].width = width
-
-    for row in range(2, candidates_sheet.max_row + 1):
-        for column in (3, 4, 5, 19, 23, 25, 26, 28):
-            candidates_sheet.cell(row, column).alignment = Alignment(
-                wrap_text=True, vertical="top"
-            )
-        candidates_sheet.row_dimensions[row].height = 54
-        for column in (6, 7, 12, 16, 17, 24):
-            candidates_sheet.cell(row, column).number_format = "0.0"
-        for column in (8, 9):
-            candidates_sheet.cell(row, column).number_format = "0.0%"
-        for column in range(29, 33):
-            candidates_sheet.cell(row, column).number_format = "0.000"
-    candidate_widths = [
-        34,
-        8,
-        38,
-        62,
-        70,
-        12,
-        16,
-        14,
-        14,
-        12,
-        12,
-        20,
-        16,
-        14,
-        16,
-        16,
-        14,
-        10,
-        30,
-        14,
-        12,
-        12,
-        30,
-        18,
-        20,
-        18,
-        16,
-        58,
-        14,
-        14,
-        14,
-        14,
-        20,
-    ]
-    for column, width in enumerate(candidate_widths, start=1):
-        candidates_sheet.column_dimensions[get_column_letter(column)].width = width
-
-    for row in range(2, unmatched_sheet.max_row + 1):
-        for column in (1, 2, 3, 7, 9, 10, 11, 13, 14, 16):
-            unmatched_sheet.cell(row, column).alignment = Alignment(
-                wrap_text=True, vertical="top"
-            )
-        unmatched_sheet.row_dimensions[row].height = 54
-        for column in range(4, 9):
-            unmatched_sheet.cell(row, column).number_format = "0.000"
-        for column in (12, 15):
-            unmatched_sheet.cell(row, column).number_format = "0.0"
-    unmatched_widths = [
-        42,
-        62,
-        58,
-        14,
-        14,
-        16,
-        70,
-        16,
-        26,
-        34,
-        65,
-        18,
-        34,
-        65,
-        18,
-        24,
-    ]
-    for column, width in enumerate(unmatched_widths, start=1):
-        unmatched_sheet.column_dimensions[get_column_letter(column)].width = width
-
-    instructions_sheet.column_dimensions["A"].width = 22
-    instructions_sheet.column_dimensions["B"].width = 100
-    for row in range(2, instructions_sheet.max_row + 1):
-        instructions_sheet.cell(row, 1).fill = PatternFill(
-            "solid", fgColor=pale_blue
-        )
-        instructions_sheet.cell(row, 1).font = Font(bold=True)
-        instructions_sheet.cell(row, 2).alignment = Alignment(
-            wrap_text=True, vertical="top"
-        )
-
-    _add_status_summary_and_chart(
-        lines_sheet,
-        data_last_row=lines_data_last_row,
-        status_column=status_column,
-        header_fill=header_fill,
-        header_font=header_font,
-        status_fills={
-            "AUTO_OK": green,
-            "REVIEW": yellow,
-            "MISSING": red,
-            "NONVERBAL_REVIEW": pale_blue,
-            "SKIP": gray,
-        },
-        border=thin_gray,
-    )
-
-
-def _add_status_summary_and_chart(
-    lines_sheet,
-    *,
-    data_last_row: int,
-    status_column: int,
-    header_fill: PatternFill,
-    header_font: Font,
-    status_fills: dict[str, str],
-    border: Side,
-) -> None:
-    title_row = data_last_row + 3
-    header_row = title_row + 1
-    first_status_row = header_row + 1
-    status_column_letter = get_column_letter(status_column)
-
-    lines_sheet.merge_cells(
-        start_row=title_row,
-        start_column=1,
-        end_row=title_row,
-        end_column=2,
-    )
-    title_cell = lines_sheet.cell(title_row, 1, "Line Status Summary")
-    title_cell.fill = header_fill
-    title_cell.font = header_font
-    title_cell.alignment = Alignment(horizontal="center", vertical="center")
-    lines_sheet.row_dimensions[title_row].height = 24
-
-    lines_sheet.cell(header_row, 1, "Status")
-    lines_sheet.cell(header_row, 2, "Line Count")
-    for cell in lines_sheet[header_row][0:2]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = Border(bottom=border)
-
-    statuses = [
-        "AUTO_OK",
-        "REVIEW",
-        "MISSING",
-        "NONVERBAL_REVIEW",
-        "SKIP",
-    ]
-    for index, status in enumerate(statuses):
-        row = first_status_row + index
-        lines_sheet.cell(row, 1, status)
-        lines_sheet.cell(
-            row,
-            2,
-            (
-                f'=COUNTIF(${status_column_letter}$2:'
-                f'${status_column_letter}${data_last_row},A{row})'
-            ),
-        )
-        lines_sheet.cell(row, 1).fill = PatternFill(
-            "solid", fgColor=status_fills[status]
-        )
-        lines_sheet.cell(row, 2).number_format = "#,##0"
-
-    chart = PieChart()
-    chart.title = "Review Status Distribution"
-    chart.height = 7.0
-    chart.width = 11.5
-    chart.legend.position = "r"
-    data = Reference(
-        lines_sheet,
-        min_col=2,
-        min_row=header_row,
-        max_row=first_status_row + len(statuses) - 1,
-    )
-    labels = Reference(
-        lines_sheet,
-        min_col=1,
-        min_row=first_status_row,
-        max_row=first_status_row + len(statuses) - 1,
-    )
-    chart.add_data(data, titles_from_data=True)
-    chart.set_categories(labels)
-    chart.dataLabels = DataLabelList()
-    chart.dataLabels.showPercent = True
-    chart.dataLabels.showVal = True
-    chart.series[0].data_points = [
-        DataPoint(
-            idx=index,
-            spPr=GraphicalProperties(solidFill=status_fills[status]),
-        )
-        for index, status in enumerate(statuses)
-    ]
-    lines_sheet.add_chart(chart, f"D{title_row}")

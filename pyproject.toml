@@ -23,6 +23,9 @@ dev = [
 [project.scripts]
 dialogue-pipeline = "dialogue_pipeline.cli:main"
 
+[project.gui-scripts]
+dialogue-review = "dialogue_pipeline.ui:main"
+
 [tool.setuptools.packages.find]
 include = ["dialogue_pipeline*"]
 

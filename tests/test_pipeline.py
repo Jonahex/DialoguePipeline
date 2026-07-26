@@ -25,6 +25,8 @@ from dialogue_pipeline.finalize import finalize_review
 from dialogue_pipeline.review import (
     build_line_review,
     load_line_review,
+    preserve_manual_selections,
+    prune_line_candidates,
     save_line_review,
 )
 from dialogue_pipeline.segmentation import (
@@ -1146,6 +1148,80 @@ def test_finalize_omits_unselected_lines(tmp_path: Path) -> None:
     assert result["error_count"] == 0
 
 
+def test_review_candidates_keep_primary_top_score_cluster() -> None:
+    def candidate(
+        segment_id: str,
+        score: float,
+        *,
+        primary: bool = True,
+    ) -> dict:
+        return {
+            "segment_id": segment_id,
+            "session_id": "session",
+            "base_indices": [int(segment_id[-1])],
+            "match_score": score,
+            "selection_score": score,
+            "is_primary_match": primary,
+            "reliable": score >= 90.0,
+            "reliability_reason": "",
+        }
+
+    retained = prune_line_candidates(
+        [
+            candidate("segment1", 99.0),
+            candidate("segment2", 96.0),
+            candidate("segment3", 88.0),
+            candidate("segment4", 70.0),
+            candidate("segment5", 98.0, primary=False),
+        ]
+    )
+
+    assert [item["segment_id"] for item in retained] == [
+        "segment1",
+        "segment2",
+        "segment3",
+    ]
+
+
+def test_review_regeneration_preserves_manual_selection() -> None:
+    line = {
+        "line_id": "Sheet::R3",
+        "sheet": "Sheet",
+        "excel_row": 3,
+        "line": "Hello there.",
+        "target_filename": "hello",
+    }
+    candidate = {
+        "segment_id": "session__s00001",
+        "segment_file": "segment.wav",
+        "session_id": "session",
+        "base_indices": [0],
+        "transcript": "Hello there.",
+        "match_score": 100.0,
+        "selection_score": 100.0,
+        "reliable": True,
+    }
+    previous = build_line_review(
+        source_lines=[line],
+        candidates_by_line={line["line_id"]: [candidate]},
+        unmatched_segments=[],
+    )
+    previous["lines"][0]["status"] = "MANUALLY_REVIEWED"
+    new = build_line_review(
+        source_lines=[line],
+        candidates_by_line={},
+        unmatched_segments=[],
+    )
+
+    merged = preserve_manual_selections(new, previous)
+
+    assert merged["lines"][0]["status"] == "MANUALLY_REVIEWED"
+    assert merged["lines"][0]["selected_segment_id"] == "session__s00001"
+    assert merged["lines"][0]["candidates"][0]["segment_id"] == (
+        "session__s00001"
+    )
+
+
 def test_text_aligner_excludes_nonverbal_lines() -> None:
     actions = order_independent_align(
         [
@@ -1867,9 +1943,7 @@ def test_sample_accurate_cut_and_finalize(tmp_path: Path) -> None:
         "session__s00001"
     )
     assert loaded_review["lines"][0]["candidates"][0]["score"] == 100.0
-    assert loaded_review["unmatched_segments"][0]["segment_id"] == (
-        "session__s00001"
-    )
+    assert loaded_review["unmatched_segments"] == []
 
     manifest = {
         "schema_version": 1,

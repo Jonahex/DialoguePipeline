@@ -10,7 +10,12 @@ from typing import Any
 from rapidfuzz import fuzz
 
 from .project import load_source_data
-from .review import REVIEW_FILE_NAME, build_line_review
+from .review import (
+    REVIEW_FILE_NAME,
+    build_line_review,
+    load_line_review,
+    preserve_manual_selections,
+)
 from .segmentation import materialize_derived_segment
 from .transcription import (
     transcribe_candidate_spans,
@@ -1846,6 +1851,8 @@ def align_project(
                 {
                     "segment_id": segment["segment_id"],
                     "segment_file": segment["file"],
+                    "session_id": session["id"],
+                    "base_index": base_index,
                     "source_wav": segment["source_audio"],
                     "start_seconds": segment["start_seconds"],
                     "end_seconds": segment["end_seconds"],
@@ -1918,14 +1925,17 @@ def align_project(
     write_json(manifest_path, manifest)
 
     review_path = project_dir / REVIEW_FILE_NAME
-    write_json(
-        review_path,
-        build_line_review(
-            source_lines=source_data["lines"],
-            candidates_by_line=by_line,
-            unmatched_segments=unmatched_rows,
-        ),
+    review_data = build_line_review(
+        source_lines=source_data["lines"],
+        candidates_by_line=by_line,
+        unmatched_segments=unmatched_rows,
     )
+    if review_path.is_file():
+        review_data = preserve_manual_selections(
+            review_data,
+            load_line_review(review_path),
+        )
+    write_json(review_path, review_data)
     (project_dir / "B_unmatched_segments.tsv").unlink(missing_ok=True)
     return {
         "review": review_path,

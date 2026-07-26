@@ -92,60 +92,6 @@ class QueueWriter:
         return None
 
 
-class ScrollableFrame(ttk.Frame):
-    def __init__(self, parent: tk.Misc) -> None:
-        super().__init__(parent)
-        self.canvas = tk.Canvas(
-            self,
-            borderwidth=0,
-            highlightthickness=0,
-            background="#f8fafc",
-        )
-        scrollbar = ttk.Scrollbar(
-            self,
-            orient="vertical",
-            command=self.canvas.yview,
-        )
-        self.content = ttk.Frame(self.canvas)
-        self.window = self.canvas.create_window(
-            (0, 0),
-            window=self.content,
-            anchor="nw",
-        )
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-        self.content.bind("<Configure>", self._content_changed)
-        self.canvas.bind("<Configure>", self._canvas_changed)
-        self.canvas.bind_all("<MouseWheel>", self._mousewheel)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-    def clear(self) -> None:
-        for child in self.content.winfo_children():
-            child.destroy()
-        self.canvas.yview_moveto(0)
-
-    def destroy(self) -> None:
-        self.canvas.unbind_all("<MouseWheel>")
-        super().destroy()
-
-    def _content_changed(self, _event: tk.Event[Any]) -> None:
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-
-    def _canvas_changed(self, event: tk.Event[Any]) -> None:
-        self.canvas.itemconfigure(self.window, width=event.width)
-
-    def _mousewheel(self, event: tk.Event[Any]) -> None:
-        widget = self.winfo_containing(
-            self.winfo_pointerx(),
-            self.winfo_pointery(),
-        )
-        while widget is not None:
-            if widget is self:
-                self.canvas.yview_scroll(int(-event.delta / 120), "units")
-                return
-            widget = widget.master
-
-
 class DialogueReviewApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -161,8 +107,8 @@ class DialogueReviewApp:
         self.review_data: dict[str, Any] | None = None
         self.selected_line_id: str | None = None
         self.status_filter = tk.StringVar(value="All")
-        self.sort_field = tk.StringVar(value="Status")
-        self.sort_descending = tk.BooleanVar(value=False)
+        self.line_sort_column = "status"
+        self.line_sort_descending = False
         self.status_text = tk.StringVar(value="")
         self._worker_messages: queue.Queue[tuple[str, Any]] | None = None
         self._log_text: tk.Text | None = None
@@ -449,22 +395,6 @@ class DialogueReviewApp:
         )
         status_box.pack(side="left", padx=(6, 18))
         status_box.bind("<<ComboboxSelected>>", lambda _event: self.render_lines())
-        ttk.Label(controls, text="Sort:").pack(side="left")
-        sort_box = ttk.Combobox(
-            controls,
-            textvariable=self.sort_field,
-            values=["Status", "Sheet", "Line", "Target file", "Type"],
-            state="readonly",
-            width=18,
-        )
-        sort_box.pack(side="left", padx=(6, 10))
-        sort_box.bind("<<ComboboxSelected>>", lambda _event: self.render_lines())
-        ttk.Checkbutton(
-            controls,
-            text="Descending",
-            variable=self.sort_descending,
-            command=self.render_lines,
-        ).pack(side="left")
         ttk.Label(
             controls,
             textvariable=self.status_text,
@@ -478,7 +408,7 @@ class DialogueReviewApp:
         panes.add(left, weight=1)
         panes.add(right, weight=1)
 
-        line_columns = ("sheet", "line", "target", "type", "status")
+        line_columns = ("sheet", "line", "target", "type", "status", "audio")
         self.line_tree = ttk.Treeview(
             left,
             columns=line_columns,
@@ -491,14 +421,23 @@ class DialogueReviewApp:
             "target": ("Target file", 190),
             "type": ("Type", 90),
             "status": ("Status", 145),
+            "audio": ("", 48),
         }
         for column, (heading, width) in line_headings.items():
-            self.line_tree.heading(column, text=heading)
+            if column == "audio":
+                self.line_tree.heading(column, text=heading)
+            else:
+                self.line_tree.heading(
+                    column,
+                    text=heading,
+                    command=lambda value=column: self.sort_lines_by(value),
+                )
             self.line_tree.column(
                 column,
                 width=width,
-                minwidth=70,
+                minwidth=40 if column == "audio" else 70,
                 stretch=column in {"line", "target"},
+                anchor="center" if column in {"type", "status", "audio"} else "w",
             )
         for status, color in STATUS_COLORS.items():
             self.line_tree.tag_configure(status, background=color)
@@ -508,18 +447,54 @@ class DialogueReviewApp:
             command=self.line_tree.yview,
         )
         self.line_tree.configure(yscrollcommand=line_scrollbar.set)
-        self.line_action_bar = ttk.Frame(left)
-        self.line_action_bar.pack(side="bottom", fill="x", pady=(8, 0))
-        self.play_selected_button = ttk.Button(
-            self.line_action_bar,
-            text="Play selected segment",
-            command=self.play_selected_line,
-        )
         self.line_tree.pack(side="left", fill="both", expand=True)
         line_scrollbar.pack(side="right", fill="y")
         self.line_tree.bind("<<TreeviewSelect>>", self._tree_line_selected)
-        self.candidate_list = ScrollableFrame(right)
-        self.candidate_list.pack(fill="both", expand=True)
+        self.line_tree.bind("<ButtonRelease-1>", self._line_table_clicked)
+        self.line_tree.bind("<Motion>", self._line_table_motion)
+
+        self.candidate_description = ttk.Label(
+            right,
+            text="",
+            wraplength=650,
+            style="Muted.TLabel",
+            padding=(4, 4, 4, 10),
+        )
+        self.candidate_description.pack(anchor="w", fill="x")
+        candidate_columns = ("segment", "transcript", "score", "audio", "selection")
+        self.candidate_tree = ttk.Treeview(
+            right,
+            columns=candidate_columns,
+            show="headings",
+            selectmode="none",
+        )
+        candidate_headings = {
+            "segment": ("Segment", 210, "w"),
+            "transcript": ("Transcript", 430, "w"),
+            "score": ("Score", 70, "center"),
+            "audio": ("", 48, "center"),
+            "selection": ("Selection", 90, "center"),
+        }
+        for column, (heading, width, anchor) in candidate_headings.items():
+            self.candidate_tree.heading(column, text=heading)
+            self.candidate_tree.column(
+                column,
+                width=width,
+                minwidth=40,
+                stretch=column == "transcript",
+                anchor=anchor,
+            )
+        self.candidate_tree.tag_configure("selected", background="#bbf7d0")
+        candidate_scrollbar = ttk.Scrollbar(
+            right,
+            orient="vertical",
+            command=self.candidate_tree.yview,
+        )
+        self.candidate_tree.configure(yscrollcommand=candidate_scrollbar.set)
+        self.candidate_tree.pack(side="left", fill="both", expand=True)
+        candidate_scrollbar.pack(side="right", fill="y")
+        self.candidate_tree.bind("<ButtonRelease-1>", self._candidate_table_clicked)
+        self.candidate_tree.bind("<Motion>", self._candidate_table_motion)
         self.render_lines()
         self.render_candidates()
 
@@ -532,17 +507,33 @@ class DialogueReviewApp:
                 line for line in lines if line["status"] == selected_status
             ]
         keys: dict[str, Callable[[dict[str, Any]], Any]] = {
-            "Status": lambda line: (line["status"], line["sheet"], line["excel_row"]),
-            "Sheet": lambda line: (line["sheet"], line["excel_row"]),
-            "Line": lambda line: line["line_text"].casefold(),
-            "Target file": lambda line: line["target_filename"].casefold(),
-            "Type": lambda line: (line["type"], line["sheet"], line["excel_row"]),
+            "status": lambda line: (
+                line["status"],
+                line["sheet"],
+                line["excel_row"],
+            ),
+            "sheet": lambda line: (line["sheet"], line["excel_row"]),
+            "line": lambda line: line["line_text"].casefold(),
+            "target": lambda line: line["target_filename"].casefold(),
+            "type": lambda line: (
+                line["type"],
+                line["sheet"],
+                line["excel_row"],
+            ),
         }
         return sorted(
             lines,
-            key=keys[self.sort_field.get()],
-            reverse=self.sort_descending.get(),
+            key=keys[self.line_sort_column],
+            reverse=self.line_sort_descending,
         )
+
+    def sort_lines_by(self, column: str) -> None:
+        if column == self.line_sort_column:
+            self.line_sort_descending = not self.line_sort_descending
+        else:
+            self.line_sort_column = column
+            self.line_sort_descending = False
+        self.render_lines()
 
     def render_lines(self) -> None:
         assert self.review_data is not None
@@ -564,15 +555,35 @@ class DialogueReviewApp:
                     line["target_filename"],
                     line["type"],
                     line["status"],
+                    "▶" if line.get("selected_segment_id") else "",
                 ),
                 tags=(line["status"],),
             )
         visible_ids = {line["line_id"] for line in lines}
+        selection_changed = False
+        if self.selected_line_id not in visible_ids:
+            self.selected_line_id = lines[0]["line_id"] if lines else None
+            selection_changed = True
         if self.selected_line_id in visible_ids:
             self.line_tree.selection_set(self.selected_line_id)
             self.line_tree.focus(self.selected_line_id)
             self.line_tree.see(self.selected_line_id)
-        self._update_selected_play_button()
+        self._update_line_headings()
+        if selection_changed:
+            self.render_candidates()
+
+    def _update_line_headings(self) -> None:
+        names = {
+            "sheet": "Sheet",
+            "line": "Line text",
+            "target": "Target file",
+            "type": "Type",
+            "status": "Status",
+        }
+        arrow = "▼" if self.line_sort_descending else "▲"
+        for column, name in names.items():
+            suffix = f" {arrow}" if column == self.line_sort_column else ""
+            self.line_tree.heading(column, text=name + suffix)
 
     def _selected_line(self) -> dict[str, Any] | None:
         if self.review_data is None or self.selected_line_id is None:
@@ -591,33 +602,44 @@ class DialogueReviewApp:
         if not selected:
             return
         self.selected_line_id = selected[0]
-        self._update_selected_play_button()
         self.render_candidates()
 
-    def _update_selected_play_button(self) -> None:
-        line = self._selected_line()
-        if line and line.get("selected_segment_id"):
-            if not self.play_selected_button.winfo_manager():
-                self.play_selected_button.pack(side="right")
-        else:
-            self.play_selected_button.pack_forget()
+    def _line_table_clicked(self, event: tk.Event[Any]) -> None:
+        row_id = self.line_tree.identify_row(event.y)
+        if not row_id:
+            return
+        if self.line_tree.identify_column(event.x) == "#6":
+            line = next(
+                (
+                    item
+                    for item in self.review_data["lines"]
+                    if item["line_id"] == row_id
+                ),
+                None,
+            )
+            if line and line.get("selected_segment_id"):
+                self.play_segment(str(line["selected_segment_id"]))
 
-    def play_selected_line(self) -> None:
-        line = self._selected_line()
-        if line and line.get("selected_segment_id"):
-            self.play_segment(str(line["selected_segment_id"]))
+    def _line_table_motion(self, event: tk.Event[Any]) -> None:
+        row_id = self.line_tree.identify_row(event.y)
+        is_audio = self.line_tree.identify_column(event.x) == "#6"
+        has_audio = bool(
+            row_id and self.line_tree.set(row_id, "audio")
+        )
+        self.line_tree.configure(
+            cursor="hand2" if is_audio and has_audio else ""
+        )
 
     def render_candidates(self) -> None:
         assert self.review_data is not None
-        self.candidate_list.clear()
+        children = self.candidate_tree.get_children()
+        if children:
+            self.candidate_tree.delete(*children)
         line = self._selected_line()
         if line is None:
-            ttk.Label(
-                self.candidate_list.content,
-                text="Select a line to review its candidates.",
-                style="Muted.TLabel",
-                padding=16,
-            ).pack(anchor="w")
+            self.candidate_description.configure(
+                text="Select a line to review its candidates."
+            )
             return
 
         description = (
@@ -625,92 +647,69 @@ class DialogueReviewApp:
             if line["type"] == "nonverbal"
             else line["line_text"]
         )
-        ttk.Label(
-            self.candidate_list.content,
-            text=description,
-            wraplength=600,
-            style="Muted.TLabel",
-            padding=(4, 4, 4, 10),
-        ).pack(anchor="w", fill="x")
+        self.candidate_description.configure(text=description)
 
         candidates = (
             self.review_data["unmatched_segments"]
             if line["type"] == "nonverbal"
             else line["candidates"]
         )
-        candidates = sorted(
-            candidates,
-            key=lambda candidate: float(candidate.get("score", 0.0)),
-            reverse=True,
-        )
+        if line["type"] == "nonverbal":
+            candidates = sorted(
+                candidates,
+                key=lambda candidate: str(candidate["segment_id"]).casefold(),
+            )
+        else:
+            candidates = sorted(
+                candidates,
+                key=lambda candidate: float(candidate.get("score", 0.0)),
+                reverse=True,
+            )
         if not candidates:
-            ttk.Label(
-                self.candidate_list.content,
-                text="No candidate segments are available.",
-                padding=16,
-            ).pack(anchor="w")
+            self.candidate_description.configure(
+                text=description + "\n\nNo candidate segments are available."
+            )
             return
-
-        header = tk.Frame(self.candidate_list.content, background="#334155")
-        header.pack(fill="x", pady=(0, 2))
-        for column, (text, weight) in enumerate(
-            [("Transcript", 5), ("Score", 1), ("Audio", 1), ("Selection", 1)]
-        ):
-            header.grid_columnconfigure(column, weight=weight)
-            tk.Label(
-                header,
-                text=text,
-                background="#334155",
-                foreground="white",
-                font=("Segoe UI", 9, "bold"),
-                padx=6,
-                pady=6,
-            ).grid(row=0, column=column, sticky="nsew")
 
         selected_id = line.get("selected_segment_id")
         for candidate in candidates:
             is_selected = candidate["segment_id"] == selected_id
-            background = "#bbf7d0" if is_selected else "#ffffff"
-            row = tk.Frame(
-                self.candidate_list.content,
-                background=background,
-                highlightthickness=2 if is_selected else 1,
-                highlightbackground="#16a34a" if is_selected else "#cbd5e1",
-            )
-            row.pack(fill="x", pady=2)
-            for column, weight in enumerate([5, 1, 1, 1]):
-                row.grid_columnconfigure(column, weight=weight)
             transcript = str(candidate.get("transcript") or "[No transcript]")
             segment_id = str(candidate["segment_id"])
-            tk.Label(
-                row,
-                text=f"{transcript}\n{segment_id}",
-                background=background,
-                anchor="w",
-                justify="left",
-                wraplength=520,
-                padx=7,
-                pady=7,
-            ).grid(row=0, column=0, sticky="nsew")
-            tk.Label(
-                row,
-                text=f"{float(candidate.get('score', 0.0)):.1f}",
-                background=background,
-                padx=7,
-                pady=7,
-            ).grid(row=0, column=1, sticky="nsew")
-            ttk.Button(
-                row,
-                text="Play",
-                command=lambda value=segment_id: self.play_segment(value),
-                width=7,
-            ).grid(row=0, column=2, padx=5, pady=5)
-            ttk.Button(
-                row,
-                text="Unselect" if is_selected else "Select",
-                command=lambda value=segment_id: self.toggle_candidate(value),
-                width=9,
-            ).grid(row=0, column=3, padx=5, pady=5)
+            self.candidate_tree.insert(
+                "",
+                "end",
+                iid=segment_id,
+                values=(
+                    segment_id,
+                    transcript,
+                    f"{float(candidate.get('score', 0.0)):.1f}",
+                    "▶",
+                    "Unselect" if is_selected else "Select",
+                ),
+                tags=("selected",) if is_selected else (),
+            )
+
+    def _candidate_table_clicked(self, event: tk.Event[Any]) -> None:
+        segment_id = self.candidate_tree.identify_row(event.y)
+        if not segment_id:
+            return
+        column = self.candidate_tree.identify_column(event.x)
+        if column == "#4":
+            self.play_segment(segment_id)
+        elif column == "#5":
+            self.toggle_candidate(segment_id)
+
+    def _candidate_table_motion(self, event: tk.Event[Any]) -> None:
+        segment_id = self.candidate_tree.identify_row(event.y)
+        column = self.candidate_tree.identify_column(event.x)
+        self.candidate_tree.configure(
+            cursor=(
+                "hand2"
+                if segment_id and column in {"#4", "#5"}
+                else ""
+            )
+        )
 
     def play_segment(self, segment_id: str) -> None:
         assert self.project_dir is not None

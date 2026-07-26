@@ -41,10 +41,11 @@ transcription, segmentation, segment transcription, and alignment in the
 background while showing the pipeline log.
 
 The review screen lists script lines on the left and candidate segments on the
-right. Filter lines by status, sort them, audition one WAV at a time, and select
-or unselect a take. Selections are saved immediately to `line_review.json`.
-Nonverbal lines use the shared pool of audible segments that were not reliable
-matches for normal dialogue. `Finalize Selected Lines` copies every selected
+right. Filter lines by status, click a line-column header to sort, use the `▶`
+cells to audition one WAV at a time, and select or unselect a take. Selections
+are saved immediately to `line_review.json`. Nonverbal lines use the
+name-sorted shared pool of audible segments that are not retained candidates
+for any normal dialogue line. `Finalize Selected Lines` copies every selected
 take to its target filename.
 
 ## Commands
@@ -152,6 +153,14 @@ Use the desktop app to audition and change selections. Normal lines are
 `AUTO_OK`, `REVIEW`, or `MISSING` after alignment. Selecting a candidate changes
 the status to `MANUALLY_REVIEWED`; unselecting it changes the status to
 `REVIEW`.
+
+The review candidate list is intentionally narrower than the diagnostic
+candidate set in `alignment.json`. It keeps primary line matches, removes
+lower-scoring spans contained by a better candidate, retains candidates within
+15 score points of the best match, and cuts the list sooner when adjacent
+scores have a gap of at least 12 points. Manual selections survive later
+alignment runs even if the selected segment falls outside the new automatic
+candidate cluster.
 
 Every valid audio span is scored against every line enabled for the session; a
 global interval resolver then chooses non-overlapping spans without requiring

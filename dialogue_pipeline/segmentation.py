@@ -32,7 +32,7 @@ def split_regions_on_word_gaps(
     if not bool(settings.get("word_split_enabled", True)):
         return regions
 
-    minimum_gap = float(settings.get("word_split_gap_seconds", 0.55))
+    minimum_gap = float(settings.get("word_split_gap_seconds", 0.3))
     minimum_region = float(settings.get("word_split_min_region_seconds", 1.5))
     maximum_boundaries = max(
         0,
@@ -207,7 +207,7 @@ def segment_project(
         regions = acoustic_regions(
             duration_seconds,
             silences,
-            split_gap_seconds=float(settings.get("split_gap_seconds", 0.8)),
+            split_gap_seconds=float(settings.get("split_gap_seconds", 0.35)),
             minimum_segment_seconds=float(
                 settings.get("minimum_segment_seconds", 0.15)
             ),
@@ -273,7 +273,7 @@ def segment_project(
         gap_durations = [
             silence["duration"]
             for silence in silences
-            if silence["duration"] >= float(settings.get("split_gap_seconds", 0.8))
+            if silence["duration"] >= float(settings.get("split_gap_seconds", 0.35))
         ]
         session_outputs.append(
             {

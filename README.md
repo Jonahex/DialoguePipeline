@@ -149,13 +149,13 @@ Outputs:
 
 - `line_review.json`: every script line, its type and status, sorted candidate
   segments and transcripts, selected segment, plus the pool of audible
-  unmatched segments used to review nonverbal lines.
+  unmatched segments used to review nonverbal and `MISSING` lines.
 - `alignment.json`: machine-readable alignment details.
 
 Use the desktop app to audition and change selections. Normal lines are
 `AUTO_OK`, `REVIEW`, or `MISSING` after alignment. Selecting a candidate changes
 the status to `MANUALLY_REVIEWED`; unselecting it changes the status to
-`REVIEW`.
+`REVIEW`, or back to `MISSING` when no alignment candidate exists.
 
 The review candidate list is intentionally narrower than the diagnostic
 candidate set in `alignment.json`. It keeps primary line matches, removes
@@ -195,9 +195,20 @@ the independent base-segment transcripts with the session-level Whisper word
 timestamps and uses the more complete, ordered evidence. By default it can
 recover lines spread across as many as six segments. Textless first or last
 segments are rejected, so a duration hint cannot extend a candidate with an
-empty segment. The join is accepted only when whole-line similarity, token
-coverage, clause fidelity, order, and precision pass the configured
-`fragment_join_*` thresholds. Original fragments remain available.
+empty segment. Strict joins must pass the configured whole-line similarity,
+token coverage, clause fidelity, order, and precision thresholds. A second
+provisional path admits spans that clearly improve the selected fragment but
+whose preliminary fragment transcripts still miss a short clause. Those spans
+are independently transcribed as exact WAVs before reliability is decided.
+Inline performance cues such as `(laugh)` and `(hiccup)` are not treated as
+spoken words during matching. Original fragments remain available.
+
+`max_merge_segments` is the base-segment span limit for both the primary
+aligner and fragment recovery. An existing `fragment_join_max_segments` value
+may raise that recovery limit but can no longer lower it.
+`fragment_join_max_actions` is different: it is the number of recovery
+alternatives retained per line for exact-span verification, not a merge-size
+limit.
 
 Repeated takes are blocked from `AUTO_OK` by three complementary checks:
 repeated transcript words reduce token precision, merged spans with voiced but

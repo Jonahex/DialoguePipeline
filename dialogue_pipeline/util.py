@@ -62,6 +62,13 @@ def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def verbal_script_text(value: str) -> str:
+    """Remove inline nonverbal performance cues from a spoken script line."""
+
+    without_cues = re.sub(r"\([^)]*\)", " ", value or "")
+    return re.sub(r"\s+", " ", without_cues).strip()
+
+
 def word_count(value: str) -> int:
     normalized = normalize_text(value)
     return len(normalized.split()) if normalized else 0

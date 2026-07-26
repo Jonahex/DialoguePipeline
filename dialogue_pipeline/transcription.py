@@ -139,7 +139,7 @@ def _segment_transcription_profile(
             int(
                 settings.get(
                     "batch_size",
-                    source_settings.get("batch_size", 16),
+                    source_settings.get("batch_size", 8),
                 )
             ),
         ),
@@ -491,7 +491,7 @@ def _decode_clips_batched(
         "beam_size": int(profile.get("beam_size", 5)),
         "batch_size": min(
             len(audio_paths),
-            int(profile.get("batch_size", 16)),
+            int(profile.get("batch_size", 8)),
         ),
         "word_timestamps": True,
         "without_timestamps": False,
@@ -709,7 +709,7 @@ def transcribe_candidate_spans(
         profile=profile,
         runtime=runtime,
     )
-    batch_size = int(profile.get("batch_size", 16))
+    batch_size = int(profile.get("batch_size", 8))
     print(
         f"[candidate ASR] {len(results)} cached, {len(pending)} pending "
         f"(batch size {batch_size})",
@@ -990,7 +990,7 @@ def transcribe_segments_project(
                 profile=profile,
                 runtime=runtime,
             )
-        batch_size = int(profile.get("batch_size", 16))
+        batch_size = int(profile.get("batch_size", 8))
         for batch_start in range(0, len(pending_entries), batch_size):
             batch = pending_entries[batch_start : batch_start + batch_size]
             decoded_batch = _decode_clips_batched(
@@ -1142,7 +1142,7 @@ def transcribe_project(
     model_name = model_override or settings.get("model", "large-v3")
     device = device_override or settings.get("device", "auto")
     compute_type = settings.get("compute_type", "auto")
-    batch_size = max(1, int(settings.get("batch_size", 16)))
+    batch_size = max(1, int(settings.get("batch_size", 8)))
     model_root = resolve_model_cache_root(project_dir, settings)
     model_root.mkdir(parents=True, exist_ok=True)
     transcript_dir = project_dir / "transcripts"

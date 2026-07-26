@@ -26,6 +26,7 @@ from .util import (
     is_vocalization_script,
     normalize_text,
     read_json,
+    verbal_script_text,
     word_count,
     write_json,
 )
@@ -33,7 +34,7 @@ from .workbook_io import lines_for_session
 
 
 def text_similarity(expected: str, observed: str) -> float:
-    expected_normalized = normalize_text(expected)
+    expected_normalized = normalize_text(verbal_script_text(expected))
     observed_normalized = normalize_text(observed)
     if not expected_normalized or not observed_normalized:
         return 0.0
@@ -91,7 +92,7 @@ def transcript_fidelity(
 ) -> dict[str, float | int]:
     """Measure ordered agreement separately from tolerant candidate retrieval."""
 
-    expected_normalized = normalize_text(expected)
+    expected_normalized = normalize_text(verbal_script_text(expected))
     observed_normalized = normalize_text(observed)
     expected_tokens = expected_normalized.split()
     observed_tokens = observed_normalized.split()
@@ -143,7 +144,10 @@ def transcript_fidelity(
 def script_clauses(value: str) -> list[str]:
     return [
         clause
-        for clause in (part.strip() for part in re.split(r"[.!?]+", value or ""))
+        for clause in (
+            part.strip()
+            for part in re.split(r"[.!?]+", verbal_script_text(value))
+        )
         if normalize_text(clause)
     ]
 
@@ -416,7 +420,7 @@ def _duration_plausibility(
     line: dict[str, Any],
     span: dict[str, Any],
 ) -> float:
-    expected_words = max(1, word_count(line["line"]))
+    expected_words = max(1, word_count(verbal_script_text(line["line"])))
     expected_seconds = max(0.35, expected_words / 2.7)
     observed_seconds = max(
         0.05,
@@ -457,7 +461,7 @@ def order_independent_align(
 
     segment_count = len(segments)
     line_count = len(lines)
-    max_merge = int(settings.get("max_merge_segments", 3))
+    max_merge = int(settings.get("max_merge_segments", 10))
     max_gap = float(settings.get("max_merge_gap_seconds", 2.5))
     max_span = float(settings.get("max_span_seconds", 35.0))
     minimum_score = float(settings.get("candidate_min_score", 45.0))
@@ -617,7 +621,9 @@ def _apply_duplicate_line_policy(
 
     duplicate_indexes: dict[str, list[int]] = defaultdict(list)
     for line_index, line in enumerate(lines):
-        duplicate_indexes[normalize_text(line["line"])].append(line_index)
+        duplicate_indexes[
+            normalize_text(verbal_script_text(line["line"]))
+        ].append(line_index)
     duplicate_indexes = {
         text: indexes
         for text, indexes in duplicate_indexes.items()
@@ -631,7 +637,12 @@ def _apply_duplicate_line_policy(
         matching_actions = []
         for action in actions:
             primary_index = int(action["line_index"])
-            if normalize_text(lines[primary_index]["line"]) != normalized:
+            if (
+                normalize_text(
+                    verbal_script_text(lines[primary_index]["line"])
+                )
+                != normalized
+            ):
                 continue
             matching_actions.append(action)
         matching_actions.sort(key=lambda action: int(action["start_index"]))
@@ -720,21 +731,17 @@ def _multisentence_fragment_join_actions(
             int(action["count"]),
         ),
     )
+    # The primary and recovery aligners should grow together. The optional
+    # fragment-specific value remains an override for existing projects, but
+    # can no longer make recovery narrower than max_merge_segments.
     maximum_segments = max(
         2,
-        int(
-            settings.get(
-                "fragment_join_max_segments",
-                settings.get(
-                    "fragment_join_max_actions",
-                    max(6, int(settings.get("max_merge_segments", 3))),
-                ),
-            )
-        ),
+        int(settings.get("max_merge_segments", 10)),
+        int(settings.get("fragment_join_max_segments", 0)),
     )
     maximum_actions_per_line = max(
         1,
-        int(settings.get("fragment_join_max_actions", 3)),
+        int(settings.get("fragment_join_max_actions", 10)),
     )
     maximum_gap = float(settings.get("max_merge_gap_seconds", 2.5))
     maximum_span = float(settings.get("max_span_seconds", 35.0))
@@ -752,6 +759,21 @@ def _multisentence_fragment_join_actions(
     )
     minimum_token_precision = float(
         settings.get("fragment_join_min_token_precision", 0.83)
+    )
+    provisional_minimum_match = float(
+        settings.get(
+            "fragment_join_provisional_min_match_score",
+            settings.get("candidate_min_score", 45.0),
+        )
+    )
+    provisional_minimum_token_coverage = float(
+        settings.get("fragment_join_provisional_min_token_coverage", 0.70)
+    )
+    provisional_minimum_ordered_score = float(
+        settings.get("fragment_join_provisional_min_ordered_score", 55.0)
+    )
+    provisional_minimum_token_precision = float(
+        settings.get("fragment_join_provisional_min_token_precision", 0.65)
     )
     neighbor_radius = max(
         0,
@@ -856,11 +878,16 @@ def _multisentence_fragment_join_actions(
                 line_text,
                 {"transcript": str(action.get("transcript") or "")},
             )
-            expected_words = max(1, word_count(line_text))
+            expected_words = max(
+                1,
+                word_count(verbal_script_text(line_text)),
+            )
             observed_text = str(action.get("transcript") or "")
             observed_words = word_count(observed_text)
             length_ratio = observed_words / expected_words
-            expected_counts = Counter(normalize_text(line_text).split())
+            expected_counts = Counter(
+                normalize_text(verbal_script_text(line_text)).split()
+            )
             observed_counts = Counter(normalize_text(observed_text).split())
             repeated_excess = any(
                 count >= 2 and count > expected_counts.get(token, 0)
@@ -1031,33 +1058,52 @@ def _multisentence_fragment_join_actions(
                     and coverage_gain < minimum_coverage_gain
                 ):
                     continue
-                if (
-                    combined_sentence["clause_count"] >= 2
-                    and combined_sentence["missing_clause_count"] > 0
-                ):
-                    continue
-                if not bool(combined_sentence["clauses_in_order"]):
-                    continue
-                if (
-                    float(combined_fidelity["token_coverage"])
-                    < minimum_token_coverage
-                ):
-                    continue
-                if (
-                    float(combined_fidelity["ordered_similarity"])
-                    < minimum_ordered_score
-                ):
-                    continue
-                if (
-                    float(combined_fidelity["token_precision"])
-                    < minimum_token_precision
-                ):
+                strict_preview = bool(
+                    (
+                        combined_sentence["clause_count"] < 2
+                        or (
+                            combined_sentence["missing_clause_count"] == 0
+                            and combined_sentence["clauses_in_order"]
+                        )
+                    )
+                    and float(combined_fidelity["token_coverage"])
+                    >= minimum_token_coverage
+                    and float(combined_fidelity["ordered_similarity"])
+                    >= minimum_ordered_score
+                    and float(combined_fidelity["token_precision"])
+                    >= minimum_token_precision
+                )
+                provisional_preview = bool(
+                    combined_match >= provisional_minimum_match
+                    and float(combined_fidelity["token_coverage"])
+                    >= provisional_minimum_token_coverage
+                    and float(combined_fidelity["ordered_similarity"])
+                    >= provisional_minimum_ordered_score
+                    and float(combined_fidelity["token_precision"])
+                    >= provisional_minimum_token_precision
+                    and (
+                        combined_sentence["missing_clause_count"] > 0
+                        or bool(combined_sentence["clauses_in_order"])
+                    )
+                )
+                if not strict_preview and not provisional_preview:
                     continue
 
-                # Do not generate a join whose apparent improvement comes only
-                # from repeating the same text across adjacent takes.
+                expected_counts = Counter(
+                    normalize_text(
+                        verbal_script_text(line["line"])
+                    ).split()
+                )
+                observed_counts = Counter(
+                    normalize_text(span["transcript"]).split()
+                )
+                repeated_excess = any(
+                    count >= 2 and count > expected_counts.get(token, 0)
+                    for token, count in observed_counts.items()
+                )
                 if (
-                    int(combined_fidelity["extra_word_count"]) > 0
+                    repeated_excess
+                    and int(combined_fidelity["extra_word_count"]) > 0
                     and float(combined_fidelity["token_precision"])
                     < float(
                         settings.get(
@@ -1114,10 +1160,12 @@ def _multisentence_fragment_join_actions(
                         ],
                         "fragment_join": True,
                         "fragment_source_count": count,
+                        "fragment_join_provisional": not strict_preview,
                     }
                 )
                 existing.add(key)
-                break
+                if strict_preview:
+                    break
 
     joined_by_line: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for action in joined:
@@ -1237,6 +1285,10 @@ def _expand_alignment_actions(
                         if match_rank == 1
                         else 0
                     ),
+                    "fragment_join_provisional": bool(
+                        action.get("fragment_join_provisional", False)
+                        and match_rank == 1
+                    ),
                 }
             )
     return expanded
@@ -1267,7 +1319,8 @@ def _candidate_reliability(
     if (
         observed
         and not duplicate_text
-        and normalize_text(line["line"]) == normalize_text(observed)
+        and normalize_text(verbal_script_text(line["line"]))
+        == normalize_text(observed)
     ):
         return True, ""
     fidelity = transcript_fidelity(
@@ -1296,7 +1349,7 @@ def _candidate_reliability(
             )
         ),
     )
-    is_short_line = word_count(line["line"]) <= 3
+    is_short_line = word_count(verbal_script_text(line["line"])) <= 3
     if is_short_line:
         minimum_score = float(settings.get("short_line_min_score", 88.0))
         minimum_margin = float(settings.get("short_line_min_margin", 15.0))
@@ -1446,7 +1499,8 @@ def align_project(
             if not is_vocalization_script(line["line"])
         ]
         normalized_line_counts = Counter(
-            normalize_text(line["line"]) for line in session_lines
+            normalize_text(verbal_script_text(line["line"]))
+            for line in session_lines
         )
         print(
             f"[align {session_index}] {session['id']}: "
@@ -1542,7 +1596,8 @@ def align_project(
             device_override=segment_device_override,
         )
         normalized_session_lines = [
-            normalize_text(line["line"]) for line in session_lines
+            normalize_text(verbal_script_text(line["line"]))
+            for line in session_lines
         ]
         exact_scores_by_segment: dict[str, list[float]] = {}
         for segment_id, exact_asr in exact_asr_by_segment.items():
@@ -1665,8 +1720,8 @@ def align_project(
             ]
             reusable_duplicate = bool(
                 duplicate_policy == "reuse"
-                and normalize_text(primary_line["line"])
-                == normalize_text(line["line"])
+                and normalize_text(verbal_script_text(primary_line["line"]))
+                == normalize_text(verbal_script_text(line["line"]))
             )
             fidelity = transcript_fidelity(
                 line["line"],
@@ -1706,7 +1761,10 @@ def align_project(
                 settings=settings,
                 observed=observed_transcript,
                 duplicate_text=(
-                    normalized_line_counts[normalize_text(line["line"])] > 1
+                    normalized_line_counts[
+                        normalize_text(verbal_script_text(line["line"]))
+                    ]
+                    > 1
                     and not action.get("duplicate_resolved", False)
                     and not reusable_duplicate
                 ),
@@ -1812,6 +1870,9 @@ def align_project(
                 "fragment_join": bool(action.get("fragment_join", False)),
                 "fragment_source_count": int(
                     action.get("fragment_source_count", 0)
+                ),
+                "fragment_join_provisional": bool(
+                    action.get("fragment_join_provisional", False)
                 ),
             }
             if (

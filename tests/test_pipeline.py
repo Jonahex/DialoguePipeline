@@ -39,6 +39,10 @@ from dialogue_pipeline.transcription import (
     transcribe_project,
     transcribe_segments_project,
 )
+from dialogue_pipeline.ui import (
+    _selected_segment_score,
+    _uses_unmatched_candidates,
+)
 from dialogue_pipeline.util import (
     default_model_cache_root,
     read_json,
@@ -801,6 +805,8 @@ def test_fragment_join_can_recover_four_segments_around_partial_seed() -> None:
         lines=lines,
         base_segments=segments,
         settings={
+            "max_merge_segments": 4,
+            "fragment_join_max_segments": 2,
             "max_merge_gap_seconds": 1.0,
             "max_span_seconds": 10.0,
         },
@@ -810,6 +816,77 @@ def test_fragment_join_can_recover_four_segments_around_partial_seed() -> None:
         action["start_index"] == 0 and action["count"] == 4
         for action in joined
     )
+
+
+def test_fragment_join_sends_plausible_incomplete_span_to_exact_asr() -> None:
+    line_text = "Bah. Fine. I can see you're no fool. What do you want?"
+    segments = [
+        {
+            "start_seconds": 0.0,
+            "end_seconds": 0.8,
+            "transcript": "Ugh, fine",
+            "asr_probability": 0.9,
+        },
+        {
+            "start_seconds": 1.0,
+            "end_seconds": 2.2,
+            "transcript": "I can see you're no fool",
+            "asr_probability": 0.95,
+        },
+        {
+            "start_seconds": 2.4,
+            "end_seconds": 3.2,
+            "transcript": "What do you want",
+            "asr_probability": 0.95,
+        },
+    ]
+    partial = " ".join(segment["transcript"] for segment in segments[:2])
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": 0,
+            "count": 2,
+            "line_index": 0,
+            "match_score": text_similarity(line_text, partial),
+            "transcript": partial,
+            "duration_plausibility": 70.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=[{"line_id": "line", "line": line_text}],
+        base_segments=segments,
+        settings={
+            "max_merge_segments": 3,
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+    )
+
+    recovered = next(
+        action
+        for action in joined
+        if action["start_index"] == 0 and action["count"] == 3
+    )
+    assert recovered["fragment_join_provisional"] is True
+
+
+def test_inline_nonverbal_cues_do_not_make_spoken_line_incomplete() -> None:
+    line_text = "(laugh) See! What did I tell you?"
+    observed = "See! What did I tell you?"
+
+    assert text_similarity(line_text, observed) == pytest.approx(100.0)
+    assert sentence_fidelity(line_text, observed)["missing_clause_count"] == 0
+    assert _candidate_reliability(
+        line={"line": line_text},
+        match_score=100.0,
+        margin=20.0,
+        settings={},
+        observed=observed,
+    ) == (True, "")
 
 
 def test_fragment_join_searches_neighbor_before_worse_selected_candidate() -> None:
@@ -1222,6 +1299,48 @@ def test_review_regeneration_preserves_manual_selection() -> None:
     assert merged["lines"][0]["candidates"][0]["segment_id"] == (
         "session__s00001"
     )
+
+
+def test_missing_line_can_select_and_preserve_unmatched_segment() -> None:
+    line = {
+        "line_id": "Sheet::R3",
+        "sheet": "Sheet",
+        "excel_row": 3,
+        "line": "No automatic candidate.",
+        "target_filename": "missing",
+    }
+    unmatched = {
+        "segment_id": "session__s00001",
+        "segment_file": "segment.wav",
+        "session_id": "session",
+        "base_index": 0,
+        "transcript": "Maybe this is it",
+        "technical_score": 82.0,
+        "audible": True,
+    }
+    previous = build_line_review(
+        source_lines=[line],
+        candidates_by_line={},
+        unmatched_segments=[unmatched],
+    )
+    previous_line = previous["lines"][0]
+    assert previous_line["status"] == "MISSING"
+    assert _uses_unmatched_candidates(previous_line)
+    previous_line["selected_segment_id"] = unmatched["segment_id"]
+    previous_line["status"] = "MANUALLY_REVIEWED"
+    assert _uses_unmatched_candidates(previous_line)
+    assert _selected_segment_score(previous, previous_line) == 82.0
+
+    regenerated = build_line_review(
+        source_lines=[line],
+        candidates_by_line={},
+        unmatched_segments=[],
+    )
+    merged = preserve_manual_selections(regenerated, previous)
+
+    assert merged["lines"][0]["status"] == "MANUALLY_REVIEWED"
+    assert merged["lines"][0]["selected_segment_id"] == unmatched["segment_id"]
+    assert merged["unmatched_segments"][0]["segment_id"] == unmatched["segment_id"]
 
 
 def test_text_aligner_excludes_nonverbal_lines() -> None:

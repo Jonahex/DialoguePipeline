@@ -413,7 +413,10 @@ def preserve_manual_selections(
                 for segment in new_data["unmatched_segments"]
             }
         if (
-            new_line["type"] == "nonverbal"
+            (
+                new_line["type"] == "nonverbal"
+                or not new_line["candidates"]
+            )
             and selected_id not in new_unmatched_ids
             and selected_id in previous_unmatched
         ):

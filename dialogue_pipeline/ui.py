@@ -36,6 +36,32 @@ STATUS_COLORS = {
 }
 
 
+def _uses_unmatched_candidates(line: dict[str, Any]) -> bool:
+    return bool(
+        line["type"] == "nonverbal"
+        or (
+            not line.get("candidates")
+            and line["status"] in {"MISSING", "MANUALLY_REVIEWED"}
+        )
+    )
+
+
+def _selected_segment_score(
+    review_data: dict[str, Any],
+    line: dict[str, Any],
+) -> float | None:
+    selected_id = line.get("selected_segment_id")
+    if not selected_id:
+        return None
+    for candidate in line.get("candidates") or []:
+        if candidate["segment_id"] == selected_id:
+            return float(candidate.get("score", 0.0))
+    for candidate in review_data["unmatched_segments"]:
+        if candidate["segment_id"] == selected_id:
+            return float(candidate.get("score", 0.0))
+    return None
+
+
 class AudioPlayer:
     def __init__(self) -> None:
         self._process: subprocess.Popen[bytes] | None = None
@@ -409,7 +435,16 @@ class DialogueReviewApp:
         panes.add(left, weight=1)
         panes.add(right, weight=1)
 
-        line_columns = ("sheet", "line", "target", "type", "status", "audio")
+        line_columns = (
+            "index",
+            "sheet",
+            "line",
+            "target",
+            "type",
+            "status",
+            "score",
+            "audio",
+        )
         self.line_tree = ttk.Treeview(
             left,
             columns=line_columns,
@@ -417,11 +452,13 @@ class DialogueReviewApp:
             selectmode="browse",
         )
         line_headings = {
+            "index": ("Index", 65),
             "sheet": ("Sheet", 115),
-            "line": ("Line text", 410),
-            "target": ("Target file", 190),
+            "line": ("Line text", 350),
+            "target": ("Target file", 170),
             "type": ("Type", 90),
-            "status": ("Status", 145),
+            "status": ("Status", 130),
+            "score": ("Selected score", 105),
             "audio": ("", 48),
         }
         for column, (heading, width) in line_headings.items():
@@ -438,7 +475,11 @@ class DialogueReviewApp:
                 width=width,
                 minwidth=40 if column == "audio" else 70,
                 stretch=column in {"line", "target"},
-                anchor="center" if column in {"type", "status", "audio"} else "w",
+                anchor=(
+                    "center"
+                    if column in {"index", "type", "status", "score", "audio"}
+                    else "w"
+                ),
             )
         for status, color in STATUS_COLORS.items():
             self.line_tree.tag_configure(status, background=color)
@@ -558,12 +599,22 @@ class DialogueReviewApp:
     def _filtered_lines(self) -> list[dict[str, Any]]:
         assert self.review_data is not None
         lines = list(self.review_data["lines"])
+        line_indexes = {
+            line["line_id"]: index
+            for index, line in enumerate(self.review_data["lines"], start=1)
+        }
         selected_status = self.status_filter.get()
         if selected_status != "All":
             lines = [
                 line for line in lines if line["status"] == selected_status
             ]
+
+        def selected_score(line: dict[str, Any]) -> float:
+            score = _selected_segment_score(self.review_data, line)
+            return score if score is not None else -1.0
+
         keys: dict[str, Callable[[dict[str, Any]], Any]] = {
+            "index": lambda line: line_indexes[line["line_id"]],
             "status": lambda line: (
                 line["status"],
                 line["sheet"],
@@ -577,6 +628,7 @@ class DialogueReviewApp:
                 line["sheet"],
                 line["excel_row"],
             ),
+            "score": selected_score,
         }
         return sorted(
             lines,
@@ -601,18 +653,29 @@ class DialogueReviewApp:
         self.status_text.set(
             f"{len(lines)} of {len(self.review_data['lines'])} lines"
         )
+        line_indexes = {
+            line["line_id"]: index
+            for index, line in enumerate(self.review_data["lines"], start=1)
+        }
         for line in lines:
+            selected_score = _selected_segment_score(self.review_data, line)
             self.line_tree.insert(
                 "",
                 "end",
                 iid=line["line_id"],
                 values=(
+                    line_indexes[line["line_id"]],
                     line["sheet"],
                     line["line_text"],
                     line["target_filename"],
                     line["type"],
                     line["status"],
-                    "▶" if line.get("selected_segment_id") else "",
+                    (
+                        f"{selected_score:.1f}"
+                        if selected_score is not None
+                        else ""
+                    ),
+                    "\u25b6" if line.get("selected_segment_id") else "",
                 ),
                 tags=(line["status"],),
             )
@@ -631,11 +694,13 @@ class DialogueReviewApp:
 
     def _update_line_headings(self) -> None:
         names = {
+            "index": "Index",
             "sheet": "Sheet",
             "line": "Line text",
             "target": "Target file",
             "type": "Type",
             "status": "Status",
+            "score": "Selected score",
         }
         arrow = "▼" if self.line_sort_descending else "▲"
         for column, name in names.items():
@@ -665,7 +730,7 @@ class DialogueReviewApp:
         row_id = self.line_tree.identify_row(event.y)
         if not row_id:
             return
-        if self.line_tree.identify_column(event.x) == "#6":
+        if self.line_tree.identify_column(event.x) == "#8":
             line = next(
                 (
                     item
@@ -679,7 +744,7 @@ class DialogueReviewApp:
 
     def _line_table_motion(self, event: tk.Event[Any]) -> None:
         row_id = self.line_tree.identify_row(event.y)
-        is_audio = self.line_tree.identify_column(event.x) == "#6"
+        is_audio = self.line_tree.identify_column(event.x) == "#8"
         has_audio = bool(
             row_id and self.line_tree.set(row_id, "audio")
         )
@@ -707,19 +772,25 @@ class DialogueReviewApp:
         self.selected_acting_note_label.configure(
             text=line.get("acting_note") or "—"
         )
-        description = (
-            "Unmatched audible segments are shown for nonverbal lines."
-            if line["type"] == "nonverbal"
-            else ""
-        )
+        uses_unmatched = _uses_unmatched_candidates(line)
+        description = ""
+        if uses_unmatched:
+            description = (
+                "Unmatched audible segments are shown for nonverbal lines."
+                if line["type"] == "nonverbal"
+                else (
+                    "No alignment candidate was found; all unmatched audible "
+                    "segments are shown."
+                )
+            )
         self.candidate_description.configure(text=description)
 
         candidates = (
             self.review_data["unmatched_segments"]
-            if line["type"] == "nonverbal"
+            if uses_unmatched
             else line["candidates"]
         )
-        if line["type"] == "nonverbal":
+        if uses_unmatched:
             candidates = sorted(
                 candidates,
                 key=lambda candidate: str(candidate["segment_id"]).casefold(),
@@ -729,7 +800,7 @@ class DialogueReviewApp:
                 candidates,
                 key=lambda candidate: float(candidate.get("score", 0.0)),
                 reverse=True,
-        )
+            )
         if not candidates:
             self.candidate_description.configure(
                 text=(
@@ -800,7 +871,11 @@ class DialogueReviewApp:
             return
         if line.get("selected_segment_id") == segment_id:
             line["selected_segment_id"] = None
-            line["status"] = "REVIEW"
+            line["status"] = (
+                "MISSING"
+                if line["type"] == "normal" and not line["candidates"]
+                else "REVIEW"
+            )
         else:
             line["selected_segment_id"] = segment_id
             line["status"] = "MANUALLY_REVIEWED"

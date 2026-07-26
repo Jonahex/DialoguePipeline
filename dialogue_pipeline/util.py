@@ -69,6 +69,95 @@ def verbal_script_text(value: str) -> str:
     return re.sub(r"\s+", " ", without_cues).strip()
 
 
+_SPOKEN_TOKEN_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "'em": ("them",),
+    "'m": ("am",),
+    "'re": ("are",),
+    "'ve": ("have",),
+    "'ll": ("will",),
+    "'d": ("would",),
+    "'cause": ("because",),
+    "ain't": ("is", "not"),
+    "c'mon": ("come", "on"),
+    "coulda": ("could", "have"),
+    "gimme": ("give", "me"),
+    "gonna": ("going", "to"),
+    "gotta": ("got", "to"),
+    "kinda": ("kind", "of"),
+    "lemme": ("let", "me"),
+    "outta": ("out", "of"),
+    "sorta": ("sort", "of"),
+    "shoulda": ("should", "have"),
+    "wanna": ("want", "to"),
+    "woulda": ("would", "have"),
+    "ya": ("you",),
+    "i'm": ("i", "am"),
+    "you're": ("you", "are"),
+    "we're": ("we", "are"),
+    "they're": ("they", "are"),
+    "i've": ("i", "have"),
+    "you've": ("you", "have"),
+    "we've": ("we", "have"),
+    "they've": ("they", "have"),
+    "i'll": ("i", "will"),
+    "you'll": ("you", "will"),
+    "we'll": ("we", "will"),
+    "they'll": ("they", "will"),
+    "i'd": ("i", "would"),
+    "you'd": ("you", "would"),
+    "we'd": ("we", "would"),
+    "they'd": ("they", "would"),
+    "he's": ("he", "is"),
+    "she's": ("she", "is"),
+    "it's": ("it", "is"),
+    "that's": ("that", "is"),
+    "there's": ("there", "is"),
+    "here's": ("here", "is"),
+    "what's": ("what", "is"),
+    "where's": ("where", "is"),
+    "who's": ("who", "is"),
+    "how's": ("how", "is"),
+    "let's": ("let", "us"),
+    "can't": ("can", "not"),
+    "won't": ("will", "not"),
+    "shan't": ("shall", "not"),
+}
+
+
+def normalize_spoken_text(
+    value: str,
+    *,
+    remove_parenthetical_cues: bool = False,
+) -> str:
+    """Canonicalize equivalent written forms of spoken English."""
+
+    if remove_parenthetical_cues:
+        value = verbal_script_text(value)
+    tokens = normalize_text(value).split()
+    expanded: list[str] = []
+    for token in tokens:
+        replacement = _SPOKEN_TOKEN_EXPANSIONS.get(token)
+        if replacement is not None:
+            expanded.extend(replacement)
+            continue
+        if token.endswith("n't") and len(token) > 3:
+            expanded.extend((token[:-3], "not"))
+            continue
+        for suffix, word in (
+            ("'ve", "have"),
+            ("'re", "are"),
+            ("'ll", "will"),
+            ("'m", "am"),
+            ("'d", "would"),
+        ):
+            if token.endswith(suffix) and len(token) > len(suffix):
+                expanded.extend((token[: -len(suffix)], word))
+                break
+        else:
+            expanded.append(token)
+    return " ".join(expanded)
+
+
 def word_count(value: str) -> int:
     normalized = normalize_text(value)
     return len(normalized.split()) if normalized else 0

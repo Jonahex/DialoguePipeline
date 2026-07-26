@@ -24,6 +24,7 @@ from .transcription import (
 from .util import (
     is_nonverbal_script,
     is_vocalization_script,
+    normalize_spoken_text,
     normalize_text,
     read_json,
     verbal_script_text,
@@ -34,8 +35,11 @@ from .workbook_io import lines_for_session
 
 
 def text_similarity(expected: str, observed: str) -> float:
-    expected_normalized = normalize_text(verbal_script_text(expected))
-    observed_normalized = normalize_text(observed)
+    expected_normalized = normalize_spoken_text(
+        expected,
+        remove_parenthetical_cues=True,
+    )
+    observed_normalized = normalize_spoken_text(observed)
     if not expected_normalized or not observed_normalized:
         return 0.0
     expected_tokens = expected_normalized.split()
@@ -84,26 +88,12 @@ def text_similarity(expected: str, observed: str) -> float:
     return max(0.0, min(100.0, score))
 
 
-def transcript_fidelity(
-    expected: str,
-    observed: str,
+def _fuzzy_token_match_count(
+    expected_tokens: list[str],
+    observed_tokens: list[str],
     *,
-    token_min_similarity: float = 78.0,
-) -> dict[str, float | int]:
-    """Measure ordered agreement separately from tolerant candidate retrieval."""
-
-    expected_normalized = normalize_text(verbal_script_text(expected))
-    observed_normalized = normalize_text(observed)
-    expected_tokens = expected_normalized.split()
-    observed_tokens = observed_normalized.split()
-    if not expected_tokens or not observed_tokens:
-        return {
-            "ordered_similarity": 0.0,
-            "token_coverage": 0.0,
-            "token_precision": 0.0,
-            "extra_word_count": len(observed_tokens),
-        }
-
+    token_min_similarity: float,
+) -> int:
     possible_matches = sorted(
         (
             (
@@ -128,8 +118,59 @@ def transcript_fidelity(
             continue
         matched_expected.add(expected_index)
         matched_observed.add(observed_index)
+    return len(matched_expected)
 
-    matched_count = len(matched_expected)
+
+def transcript_fidelity(
+    expected: str,
+    observed: str,
+    *,
+    token_min_similarity: float = 78.0,
+    boundary_window_tokens: int = 4,
+    boundary_observed_slack_tokens: int = 2,
+) -> dict[str, float | int]:
+    """Measure ordered agreement separately from tolerant candidate retrieval."""
+
+    expected_normalized = normalize_spoken_text(
+        expected,
+        remove_parenthetical_cues=True,
+    )
+    observed_normalized = normalize_spoken_text(observed)
+    expected_tokens = expected_normalized.split()
+    observed_tokens = observed_normalized.split()
+    if not expected_tokens or not observed_tokens:
+        return {
+            "ordered_similarity": 0.0,
+            "token_coverage": 0.0,
+            "token_precision": 0.0,
+            "extra_word_count": len(observed_tokens),
+            "prefix_token_coverage": 0.0,
+            "suffix_token_coverage": 0.0,
+        }
+
+    matched_count = _fuzzy_token_match_count(
+        expected_tokens,
+        observed_tokens,
+        token_min_similarity=token_min_similarity,
+    )
+    boundary_size = min(
+        len(expected_tokens),
+        max(1, int(boundary_window_tokens)),
+    )
+    observed_boundary_size = min(
+        len(observed_tokens),
+        boundary_size + max(0, int(boundary_observed_slack_tokens)),
+    )
+    prefix_match_count = _fuzzy_token_match_count(
+        expected_tokens[:boundary_size],
+        observed_tokens[:observed_boundary_size],
+        token_min_similarity=token_min_similarity,
+    )
+    suffix_match_count = _fuzzy_token_match_count(
+        expected_tokens[-boundary_size:],
+        observed_tokens[-observed_boundary_size:],
+        token_min_similarity=token_min_similarity,
+    )
     return {
         "ordered_similarity": fuzz.ratio(
             expected_normalized,
@@ -138,6 +179,8 @@ def transcript_fidelity(
         "token_coverage": matched_count / len(expected_tokens),
         "token_precision": matched_count / len(observed_tokens),
         "extra_word_count": len(observed_tokens) - matched_count,
+        "prefix_token_coverage": prefix_match_count / boundary_size,
+        "suffix_token_coverage": suffix_match_count / boundary_size,
     }
 
 
@@ -162,7 +205,7 @@ def sentence_fidelity(
     short_clause_min_token_coverage: float = 1.0,
 ) -> dict[str, Any]:
     clauses = script_clauses(expected)
-    observed_normalized = normalize_text(observed)
+    observed_normalized = normalize_spoken_text(observed)
     clause_scores = []
     clause_token_coverages = []
     clause_word_counts = []
@@ -174,7 +217,10 @@ def sentence_fidelity(
             token_min_similarity=token_min_similarity,
         )
         partial_score = (
-            fuzz.partial_ratio(normalize_text(clause), observed_normalized)
+            fuzz.partial_ratio(
+                normalize_spoken_text(clause),
+                observed_normalized,
+            )
             if observed_normalized
             else 0.0
         )
@@ -188,7 +234,7 @@ def sentence_fidelity(
         clause_word_counts.append(word_count(clause))
         alignment = (
             fuzz.partial_ratio_alignment(
-                normalize_text(clause),
+                normalize_spoken_text(clause),
                 observed_normalized,
             )
             if observed_normalized
@@ -420,7 +466,15 @@ def _duration_plausibility(
     line: dict[str, Any],
     span: dict[str, Any],
 ) -> float:
-    expected_words = max(1, word_count(verbal_script_text(line["line"])))
+    expected_words = max(
+        1,
+        len(
+            normalize_spoken_text(
+                line["line"],
+                remove_parenthetical_cues=True,
+            ).split()
+        ),
+    )
     expected_seconds = max(0.35, expected_words / 2.7)
     observed_seconds = max(
         0.05,
@@ -622,7 +676,10 @@ def _apply_duplicate_line_policy(
     duplicate_indexes: dict[str, list[int]] = defaultdict(list)
     for line_index, line in enumerate(lines):
         duplicate_indexes[
-            normalize_text(verbal_script_text(line["line"]))
+            normalize_spoken_text(
+                line["line"],
+                remove_parenthetical_cues=True,
+            )
         ].append(line_index)
     duplicate_indexes = {
         text: indexes
@@ -638,8 +695,9 @@ def _apply_duplicate_line_policy(
         for action in actions:
             primary_index = int(action["line_index"])
             if (
-                normalize_text(
-                    verbal_script_text(lines[primary_index]["line"])
+                normalize_spoken_text(
+                    lines[primary_index]["line"],
+                    remove_parenthetical_cues=True,
                 )
                 != normalized
             ):
@@ -760,6 +818,9 @@ def _multisentence_fragment_join_actions(
     minimum_token_precision = float(
         settings.get("fragment_join_min_token_precision", 0.83)
     )
+    minimum_boundary_coverage = float(
+        settings.get("reliable_min_boundary_token_coverage", 0.60)
+    )
     provisional_minimum_match = float(
         settings.get(
             "fragment_join_provisional_min_match_score",
@@ -816,6 +877,15 @@ def _multisentence_fragment_join_actions(
             line_text,
             transcript,
             token_min_similarity=token_min_similarity,
+            boundary_window_tokens=int(
+                settings.get("reliable_boundary_window_tokens", 4)
+            ),
+            boundary_observed_slack_tokens=int(
+                settings.get(
+                    "reliable_boundary_observed_slack_tokens",
+                    2,
+                )
+            ),
         )
         sentence = sentence_fidelity(
             line_text,
@@ -845,6 +915,10 @@ def _multisentence_fragment_join_actions(
         return (
             int(sentence["missing_clause_count"]) == 0,
             bool(sentence["clauses_in_order"]),
+            min(
+                float(fidelity["prefix_token_coverage"]),
+                float(fidelity["suffix_token_coverage"]),
+            ),
             float(fidelity["token_coverage"]),
             float(sentence["minimum_clause_score"]),
             float(scored["match"]),
@@ -880,15 +954,27 @@ def _multisentence_fragment_join_actions(
             )
             expected_words = max(
                 1,
-                word_count(verbal_script_text(line_text)),
+                len(
+                    normalize_spoken_text(
+                        line_text,
+                        remove_parenthetical_cues=True,
+                    ).split()
+                ),
             )
             observed_text = str(action.get("transcript") or "")
-            observed_words = word_count(observed_text)
+            observed_words = len(
+                normalize_spoken_text(observed_text).split()
+            )
             length_ratio = observed_words / expected_words
             expected_counts = Counter(
-                normalize_text(verbal_script_text(line_text)).split()
+                normalize_spoken_text(
+                    line_text,
+                    remove_parenthetical_cues=True,
+                ).split()
             )
-            observed_counts = Counter(normalize_text(observed_text).split())
+            observed_counts = Counter(
+                normalize_spoken_text(observed_text).split()
+            )
             repeated_excess = any(
                 count >= 2 and count > expected_counts.get(token, 0)
                 for token, count in observed_counts.items()
@@ -899,6 +985,10 @@ def _multisentence_fragment_join_actions(
                 >= minimum_complete_ordered
                 and int(scored["sentence"]["missing_clause_count"]) == 0
                 and bool(scored["sentence"]["clauses_in_order"])
+                and float(scored["fidelity"]["prefix_token_coverage"])
+                >= minimum_boundary_coverage
+                and float(scored["fidelity"]["suffix_token_coverage"])
+                >= minimum_boundary_coverage
                 and minimum_length_ratio
                 <= length_ratio
                 <= maximum_length_ratio
@@ -1072,6 +1162,14 @@ def _multisentence_fragment_join_actions(
                     >= minimum_ordered_score
                     and float(combined_fidelity["token_precision"])
                     >= minimum_token_precision
+                    and float(
+                        combined_fidelity["prefix_token_coverage"]
+                    )
+                    >= minimum_boundary_coverage
+                    and float(
+                        combined_fidelity["suffix_token_coverage"]
+                    )
+                    >= minimum_boundary_coverage
                 )
                 provisional_preview = bool(
                     combined_match >= provisional_minimum_match
@@ -1090,12 +1188,13 @@ def _multisentence_fragment_join_actions(
                     continue
 
                 expected_counts = Counter(
-                    normalize_text(
-                        verbal_script_text(line["line"])
+                    normalize_spoken_text(
+                        line["line"],
+                        remove_parenthetical_cues=True,
                     ).split()
                 )
                 observed_counts = Counter(
-                    normalize_text(span["transcript"]).split()
+                    normalize_spoken_text(span["transcript"]).split()
                 )
                 repeated_excess = any(
                     count >= 2 and count > expected_counts.get(token, 0)
@@ -1182,6 +1281,10 @@ def _multisentence_fragment_join_actions(
             return (
                 int(scored["sentence"]["missing_clause_count"]) == 0,
                 bool(scored["sentence"]["clauses_in_order"]),
+                min(
+                    float(scored["fidelity"]["prefix_token_coverage"]),
+                    float(scored["fidelity"]["suffix_token_coverage"]),
+                ),
                 float(scored["fidelity"]["token_coverage"]),
                 float(scored["match"]),
                 float(scored["fidelity"]["token_precision"]),
@@ -1319,8 +1422,11 @@ def _candidate_reliability(
     if (
         observed
         and not duplicate_text
-        and normalize_text(verbal_script_text(line["line"]))
-        == normalize_text(observed)
+        and normalize_spoken_text(
+            line["line"],
+            remove_parenthetical_cues=True,
+        )
+        == normalize_spoken_text(observed)
     ):
         return True, ""
     fidelity = transcript_fidelity(
@@ -1328,6 +1434,15 @@ def _candidate_reliability(
         observed or "",
         token_min_similarity=float(
             settings.get("fidelity_token_min_similarity", 78.0)
+        ),
+        boundary_window_tokens=int(
+            settings.get("reliable_boundary_window_tokens", 4)
+        ),
+        boundary_observed_slack_tokens=int(
+            settings.get(
+                "reliable_boundary_observed_slack_tokens",
+                2,
+            )
         ),
     )
     sentence = sentence_fidelity(
@@ -1349,7 +1464,15 @@ def _candidate_reliability(
             )
         ),
     )
-    is_short_line = word_count(verbal_script_text(line["line"])) <= 3
+    is_short_line = (
+        len(
+            normalize_spoken_text(
+                line["line"],
+                remove_parenthetical_cues=True,
+            ).split()
+        )
+        <= 3
+    )
     if is_short_line:
         minimum_score = float(settings.get("short_line_min_score", 88.0))
         minimum_margin = float(settings.get("short_line_min_margin", 15.0))
@@ -1384,10 +1507,6 @@ def _candidate_reliability(
         and sentence["missing_clause_count"] > 0
     ):
         return False, "MISSING_SENTENCE"
-    if fidelity["token_coverage"] < float(
-        settings.get("reliable_min_token_coverage", 0.60)
-    ):
-        return False, "INCOMPLETE_TRANSCRIPT"
     if fidelity["token_precision"] < float(
         settings.get("reliable_min_token_precision", 0.70)
     ):
@@ -1397,6 +1516,27 @@ def _candidate_reliability(
         and not bool(sentence["clauses_in_order"])
     ):
         return False, "SENTENCE_ORDER_MISMATCH"
+    minimum_boundary_coverage = float(
+        settings.get("reliable_min_boundary_token_coverage", 0.60)
+    )
+    missing_start = (
+        float(fidelity["prefix_token_coverage"])
+        < minimum_boundary_coverage
+    )
+    missing_end = (
+        float(fidelity["suffix_token_coverage"])
+        < minimum_boundary_coverage
+    )
+    if missing_start and missing_end:
+        return False, "MISSING_LINE_BOUNDARIES"
+    if missing_start:
+        return False, "MISSING_LINE_START"
+    if missing_end:
+        return False, "MISSING_LINE_END"
+    if fidelity["token_coverage"] < float(
+        settings.get("reliable_min_token_coverage", 0.60)
+    ):
+        return False, "INCOMPLETE_TRANSCRIPT"
     if fidelity["ordered_similarity"] < float(
         settings.get("reliable_min_ordered_score", 55.0)
     ):
@@ -1499,7 +1639,10 @@ def align_project(
             if not is_vocalization_script(line["line"])
         ]
         normalized_line_counts = Counter(
-            normalize_text(verbal_script_text(line["line"]))
+            normalize_spoken_text(
+                line["line"],
+                remove_parenthetical_cues=True,
+            )
             for line in session_lines
         )
         print(
@@ -1596,7 +1739,10 @@ def align_project(
             device_override=segment_device_override,
         )
         normalized_session_lines = [
-            normalize_text(verbal_script_text(line["line"]))
+            normalize_spoken_text(
+                line["line"],
+                remove_parenthetical_cues=True,
+            )
             for line in session_lines
         ]
         exact_scores_by_segment: dict[str, list[float]] = {}
@@ -1720,14 +1866,29 @@ def align_project(
             ]
             reusable_duplicate = bool(
                 duplicate_policy == "reuse"
-                and normalize_text(verbal_script_text(primary_line["line"]))
-                == normalize_text(verbal_script_text(line["line"]))
+                and normalize_spoken_text(
+                    primary_line["line"],
+                    remove_parenthetical_cues=True,
+                )
+                == normalize_spoken_text(
+                    line["line"],
+                    remove_parenthetical_cues=True,
+                )
             )
             fidelity = transcript_fidelity(
                 line["line"],
                 observed_transcript,
                 token_min_similarity=float(
                     settings.get("fidelity_token_min_similarity", 78.0)
+                ),
+                boundary_window_tokens=int(
+                    settings.get("reliable_boundary_window_tokens", 4)
+                ),
+                boundary_observed_slack_tokens=int(
+                    settings.get(
+                        "reliable_boundary_observed_slack_tokens",
+                        2,
+                    )
                 ),
             )
             sentence = sentence_fidelity(
@@ -1762,7 +1923,10 @@ def align_project(
                 observed=observed_transcript,
                 duplicate_text=(
                     normalized_line_counts[
-                        normalize_text(verbal_script_text(line["line"]))
+                        normalize_spoken_text(
+                            line["line"],
+                            remove_parenthetical_cues=True,
+                        )
                     ]
                     > 1
                     and not action.get("duplicate_resolved", False)
@@ -1838,6 +2002,12 @@ def align_project(
                 "ordered_similarity": fidelity["ordered_similarity"],
                 "token_coverage": fidelity["token_coverage"],
                 "token_precision": fidelity["token_precision"],
+                "prefix_token_coverage": fidelity[
+                    "prefix_token_coverage"
+                ],
+                "suffix_token_coverage": fidelity[
+                    "suffix_token_coverage"
+                ],
                 "extra_word_count": fidelity["extra_word_count"],
                 "clause_count": sentence["clause_count"],
                 "minimum_clause_score": sentence["minimum_clause_score"],

@@ -204,6 +204,75 @@ def test_text_similarity_handles_reordered_and_repeated_take_text() -> None:
     assert text_similarity("Run away! Run away!", "Runaway Runaway") >= 72
 
 
+@pytest.mark.parametrize(
+    ("expected", "observed"),
+    [
+        ("C'mon... get up!", "Come on, get up!"),
+        ("Could've asked.", "Could have asked."),
+        ("I've had enough.", "I have had enough."),
+        ("You're finished!", "You are finished!"),
+        ("We won't survive.", "We will not survive."),
+        ("You gotta be joking.", "You got to be joking."),
+    ],
+)
+def test_spoken_form_normalization_accepts_equivalent_phrasing(
+    expected: str,
+    observed: str,
+) -> None:
+    fidelity = transcript_fidelity(expected, observed)
+
+    assert text_similarity(expected, observed) == pytest.approx(100.0)
+    assert fidelity["ordered_similarity"] == pytest.approx(100.0)
+    assert fidelity["token_coverage"] == 1.0
+    assert fidelity["token_precision"] == 1.0
+    assert _candidate_reliability(
+        line={"line": expected},
+        match_score=100.0,
+        margin=20.0,
+        settings={},
+        observed=observed,
+        duration_plausibility=80.0,
+    ) == (True, "")
+
+
+def test_missing_single_sentence_boundary_prevents_auto_acceptance() -> None:
+    expected = (
+        "I live with that woman, and there is no way anyone who's heard "
+        "her speak would want to bed her, much less live with her."
+    )
+    missing_start = (
+        "And there is no way anyone who's heard her speak would want to "
+        "bed her, much less live with her."
+    )
+    missing_end = (
+        "I live with that woman, and there's no way anyone who's heard "
+        "her speak would want to bed her."
+    )
+
+    start_fidelity = transcript_fidelity(expected, missing_start)
+    end_fidelity = transcript_fidelity(expected, missing_end)
+    assert start_fidelity["token_coverage"] > 0.75
+    assert start_fidelity["prefix_token_coverage"] < 0.60
+    assert end_fidelity["token_coverage"] > 0.75
+    assert end_fidelity["suffix_token_coverage"] < 0.60
+    assert _candidate_reliability(
+        line={"line": expected},
+        match_score=text_similarity(expected, missing_start),
+        margin=40.0,
+        settings={},
+        observed=missing_start,
+        duration_plausibility=80.0,
+    ) == (False, "MISSING_LINE_START")
+    assert _candidate_reliability(
+        line={"line": expected},
+        match_score=text_similarity(expected, missing_end),
+        margin=40.0,
+        settings={},
+        observed=missing_end,
+        duration_plausibility=80.0,
+    ) == (False, "MISSING_LINE_END")
+
+
 def test_exact_short_match_is_reliable_unless_script_text_is_duplicated() -> None:
     settings = {
         "short_line_min_score": 88.0,
@@ -872,6 +941,119 @@ def test_fragment_join_sends_plausible_incomplete_span_to_exact_asr() -> None:
         if action["start_index"] == 0 and action["count"] == 3
     )
     assert recovered["fragment_join_provisional"] is True
+
+
+def test_fragment_join_recovers_single_sentence_missing_end() -> None:
+    line_text = (
+        "I live with that woman, and there is no way anyone who's heard "
+        "her speak would want to bed her, much less live with her."
+    )
+    segments = [
+        {
+            "start_seconds": 0.0,
+            "end_seconds": 6.0,
+            "transcript": (
+                "I live with that woman, and there's no way anyone who's "
+                "heard her speak would want to bed her."
+            ),
+            "asr_probability": 0.98,
+        },
+        {
+            "start_seconds": 6.2,
+            "end_seconds": 8.0,
+            "transcript": "Much less live with her.",
+            "asr_probability": 0.96,
+        },
+    ]
+    partial = segments[0]["transcript"]
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": 0,
+            "count": 1,
+            "line_index": 0,
+            "match_score": text_similarity(line_text, partial),
+            "transcript": partial,
+            "duration_plausibility": 75.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=[{"line_id": "Palioth::R53", "line": line_text}],
+        base_segments=segments,
+        settings={
+            "max_merge_segments": 10,
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 20.0,
+        },
+    )
+
+    recovered = next(
+        action
+        for action in joined
+        if action["start_index"] == 0 and action["count"] == 2
+    )
+    fidelity = transcript_fidelity(line_text, recovered["transcript"])
+    assert fidelity["prefix_token_coverage"] == 1.0
+    assert fidelity["suffix_token_coverage"] == 1.0
+
+
+def test_fragment_join_recovers_seven_fragments_with_ten_segment_limit() -> None:
+    line_text = (
+        "I live with that woman, and there is no way anyone who's heard "
+        "her speak would want to bed her, much less live with her."
+    )
+    transcripts = [
+        "I live with that woman.",
+        "And there is no way.",
+        "Anyone",
+        "who's heard her speak",
+        "would want to bed her",
+        "much less",
+        "live with her",
+    ]
+    segments = [
+        {
+            "start_seconds": index * 1.2,
+            "end_seconds": index * 1.2 + 1.0,
+            "transcript": transcript,
+            "asr_probability": 0.95,
+        }
+        for index, transcript in enumerate(transcripts)
+    ]
+    partial = " ".join(transcripts[1:])
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": 1,
+            "count": 6,
+            "line_index": 0,
+            "match_score": text_similarity(line_text, partial),
+            "transcript": partial,
+            "duration_plausibility": 75.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=[{"line_id": "Palioth::R53", "line": line_text}],
+        base_segments=segments,
+        settings={
+            "max_merge_segments": 10,
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 20.0,
+        },
+    )
+
+    assert any(
+        action["start_index"] == 0 and action["count"] == 7
+        for action in joined
+    )
 
 
 def test_inline_nonverbal_cues_do_not_make_spoken_line_incomplete() -> None:

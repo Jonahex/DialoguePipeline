@@ -176,11 +176,16 @@ to be useful only as a tie-breaker.
 Candidate discovery deliberately tolerates reordered or imperfect ASR text,
 but `AUTO_OK` uses separate transcript-fidelity gates. Detailed diagnostics
 remain in `alignment.json`, including ordered similarity, fuzzy-token coverage,
-fuzzy-token precision, extra-word count, and exact-span ASR verification
-status. Lines of three words or fewer default to complete coverage
+fuzzy-token precision, anchored prefix/suffix coverage, extra-word count, and
+exact-span ASR verification status. Lines of three words or fewer default to complete coverage
 and precision plus `short_line_min_ordered_score`; longer lines use the more
 tolerant `reliable_min_ordered_score`, `reliable_min_token_coverage`, and
-`reliable_min_token_precision`. A merged span containing substantial,
+`reliable_min_token_precision`, but must also preserve the beginning and end
+of the script line. Missing boundaries receive `MISSING_LINE_START`,
+`MISSING_LINE_END`, or `MISSING_LINE_BOUNDARIES`. Common equivalent spoken
+forms are canonicalized before scoring, including contractions such as
+`could've`/`could have`, `I've`/`I have`, and colloquialisms such as
+`c'mon`/`come on`. A merged span containing substantial,
 non-quiet audio with no transcript is kept for review with reason
 `MERGED_UNTRANSCRIBED_AUDIO` rather than accepted automatically.
 

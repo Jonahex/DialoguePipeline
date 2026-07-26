@@ -162,13 +162,16 @@ Multi-sentence lines also use clause-level completeness. Every clause separated
 by `.`, `?`, or `!` must reach `reliable_min_clause_score`, otherwise the
 candidate stays in review with reason `MISSING_SENTENCE`; clauses in the wrong
 order receive `SENTENCE_ORDER_MISMATCH`. When a line is split, the fragment
-joiner searches contiguous base-segment windows, including fragments the global
-resolver did not select. It reconstructs each span transcript from the
-session-level Whisper word timestamps, which recovers words straddling a left
-cut boundary. Textless first or last segments are rejected, so a duration hint
-cannot extend a candidate with an empty segment. The join is accepted only when
-whole-line similarity, weakest-clause fidelity, order, and precision pass the
-configured `fragment_join_*` thresholds. Original fragments remain available.
+joiner searches contiguous base-segment windows, including windows that merely
+overlap or neighbor the global resolver's selection. This also covers a
+single-clause line cut at a comma or another internal pause. The joiner compares
+the independent base-segment transcripts with the session-level Whisper word
+timestamps and uses the more complete, ordered evidence. By default it can
+recover lines spread across as many as six segments. Textless first or last
+segments are rejected, so a duration hint cannot extend a candidate with an
+empty segment. The join is accepted only when whole-line similarity, token
+coverage, clause fidelity, order, and precision pass the configured
+`fragment_join_*` thresholds. Original fragments remain available.
 
 Repeated takes are blocked from `AUTO_OK` by three complementary checks:
 repeated transcript words reduce token precision, merged spans with voiced but
@@ -180,7 +183,9 @@ performances into a single exact transcript.
 Before a candidate can become `AUTO_OK`, the exact WAV that would be exported
 must have an unprompted independent transcript. Base candidates reuse their
 base-clip result; serious merged candidates are decoded again as one continuous
-span and cached separately. The resulting exact-span text—not the concatenated
+span and cached separately. Uncached merged spans are deduplicated and decoded
+in batches using `segment_transcription.batch_size`; changing only batch size
+does not invalidate their transcript cache. The resulting exact-span text—not the concatenated
 base transcripts or script-prompted fallback—drives the final similarity,
 clause, extra-word, and repetition gates. Empty or failed verification receives
 `EXACT_SPAN_ASR_FAILED`.

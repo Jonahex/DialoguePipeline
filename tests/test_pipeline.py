@@ -33,6 +33,7 @@ from dialogue_pipeline.segmentation import (
 )
 from dialogue_pipeline.transcription import (
     transcribe_candidate_span,
+    transcribe_candidate_spans,
     transcribe_project,
     transcribe_segments_project,
 )
@@ -494,6 +495,18 @@ def test_adjacent_sentence_fragments_create_complete_take_candidates() -> None:
         == 0
         for action in joined
     )
+    limited = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_segments": 2,
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+            "fragment_join_max_actions": 1,
+        },
+    )
+    assert len(limited) == 1
 
 
 def test_fragment_join_uses_shortest_text_bounded_span() -> None:
@@ -662,6 +675,277 @@ def test_fragment_join_recovers_unselected_preceding_sentence_from_word_span() -
         ]
         == 0
     )
+
+
+def test_fragment_join_prefers_complete_segment_asr_over_stale_session_words() -> None:
+    line_text = "Maybe over here... No, nothing."
+    lines = [{"line_id": "line", "line": line_text}]
+    segments = [
+        {
+            "start_seconds": 0.0,
+            "end_seconds": 1.0,
+            "transcript": "Maybe over here",
+            "asr_probability": 0.95,
+        },
+        {
+            "start_seconds": 1.2,
+            "end_seconds": 2.0,
+            "transcript": "No nothing",
+            "asr_probability": 0.95,
+        },
+    ]
+    transcription = {
+        "segments": [
+            {
+                "start": 0.0,
+                "end": 2.0,
+                "words": [
+                    {
+                        "start": 0.0,
+                        "end": 0.3,
+                        "word": " Maybe",
+                        "probability": 0.99,
+                    },
+                    {
+                        "start": 0.3,
+                        "end": 0.6,
+                        "word": " over",
+                        "probability": 0.99,
+                    },
+                    {
+                        "start": 0.6,
+                        "end": 0.9,
+                        "word": " here",
+                        "probability": 0.99,
+                    },
+                ],
+            }
+        ]
+    }
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": 0,
+            "count": 1,
+            "line_index": 0,
+            "match_score": text_similarity(
+                line_text,
+                segments[0]["transcript"],
+            ),
+            "transcript": segments[0]["transcript"],
+            "duration_plausibility": 60.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+        transcription=transcription,
+    )
+
+    assert len(joined) == 1
+    assert joined[0]["start_index"] == 0
+    assert joined[0]["count"] == 2
+    assert joined[0]["transcript"] == "Maybe over here No nothing"
+    assert joined[0]["transcript_source"] == "segment_asr_span"
+
+
+def test_fragment_join_recovers_single_clause_split_at_internal_pause() -> None:
+    line_text = "Only my consciousness remains, trapped in this dream."
+    lines = [{"line_id": "line", "line": line_text}]
+    transcripts = [
+        "Only my consciousness remains",
+        "trapped in this dream",
+    ]
+    segments = [
+        {
+            "start_seconds": index * 2.0,
+            "end_seconds": index * 2.0 + 1.5,
+            "transcript": transcript,
+            "asr_probability": 0.95,
+        }
+        for index, transcript in enumerate(transcripts)
+    ]
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": 0,
+            "count": 1,
+            "line_index": 0,
+            "match_score": text_similarity(line_text, transcripts[0]),
+            "transcript": transcripts[0],
+            "duration_plausibility": 60.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+    )
+
+    assert [(action["start_index"], action["count"]) for action in joined] == [
+        (0, 2)
+    ]
+
+
+def test_fragment_join_can_recover_four_segments_around_partial_seed() -> None:
+    line_text = (
+        "The tree here is an illusion. What point would there be? "
+        "No. He's swayed you!"
+    )
+    lines = [{"line_id": "line", "line": line_text}]
+    transcripts = [
+        "The tree here is an illusion",
+        "What point would there be",
+        "No",
+        "He's swayed you",
+    ]
+    segments = [
+        {
+            "start_seconds": index * 1.2,
+            "end_seconds": index * 1.2 + 1.0,
+            "transcript": transcript,
+            "asr_probability": 0.95,
+        }
+        for index, transcript in enumerate(transcripts)
+    ]
+    partial = f"{transcripts[1]} {transcripts[2]}"
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": 1,
+            "count": 2,
+            "line_index": 0,
+            "match_score": text_similarity(line_text, partial),
+            "transcript": partial,
+            "duration_plausibility": 70.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+    )
+
+    assert any(
+        action["start_index"] == 0 and action["count"] == 4
+        for action in joined
+    )
+
+
+def test_fragment_join_searches_neighbor_before_worse_selected_candidate() -> None:
+    line_text = "All right, okay... Sounds good."
+    lines = [{"line_id": "line", "line": line_text}]
+    transcripts = [
+        "Oh all right okay",
+        "Sounds good",
+        "Alright, okay. Sounds good. Alright, okay.",
+    ]
+    segments = [
+        {
+            "start_seconds": index * 2.0,
+            "end_seconds": index * 2.0 + 1.5,
+            "transcript": transcript,
+            "asr_probability": 0.95,
+        }
+        for index, transcript in enumerate(transcripts)
+    ]
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": 2,
+            "count": 1,
+            "line_index": 0,
+            "match_score": text_similarity(line_text, transcripts[2]),
+            "transcript": transcripts[2],
+            "duration_plausibility": 45.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+    )
+
+    assert any(
+        action["start_index"] == 0 and action["count"] == 2
+        for action in joined
+    )
+
+
+def test_fragment_join_skips_line_with_complete_contraction_variant() -> None:
+    line_text = "Could've been worse."
+    lines = [{"line_id": "line", "line": line_text}]
+    segments = [
+        {
+            "start_seconds": 0.0,
+            "end_seconds": 1.0,
+            "transcript": "Could have been worse",
+            "asr_probability": 0.95,
+        },
+        {
+            "start_seconds": 1.2,
+            "end_seconds": 1.8,
+            "transcript": "Seems",
+            "asr_probability": 0.95,
+        },
+    ]
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": 0,
+            "count": 1,
+            "line_index": 0,
+            "match_score": text_similarity(
+                line_text,
+                segments[0]["transcript"],
+            ),
+            "transcript": segments[0]["transcript"],
+            "duration_plausibility": 80.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+    )
+
+    assert joined == []
 
 
 def test_unordered_alignment_does_not_merge_empty_boundary_segment() -> None:
@@ -1529,6 +1813,99 @@ def test_merged_candidate_asr_decodes_the_exact_span_once(
     assert calls[0]["vad_filter"] is False
     assert calls[0]["condition_on_previous_text"] is False
     assert "initial_prompt" not in calls[0]
+
+
+def test_candidate_span_asr_batches_unique_uncached_spans(
+    tmp_path: Path,
+) -> None:
+    segments = []
+    for index in range(3):
+        segment_file = tmp_path / f"merged_{index}.wav"
+        _write_tone(segment_file, duration_seconds=0.5)
+        segments.append(
+            {
+                "segment_id": f"session__m{index + 1:05d}_{index + 2:05d}",
+                "kind": "merged",
+                "file": segment_file.name,
+                "source_sha256": "source-hash",
+                "start_sample": index * 24000,
+                "end_sample": (index + 1) * 24000,
+            }
+        )
+    project = {
+        "language": "en",
+        "transcription": {
+            "model": "large-v3",
+            "device": "cpu",
+            "compute_type": "int8",
+        },
+        "segment_transcription": {
+            "enabled": True,
+            "batch_size": 2,
+        },
+        "segmentation": {"fade_ms": 5.0},
+        "export": {
+            "sample_rate": 48000,
+            "channels": 1,
+            "bits_per_sample": 16,
+        },
+    }
+    batch_sizes = []
+
+    class FakeBatchedModel:
+        def transcribe(self, _audio, **kwargs):
+            clips = kwargs["clip_timestamps"]
+            batch_sizes.append(kwargs["batch_size"])
+            decoded = []
+            for index, clip in enumerate(clips):
+                start = clip["start"]
+                decoded.append(
+                    SimpleNamespace(
+                        start=start + 0.05,
+                        end=start + 0.35,
+                        text=f"Line {index + 1}",
+                        avg_logprob=-0.1,
+                        no_speech_prob=0.01,
+                        words=[
+                            SimpleNamespace(
+                                start=start + 0.05,
+                                end=start + 0.25,
+                                word=" Line",
+                                probability=0.95,
+                            )
+                        ],
+                    )
+                )
+            return iter(decoded), SimpleNamespace(language="en")
+
+    runtime = {
+        "model": SimpleNamespace(
+            feature_extractor=SimpleNamespace(sampling_rate=16000)
+        ),
+        "batched_model": FakeBatchedModel(),
+    }
+    results = transcribe_candidate_spans(
+        project_dir=tmp_path,
+        project=project,
+        segments=[segments[0], segments[1], segments[0], segments[2]],
+        runtime=runtime,
+    )
+    cached = transcribe_candidate_spans(
+        project_dir=tmp_path,
+        project=project,
+        segments=segments,
+        runtime={},
+    )
+
+    assert batch_sizes == [2, 1]
+    assert set(results) == {segment["segment_id"] for segment in segments}
+    assert {
+        segment_id: payload["cache_key"]
+        for segment_id, payload in cached.items()
+    } == {
+        segment_id: payload["cache_key"]
+        for segment_id, payload in results.items()
+    }
 
 
 def test_sample_accurate_cut_and_finalize(tmp_path: Path) -> None:

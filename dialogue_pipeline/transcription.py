@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -372,7 +373,6 @@ def _clip_decoding_identity(
         "compute_type_request": profile["compute_type"],
         "language": project.get("language", "en"),
         "beam_size": int(profile.get("beam_size", 5)),
-        "batch_size": int(profile.get("batch_size", 16)),
         "condition_on_previous_text": False,
         "vad_filter": False,
         "prompt": prompt or "",
@@ -396,12 +396,29 @@ def _cached_clip_payload(
     *,
     cache_path: Path,
     cache_key: str,
+    cache_identity: dict[str, Any],
+    decoding_identity: dict[str, Any],
     force: bool,
 ) -> dict[str, Any] | None:
     if not cache_path.is_file() or force:
         return None
     cached = read_json(cache_path)
-    return cached if cached.get("cache_key") == cache_key else None
+    if cached.get("cache_key") == cache_key:
+        return cached
+
+    # Batch size changes only how clips are grouped for inference; it does not
+    # change the requested decoding of an individual clip. Accept caches from
+    # versions that recorded this execution detail in the decoding identity.
+    cached_decoding = dict(cached.get("decoding") or {})
+    cached_decoding.pop("batch_size", None)
+    normalized_decoding = dict(decoding_identity)
+    normalized_decoding.pop("batch_size", None)
+    if (
+        cached.get("cache_identity") == cache_identity
+        and cached_decoding == normalized_decoding
+    ):
+        return cached
+    return None
 
 
 def _clip_payload(
@@ -575,6 +592,8 @@ def transcribe_clip_cached(
     cached = _cached_clip_payload(
         cache_path=cache_path,
         cache_key=cache_key,
+        cache_identity=cache_identity,
+        decoding_identity=decoding_identity,
         force=force,
     )
     if cached:
@@ -601,6 +620,153 @@ def transcribe_clip_cached(
     )
     write_json(cache_path, payload)
     return payload
+
+
+def transcribe_candidate_spans(
+    *,
+    project_dir: Path,
+    project: dict[str, Any],
+    segments: list[dict[str, Any]],
+    runtime: dict[str, Any],
+    force: bool = False,
+    model_override: str | None = None,
+    device_override: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Transcribe unique exact candidate WAVs in cache-aware batches."""
+
+    profile = _segment_transcription_profile(
+        project,
+        model_override=model_override,
+        device_override=device_override,
+    )
+    results: dict[str, dict[str, Any]] = {}
+    pending = []
+    seen = set()
+    cache_dir = project_dir / "segment_transcripts" / "candidates"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    for segment in segments:
+        segment_id = str(segment["segment_id"])
+        if segment_id in seen:
+            continue
+        seen.add(segment_id)
+        if segment.get("kind") == "base":
+            primary = (segment.get("segment_asr") or {}).get("primary")
+            if primary:
+                results[segment_id] = primary
+                continue
+
+        cache_identity = {
+            "kind": "candidate_span",
+            "segment_id": segment_id,
+            "source_sha256": segment.get("source_sha256"),
+            "start_sample": segment.get("start_sample"),
+            "end_sample": segment.get("end_sample"),
+            "fade_ms": (project.get("segmentation") or {}).get("fade_ms"),
+            "export": project.get("export") or {},
+        }
+        decoding_identity = _clip_decoding_identity(
+            project=project,
+            profile=profile,
+            prompt=None,
+        )
+        cache_key = _clip_cache_key(
+            cache_identity=cache_identity,
+            decoding_identity=decoding_identity,
+        )
+        cache_path = cache_dir / f"{segment_id}.json"
+        cached = _cached_clip_payload(
+            cache_path=cache_path,
+            cache_key=cache_key,
+            cache_identity=cache_identity,
+            decoding_identity=decoding_identity,
+            force=force,
+        )
+        if cached:
+            segment["candidate_asr"] = cached
+            results[segment_id] = cached
+            continue
+        pending.append(
+            {
+                "segment": segment,
+                "audio_path": resolve_project_path(
+                    project_dir,
+                    segment["file"],
+                ),
+                "cache_path": cache_path,
+                "cache_identity": cache_identity,
+                "decoding_identity": decoding_identity,
+                "cache_key": cache_key,
+            }
+        )
+
+    if not pending:
+        return results
+
+    _ensure_clip_model(
+        project_dir=project_dir,
+        project=project,
+        profile=profile,
+        runtime=runtime,
+    )
+    batch_size = int(profile.get("batch_size", 16))
+    print(
+        f"[candidate ASR] {len(results)} cached, {len(pending)} pending "
+        f"(batch size {batch_size})",
+        flush=True,
+    )
+    for batch_start in range(0, len(pending), batch_size):
+        batch = pending[batch_start : batch_start + batch_size]
+        print(
+            f"[candidate ASR] batch "
+            f"{batch_start // batch_size + 1}/"
+            f"{math.ceil(len(pending) / batch_size)}",
+            flush=True,
+        )
+        try:
+            decoded_batch = _decode_clips_batched(
+                audio_paths=[entry["audio_path"] for entry in batch],
+                project=project,
+                profile=profile,
+                runtime=runtime,
+            )
+            decoded_or_errors = list(decoded_batch)
+        except Exception as batch_error:
+            decoded_or_errors = []
+            for entry in batch:
+                try:
+                    decoded_or_errors.append(
+                        _decode_clips_batched(
+                            audio_paths=[entry["audio_path"]],
+                            project=project,
+                            profile=profile,
+                            runtime=runtime,
+                        )[0]
+                    )
+                except Exception as error:
+                    decoded_or_errors.append(
+                        {
+                            "error": str(error),
+                            "batch_error": str(batch_error),
+                        }
+                    )
+
+        for entry, decoded in zip(batch, decoded_or_errors):
+            segment = entry["segment"]
+            segment_id = str(segment["segment_id"])
+            if decoded.get("error"):
+                results[segment_id] = decoded
+                continue
+            payload = _clip_payload(
+                cache_key=entry["cache_key"],
+                cache_identity=entry["cache_identity"],
+                decoding_identity=entry["decoding_identity"],
+                decoded=decoded,
+            )
+            write_json(entry["cache_path"], payload)
+            segment["candidate_asr"] = payload
+            results[segment_id] = payload
+    return results
 
 
 def _prompt_candidates(
@@ -798,6 +964,8 @@ def transcribe_segments_project(
             primary = _cached_clip_payload(
                 cache_path=cache_path,
                 cache_key=cache_key,
+                cache_identity=cache_identity,
+                decoding_identity=decoding_identity,
                 force=force,
             )
             entry = {
@@ -944,42 +1112,19 @@ def transcribe_candidate_span(
     device_override: str | None = None,
 ) -> dict[str, Any]:
     """Transcribe the exact candidate WAV without script prompting."""
-    profile = _segment_transcription_profile(
-        project,
+    result = transcribe_candidate_spans(
+        project_dir=project_dir,
+        project=project,
+        segments=[segment],
+        runtime=runtime,
+        force=force,
         model_override=model_override,
         device_override=device_override,
     )
-    if segment.get("kind") == "base":
-        primary = (segment.get("segment_asr") or {}).get("primary")
-        if primary:
-            return primary
-
-    cache_identity = {
-        "kind": "candidate_span",
-        "segment_id": segment["segment_id"],
-        "source_sha256": segment.get("source_sha256"),
-        "start_sample": segment.get("start_sample"),
-        "end_sample": segment.get("end_sample"),
-        "fade_ms": (project.get("segmentation") or {}).get("fade_ms"),
-        "export": project.get("export") or {},
-    }
-    result = transcribe_clip_cached(
-        project_dir=project_dir,
-        project=project,
-        audio_path=resolve_project_path(project_dir, segment["file"]),
-        cache_path=(
-            project_dir
-            / "segment_transcripts"
-            / "candidates"
-            / f"{segment['segment_id']}.json"
-        ),
-        cache_identity=cache_identity,
-        profile=profile,
-        runtime=runtime,
-        force=force,
-    )
-    segment["candidate_asr"] = result
-    return result
+    payload = result[str(segment["segment_id"])]
+    if payload.get("error"):
+        raise RuntimeError(str(payload["error"]))
+    return payload
 
 
 def transcribe_project(

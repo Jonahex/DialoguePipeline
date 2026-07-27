@@ -36,6 +36,8 @@ ALIGNMENT_DEFAULTS: dict[str, Any] = {
     "clause_completeness_weight": 5.0,
     "fragment_join_enabled": True,
     "fragment_join_max_actions": 10,
+    "fragment_join_fallback_max_actions": 2,
+    "fragment_join_fallback_min_match_score": 90.0,
     "fragment_join_max_segments": 10,
     "fragment_join_require_text_boundaries": True,
     "fragment_join_only_incomplete_lines": True,
@@ -52,6 +54,14 @@ ALIGNMENT_DEFAULTS: dict[str, Any] = {
     "fragment_join_complete_min_ordered_score": 70.0,
     "fragment_join_complete_min_length_ratio": 0.75,
     "fragment_join_complete_max_length_ratio": 1.35,
+    "intra_segment_trim_enabled": True,
+    "intra_segment_trim_max_actions_per_line": 2,
+    "intra_segment_trim_max_actions_per_segment": 3,
+    "intra_segment_trim_min_gap_seconds": 0.40,
+    "intra_segment_trim_min_match_score": 85.0,
+    "intra_segment_trim_min_token_coverage": 0.85,
+    "intra_segment_trim_min_token_precision": 0.85,
+    "intra_segment_trim_min_ordered_score": 70.0,
     "span_word_min_overlap_seconds": 0.20,
     "span_word_min_overlap_fraction": 0.20,
     "short_line_min_score": 88.0,
@@ -124,8 +134,21 @@ _GROUPED_KEYS: dict[tuple[str, ...], str] = {
     ),
     ("recovery", "enabled"): "fragment_join_enabled",
     ("recovery", "max_candidates_per_line"): "fragment_join_max_actions",
+    ("recovery", "fallback_candidates_per_line"): (
+        "fragment_join_fallback_max_actions"
+    ),
+    ("recovery", "fallback_minimum_score"): (
+        "fragment_join_fallback_min_match_score"
+    ),
     ("recovery", "max_segments"): "fragment_join_max_segments",
     ("recovery", "neighbor_radius"): "fragment_join_neighbor_radius",
+    ("recovery", "trim_oversized_segments"): "intra_segment_trim_enabled",
+    ("recovery", "trim_candidates_per_line"): (
+        "intra_segment_trim_max_actions_per_line"
+    ),
+    ("recovery", "trim_minimum_gap_seconds"): (
+        "intra_segment_trim_min_gap_seconds"
+    ),
     ("quality", "reject_clipping"): "auto_reject_clipping",
     ("quality", "minimum_technical_score"): "auto_min_technical_score",
     ("quality", "reject_untranscribed_merge"): (
@@ -191,8 +214,13 @@ def default_alignment_config() -> dict[str, Any]:
         "recovery": {
             "enabled": True,
             "max_candidates_per_line": 10,
+            "fallback_candidates_per_line": 2,
+            "fallback_minimum_score": 90.0,
             "max_segments": 10,
             "neighbor_radius": 1,
+            "trim_oversized_segments": True,
+            "trim_candidates_per_line": 2,
+            "trim_minimum_gap_seconds": 0.40,
         },
         "quality": {
             "reject_clipping": True,
@@ -257,9 +285,17 @@ class AlignmentSettings(Mapping[str, Any]):
             if int(values[key]) < 1:
                 raise ValueError(f"alignment.{key} must be at least 1")
         for key in (
+            "fragment_join_fallback_max_actions",
+            "intra_segment_trim_max_actions_per_line",
+            "intra_segment_trim_max_actions_per_segment",
+        ):
+            if int(values[key]) < 0:
+                raise ValueError(f"alignment.{key} cannot be negative")
+        for key in (
             "max_merge_gap_seconds",
             "max_span_seconds",
             "take_group_gap_seconds",
+            "intra_segment_trim_min_gap_seconds",
             "untranscribed_merge_min_seconds",
         ):
             if float(values[key]) < 0.0:
@@ -272,6 +308,9 @@ class AlignmentSettings(Mapping[str, Any]):
             "short_line_min_score",
             "short_line_min_ordered_score",
             "fidelity_token_min_similarity",
+            "fragment_join_fallback_min_match_score",
+            "intra_segment_trim_min_match_score",
+            "intra_segment_trim_min_ordered_score",
             "auto_min_technical_score",
         ):
             if not 0.0 <= float(values[key]) <= 100.0:
@@ -281,6 +320,8 @@ class AlignmentSettings(Mapping[str, Any]):
             "reliable_min_token_precision",
             "short_line_min_token_coverage",
             "short_line_min_token_precision",
+            "intra_segment_trim_min_token_coverage",
+            "intra_segment_trim_min_token_precision",
         ):
             if not 0.0 <= float(values[key]) <= 1.0:
                 raise ValueError(f"alignment.{key} must be between 0 and 1")

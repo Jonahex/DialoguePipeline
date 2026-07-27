@@ -214,6 +214,10 @@ token coverage, clause fidelity, order, and precision thresholds. A second
 provisional path admits spans that clearly improve the selected fragment but
 whose preliminary fragment transcripts still miss a short clause. Those spans
 are independently transcribed as exact WAVs before reliability is decided.
+Up to two additional high-scoring provisional joins are retained as bounded
+fallbacks even when the preliminary transcript does not improve every fidelity
+dimension. This preserves promising alternate boundaries for exact-WAV
+verification without restoring the former diagnostic candidate explosion.
 Near-complete secondary line matches can also seed recovery; the default
 `fragment_join_secondary_seed_min_match_score` is `80`. When a very short
 opening or closing clause is audible but Whisper cannot identify it reliably,
@@ -222,6 +226,12 @@ the joined span remains available for playback with
 If exact-span ASR shows that such a span belongs to a different script line than
 the preliminary fragment text suggested, the candidate is reassigned to that
 better line.
+When one oversized base segment contains multiple performances, alignment can
+also recover line-sized trimmed candidates from the independent base-ASR word
+timestamps. Cuts are considered only at pauses of at least 0.4 seconds, must
+produce materially more complete and precise text, and are independently
+transcribed again before `AUTO_OK`. The untrimmed base candidate remains
+available for comparison.
 Inline performance cues such as `(laugh)` and `(hiccup)` are not treated as
 spoken words during matching. Original fragments remain available.
 
@@ -230,7 +240,8 @@ aligner and fragment recovery. An existing `fragment_join_max_segments` value
 may raise that recovery limit but can no longer lower it.
 `fragment_join_max_actions` is different: it is the number of recovery
 alternatives retained per line for exact-span verification, not a merge-size
-limit.
+limit. `fragment_join_fallback_max_actions` separately bounds fallback joins;
+`intra_segment_trim_max_actions_per_line` bounds pause-based trims.
 
 Repeated takes are blocked from `AUTO_OK` by three complementary checks:
 repeated transcript words reduce token precision, merged spans with voiced but
@@ -295,7 +306,11 @@ New projects write a compact grouped configuration:
     "recovery": {
       "enabled": true,
       "max_candidates_per_line": 10,
-      "max_segments": 10
+      "fallback_candidates_per_line": 2,
+      "max_segments": 10,
+      "trim_oversized_segments": true,
+      "trim_candidates_per_line": 2,
+      "trim_minimum_gap_seconds": 0.4
     },
     "quality": {
       "reject_clipping": true,

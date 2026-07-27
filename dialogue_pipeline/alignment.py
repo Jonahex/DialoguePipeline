@@ -19,7 +19,10 @@ from .review import (
     load_line_review,
     preserve_manual_selections,
 )
-from .segmentation import materialize_derived_segment
+from .segmentation import (
+    materialize_derived_segment,
+    materialize_trimmed_segment,
+)
 from .transcription import (
     transcribe_candidate_spans,
     transcribe_segments_project,
@@ -1313,6 +1316,13 @@ def _multisentence_fragment_join_actions(
         1,
         int(settings.get("fragment_join_max_actions", 10)),
     )
+    fallback_actions_per_line = max(
+        0,
+        int(settings.get("fragment_join_fallback_max_actions", 2)),
+    )
+    fallback_minimum_match = float(
+        settings.get("fragment_join_fallback_min_match_score", 90.0)
+    )
     minimum_token_coverage = float(
         settings.get("fragment_join_min_token_coverage", 0.85)
     )
@@ -1405,6 +1415,59 @@ def _multisentence_fragment_join_actions(
             float(scored["match"]),
             float(fidelity["token_precision"]),
             float(fidelity["ordered_similarity"]),
+        )
+
+    def is_strict_preview(scored: dict[str, Any]) -> bool:
+        sentence = scored["sentence"]
+        fidelity = scored["fidelity"]
+        return bool(
+            (
+                sentence["clause_count"] < 2
+                or (
+                    sentence["missing_clause_count"] == 0
+                    and sentence["clauses_in_order"]
+                )
+            )
+            and float(fidelity["token_coverage"])
+            >= minimum_token_coverage
+            and float(fidelity["ordered_similarity"])
+            >= minimum_ordered_score
+            and float(fidelity["token_precision"])
+            >= minimum_token_precision
+            and has_complete_boundaries(fidelity)
+        )
+
+    def is_provisional_preview(
+        scored: dict[str, Any],
+        *,
+        boundary_audio_rescue: bool,
+    ) -> bool:
+        sentence = scored["sentence"]
+        fidelity = scored["fidelity"]
+        return bool(
+            float(scored["match"]) >= provisional_minimum_match
+            and (
+                float(fidelity["token_coverage"])
+                >= provisional_minimum_token_coverage
+                or (
+                    boundary_audio_rescue
+                    and float(fidelity["token_coverage"]) >= 0.50
+                )
+            )
+            and float(fidelity["ordered_similarity"])
+            >= provisional_minimum_ordered_score
+            and (
+                float(fidelity["token_precision"])
+                >= provisional_minimum_token_precision
+                or (
+                    boundary_audio_rescue
+                    and float(fidelity["token_precision"]) >= 0.50
+                )
+            )
+            and (
+                sentence["missing_clause_count"] > 0
+                or bool(sentence["clauses_in_order"])
+            )
         )
 
     complete_line_indexes = set()
@@ -1605,60 +1668,56 @@ def _multisentence_fragment_join_actions(
                         )
                     )
                 )
-                if (
+                quality_improved = bool(
                     preview_quality(combined)
-                    <= max(
+                    > max(
                         preview_quality(metric)
                         for metric in fragment_metrics
                     )
-                    and not boundary_audio_rescue
+                    or boundary_audio_rescue
+                )
+                strict_preview = is_strict_preview(combined)
+                provisional_preview = is_provisional_preview(
+                    combined,
+                    boundary_audio_rescue=boundary_audio_rescue,
+                )
+                fallback_preview = False
+                if not (
+                    quality_improved
+                    and (strict_preview or provisional_preview)
                 ):
-                    continue
-                strict_preview = bool(
-                    (
-                        combined_sentence["clause_count"] < 2
-                        or (
-                            combined_sentence["missing_clause_count"] == 0
-                            and combined_sentence["clauses_in_order"]
+                    fallback_options = [
+                        scored
+                        for scored in scored_previews
+                        if float(scored["match"]) >= fallback_minimum_match
+                        and is_provisional_preview(
+                            scored,
+                            boundary_audio_rescue=False,
                         )
+                    ]
+                    if (
+                        fallback_actions_per_line == 0
+                        or not fallback_options
+                    ):
+                        continue
+                    combined = max(
+                        fallback_options,
+                        key=lambda scored: (
+                            float(scored["match"]),
+                            preview_quality(scored),
+                        ),
                     )
-                    and float(combined_fidelity["token_coverage"])
-                    >= minimum_token_coverage
-                    and float(combined_fidelity["ordered_similarity"])
-                    >= minimum_ordered_score
-                    and float(combined_fidelity["token_precision"])
-                    >= minimum_token_precision
-                    and has_complete_boundaries(combined_fidelity)
-                )
-                provisional_preview = bool(
-                    combined_match >= provisional_minimum_match
-                    and (
-                        float(combined_fidelity["token_coverage"])
-                        >= provisional_minimum_token_coverage
-                        or (
-                            boundary_audio_rescue
-                            and float(combined_fidelity["token_coverage"])
-                            >= 0.50
-                        )
+                    span = combined["preview"]
+                    combined_match = float(combined["match"])
+                    combined_fidelity = combined["fidelity"]
+                    combined_sentence = combined["sentence"]
+                    strict_preview = is_strict_preview(combined)
+                    provisional_preview = is_provisional_preview(
+                        combined,
+                        boundary_audio_rescue=False,
                     )
-                    and float(combined_fidelity["ordered_similarity"])
-                    >= provisional_minimum_ordered_score
-                    and (
-                        float(combined_fidelity["token_precision"])
-                        >= provisional_minimum_token_precision
-                        or (
-                            boundary_audio_rescue
-                            and float(combined_fidelity["token_precision"])
-                            >= 0.50
-                        )
-                    )
-                    and (
-                        combined_sentence["missing_clause_count"] > 0
-                        or bool(combined_sentence["clauses_in_order"])
-                    )
-                )
-                if not strict_preview and not provisional_preview:
-                    continue
+                    boundary_audio_rescue = False
+                    fallback_preview = True
 
                 expected_counts = Counter(
                     evaluator.line_features[line_index].text.tokens
@@ -1732,6 +1791,7 @@ def _multisentence_fragment_join_actions(
                             }
                         ],
                         "fragment_join": True,
+                        "fragment_join_fallback": fallback_preview,
                         "fragment_source_count": count,
                         "fragment_join_provisional": not strict_preview,
                         "forced_review_reason": (
@@ -1770,8 +1830,20 @@ def _multisentence_fragment_join_actions(
                 -int(action["count"]),
             )
 
-        line_actions.sort(key=action_quality, reverse=True)
-        selected_joins.extend(line_actions[:maximum_actions_per_line])
+        regular_actions = [
+            action
+            for action in line_actions
+            if not action.get("fragment_join_fallback")
+        ]
+        fallback_actions = [
+            action
+            for action in line_actions
+            if action.get("fragment_join_fallback")
+        ]
+        regular_actions.sort(key=action_quality, reverse=True)
+        fallback_actions.sort(key=action_quality, reverse=True)
+        selected_joins.extend(regular_actions[:maximum_actions_per_line])
+        selected_joins.extend(fallback_actions[:fallback_actions_per_line])
     selected_joins.sort(
         key=lambda action: (
             int(action["start_index"]),
@@ -1780,6 +1852,289 @@ def _multisentence_fragment_join_actions(
         )
     )
     return selected_joins
+
+
+def _action_span_key(
+    action: Mapping[str, Any],
+) -> tuple[int, int, int, int]:
+    """Identify a whole-segment span or a trimmed portion of one span."""
+
+    return (
+        int(action["start_index"]),
+        int(action["count"]),
+        int(action.get("trim_start_sample", -1)),
+        int(action.get("trim_end_sample", -1)),
+    )
+
+
+def _intra_segment_trim_actions(
+    actions: list[dict[str, Any]],
+    *,
+    lines: list[dict[str, Any]],
+    base_segments: list[dict[str, Any]],
+    sample_rate: int,
+    settings: Mapping[str, Any] | AlignmentSettings,
+    evaluator: TranscriptEvaluator,
+) -> list[dict[str, Any]]:
+    """Recover line-sized candidates inside an oversized base segment.
+
+    Trimming is allowed only at a clear independently-transcribed word gap.
+    The trimmed text must be complete and materially more precise than the
+    full base transcript. The resulting WAV is independently decoded later,
+    exactly like every other serious alignment candidate.
+    """
+
+    settings = AlignmentSettings.from_value(settings)
+    if not bool(settings.get("intra_segment_trim_enabled", True)):
+        return []
+
+    minimum_gap = float(
+        settings.get("intra_segment_trim_min_gap_seconds", 0.40)
+    )
+    minimum_match = float(
+        settings.get("intra_segment_trim_min_match_score", 85.0)
+    )
+    minimum_coverage = float(
+        settings.get("intra_segment_trim_min_token_coverage", 0.85)
+    )
+    minimum_precision = float(
+        settings.get("intra_segment_trim_min_token_precision", 0.85)
+    )
+    minimum_ordered = float(
+        settings.get("intra_segment_trim_min_ordered_score", 70.0)
+    )
+    maximum_per_line = max(
+        0,
+        int(settings.get("intra_segment_trim_max_actions_per_line", 2)),
+    )
+    maximum_per_segment = max(
+        0,
+        int(settings.get("intra_segment_trim_max_actions_per_segment", 3)),
+    )
+    if maximum_per_line == 0 or maximum_per_segment == 0:
+        return []
+
+    proposals: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for source_action in actions:
+        if int(source_action["count"]) != 1:
+            continue
+        base_index = int(source_action["start_index"])
+        segment = base_segments[base_index]
+        segment_asr = segment.get("segment_asr") or {}
+        primary_asr = segment_asr.get("primary") or {}
+        words = [
+            word
+            for word in primary_asr.get("words") or []
+            if str(word.get("word") or "").strip()
+            and word.get("start") is not None
+            and word.get("end") is not None
+        ]
+        if len(words) < 2:
+            continue
+
+        start_words = [0]
+        end_words = []
+        boundary_offsets: dict[int, float] = {}
+        for word_index, (left, right) in enumerate(
+            zip(words, words[1:])
+        ):
+            left_end = float(left["end"])
+            right_start = float(right["start"])
+            if right_start - left_end < minimum_gap:
+                continue
+            boundary_offsets[word_index] = (left_end + right_start) / 2.0
+            end_words.append(word_index)
+            start_words.append(word_index + 1)
+        if not boundary_offsets:
+            continue
+        end_words.append(len(words) - 1)
+        word_windows = [
+            (first_word, last_word)
+            for first_word in start_words
+            for last_word in end_words
+            if first_word <= last_word
+            and not (
+                first_word == 0
+                and last_word == len(words) - 1
+            )
+        ]
+
+        line_indexes = [int(source_action["line_index"])]
+        line_indexes.extend(
+            int(match["line_index"])
+            for match in source_action.get("top_matches") or []
+            if float(match.get("match_score", 0.0))
+            >= float(settings.get("candidate_min_score", 45.0))
+        )
+        for line_index in dict.fromkeys(line_indexes):
+            line = lines[line_index]
+            if is_vocalization_script(line["line"]):
+                continue
+            full = evaluator.evaluate(
+                line_index,
+                str(
+                    primary_asr.get("transcript")
+                    or segment.get("transcript")
+                    or ""
+                ),
+            )
+            for first_word, last_word in word_windows:
+                trim_start_offset = (
+                    boundary_offsets[first_word - 1]
+                    if first_word
+                    else 0.0
+                )
+                trim_end_offset = (
+                    boundary_offsets[last_word]
+                    if last_word < len(words) - 1
+                    else float(
+                        segment["end_seconds"]
+                        - segment["start_seconds"]
+                    )
+                )
+                window_text = " ".join(
+                    str(word["word"]).strip()
+                    for word in words[first_word : last_word + 1]
+                )
+                trimmed = evaluator.evaluate(line_index, window_text)
+                fidelity = trimmed.fidelity
+                sentence = trimmed.sentence
+                if (
+                    trimmed.match_score < minimum_match
+                    or float(fidelity["token_coverage"]) < minimum_coverage
+                    or float(fidelity["token_precision"]) < minimum_precision
+                    or float(fidelity["ordered_similarity"]) < minimum_ordered
+                    or int(sentence["missing_clause_count"]) > 0
+                    or not bool(sentence["clauses_in_order"])
+                    or int(fidelity["leading_extra_token_count"]) > 0
+                    or int(fidelity["trailing_extra_token_count"]) > 0
+                ):
+                    continue
+                if (
+                    int(fidelity["extra_word_count"])
+                    >= int(full.fidelity["extra_word_count"])
+                    and float(fidelity["token_precision"])
+                    <= float(full.fidelity["token_precision"])
+                ):
+                    continue
+
+                base_start_sample = int(segment["start_sample"])
+                start_sample = max(
+                    base_start_sample,
+                    base_start_sample
+                    + round(trim_start_offset * sample_rate),
+                )
+                end_sample = min(
+                    int(segment["end_sample"]),
+                    base_start_sample
+                    + round(trim_end_offset * sample_rate),
+                )
+                key = (line_index, base_index, start_sample, end_sample)
+                if end_sample <= start_sample or key in seen:
+                    continue
+                seen.add(key)
+
+                other_score = max(
+                    (
+                        evaluator.match(other_index, window_text)
+                        for other_index, other_line in enumerate(lines)
+                        if other_index != line_index
+                        and not is_vocalization_script(other_line["line"])
+                    ),
+                    default=0.0,
+                )
+                preview = {
+                    "start_seconds": start_sample / sample_rate,
+                    "end_seconds": end_sample / sample_rate,
+                }
+                duration_score = _duration_plausibility(
+                    line,
+                    preview,
+                    expected_word_count=evaluator.line_features[
+                        line_index
+                    ].word_count,
+                )
+                proposals.append(
+                    {
+                        "type": "assigned",
+                        "start_index": base_index,
+                        "count": 1,
+                        "line_index": line_index,
+                        "match_score": trimmed.match_score,
+                        "confidence_margin": (
+                            trimmed.match_score - other_score
+                        ),
+                        "transcript": window_text,
+                        "transcript_source": (
+                            "segment_asr_word_trim_preview"
+                        ),
+                        "duration_plausibility": duration_score,
+                        "order_hint": float(
+                            source_action.get("order_hint", 0.0)
+                        ),
+                        "top_matches": [
+                            {
+                                "line_index": line_index,
+                                "match_score": trimmed.match_score,
+                                "ranking_score": trimmed.match_score,
+                                "duration_plausibility": duration_score,
+                                "order_hint": float(
+                                    source_action.get("order_hint", 0.0)
+                                ),
+                                "confidence_margin": (
+                                    trimmed.match_score - other_score
+                                ),
+                            }
+                        ],
+                        "trim_start_sample": start_sample,
+                        "trim_end_sample": end_sample,
+                        "trim_word_start": first_word,
+                        "trim_word_end": last_word,
+                        "intra_segment_trim": True,
+                        "is_primary_match": True,
+                        "segment_match_rank": 1,
+                    }
+                )
+
+    proposals.sort(
+        key=lambda action: (
+            float(action["match_score"]),
+            float(
+                evaluator.evaluate(
+                    int(action["line_index"]),
+                    str(action["transcript"]),
+                ).fidelity["token_precision"]
+            ),
+            -(
+                int(action["trim_end_sample"])
+                - int(action["trim_start_sample"])
+            ),
+        ),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    line_counts: Counter[int] = Counter()
+    segment_counts: Counter[int] = Counter()
+    for action in proposals:
+        line_index = int(action["line_index"])
+        base_index = int(action["start_index"])
+        if (
+            line_counts[line_index] >= maximum_per_line
+            or segment_counts[base_index] >= maximum_per_segment
+        ):
+            continue
+        selected.append(action)
+        line_counts[line_index] += 1
+        segment_counts[base_index] += 1
+    return sorted(
+        selected,
+        key=lambda action: (
+            int(action["start_index"]),
+            int(action["trim_start_sample"]),
+            int(action["line_index"]),
+        ),
+    )
 
 
 def _expand_alignment_actions(
@@ -1826,22 +2181,14 @@ def _expand_alignment_actions(
                     and len(identical_indexes) > 1
                 )
             )
-            expanded.append(
+            expanded_action = dict(action)
+            expanded_action.update(
                 {
                     "type": "assigned",
                     "start_index": start_index,
                     "count": count,
                     "line_index": target_index,
                     "primary_line_index": target_index,
-                    "match_score": float(action["match_score"]),
-                    "transcript": action["transcript"],
-                    "duration_plausibility": float(
-                        action.get("duration_plausibility", 0.0)
-                    ),
-                    "order_hint": float(action.get("order_hint", 0.0)),
-                    "confidence_margin": float(
-                        action.get("confidence_margin", 0.0)
-                    ),
                     "segment_match_rank": 1,
                     "is_primary_match": True,
                     "duplicate_resolution": (
@@ -1853,18 +2200,9 @@ def _expand_alignment_actions(
                         )
                     ),
                     "duplicate_resolved": duplicate_resolved,
-                    "fragment_join": bool(action.get("fragment_join", False)),
-                    "fragment_source_count": int(
-                        action.get("fragment_source_count", 0)
-                    ),
-                    "fragment_join_provisional": bool(
-                        action.get("fragment_join_provisional", False)
-                    ),
-                    "forced_review_reason": str(
-                        action.get("forced_review_reason") or ""
-                    ),
                 }
             )
+            expanded.append(expanded_action)
 
     expanded.sort(
         key=lambda action: (
@@ -1879,24 +2217,29 @@ def _expand_alignment_actions(
 def _reroute_actions_to_exact_asr_primary_matches(
     actions: list[dict[str, Any]],
     *,
-    materialized_by_span: dict[tuple[int, int], dict[str, Any]],
+    materialized_by_span: dict[
+        tuple[int, ...],
+        dict[str, Any],
+    ],
     exact_scores_by_segment: dict[str, list[float]],
     minimum_score: float,
 ) -> list[dict[str, Any]]:
     """Choose one exact-ASR primary line per unique audio span."""
 
     actions_by_span: dict[
-        tuple[int, int],
+        tuple[int, int, int, int],
         list[dict[str, Any]],
     ] = defaultdict(list)
     for action in actions:
-        actions_by_span[
-            (int(action["start_index"]), int(action["count"]))
-        ].append(action)
+        actions_by_span[_action_span_key(action)].append(action)
 
     routed_actions = []
     for span_key, span_actions in actions_by_span.items():
         segment = materialized_by_span.get(span_key)
+        if segment is None and span_key[2:] == (-1, -1):
+            # Preserve the original private-helper contract for callers that
+            # still key ordinary spans by just (start_index, count).
+            segment = materialized_by_span.get(span_key[:2])
         scores = (
             exact_scores_by_segment.get(str(segment["segment_id"]))
             if segment is not None
@@ -2317,11 +2660,25 @@ def align_project(
             evaluator=evaluator,
             span_catalog=span_catalog,
         )
+        intra_segment_trim_actions = _intra_segment_trim_actions(
+            primary_actions,
+            lines=session_lines,
+            base_segments=base_segments,
+            sample_rate=int(session_entry["sample_rate"]),
+            settings=settings,
+            evaluator=evaluator,
+        )
         candidate_actions = sorted(
-            [*primary_actions, *fragment_join_actions],
+            [
+                *primary_actions,
+                *fragment_join_actions,
+                *intra_segment_trim_actions,
+            ],
             key=lambda action: (
                 int(action["start_index"]),
                 int(action["count"]),
+                int(action.get("trim_start_sample", -1)),
+                int(action.get("trim_end_sample", -1)),
             ),
         )
         actions = candidate_actions
@@ -2339,25 +2696,36 @@ def align_project(
             )
         )
         materialized_by_span: dict[
-            tuple[int, int],
+            tuple[int, int, int, int],
             dict[str, Any],
         ] = {}
         verification_segments: dict[str, dict[str, Any]] = {}
         for action in actions:
-            span_key = (
-                int(action["start_index"]),
-                int(action["count"]),
-            )
+            span_key = _action_span_key(action)
             segment = materialized_by_span.get(span_key)
             if segment is None:
-                segment = materialize_derived_segment(
-                    project_dir=project_dir,
-                    project=project,
-                    session_entry=session_entry,
-                    base_segments=base_segments,
-                    start_index=span_key[0],
-                    count=span_key[1],
-                )
+                if bool(action.get("intra_segment_trim")):
+                    base = base_segments[span_key[0]]
+                    segment = materialize_trimmed_segment(
+                        project_dir=project_dir,
+                        project=project,
+                        session_entry=session_entry,
+                        base_segments=base_segments,
+                        base_index=span_key[0],
+                        start_sample=span_key[2],
+                        end_sample=span_key[3],
+                        transcript=str(action.get("transcript") or ""),
+                        asr_probability=base.get("asr_probability"),
+                    )
+                else:
+                    segment = materialize_derived_segment(
+                        project_dir=project_dir,
+                        project=project,
+                        session_entry=session_entry,
+                        base_segments=base_segments,
+                        start_index=span_key[0],
+                        count=span_key[1],
+                    )
                 materialized_by_span[span_key] = segment
             line = session_lines[int(action["line_index"])]
             if (
@@ -2413,12 +2781,7 @@ def align_project(
 
         for action in actions:
             line = session_lines[action["line_index"]]
-            segment = materialized_by_span[
-                (
-                    int(action["start_index"]),
-                    int(action["count"]),
-                )
-            ]
+            segment = materialized_by_span[_action_span_key(action)]
             preliminary_transcript = str(
                 action.get("transcript")
                 or segment.get("transcript")
@@ -2685,6 +3048,12 @@ def align_project(
                 ),
                 "fragment_join_provisional": bool(
                     action.get("fragment_join_provisional", False)
+                ),
+                "fragment_join_fallback": bool(
+                    action.get("fragment_join_fallback", False)
+                ),
+                "intra_segment_trim": bool(
+                    action.get("intra_segment_trim", False)
                 ),
             }
             if match_score >= float(

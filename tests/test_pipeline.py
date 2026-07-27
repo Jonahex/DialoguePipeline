@@ -15,6 +15,7 @@ from dialogue_pipeline.alignment import (
     _exact_line_scores,
     _expand_alignment_actions,
     _has_unsafe_untranscribed_merge,
+    _intra_segment_trim_actions,
     _multisentence_fragment_join_actions,
     _reroute_actions_to_exact_asr_primary_matches,
     TranscriptEvaluator,
@@ -726,6 +727,197 @@ def test_boundary_completion_can_join_repeated_short_clauses() -> None:
     assert joined[0]["start_index"] == 0
     assert joined[0]["count"] == 2
     assert joined[0]["match_score"] == 100.0
+
+
+def test_fragment_join_keeps_bounded_high_score_fallbacks() -> None:
+    lines = [
+        {
+            "line_id": "target",
+            "line": "You win... I... I surrender!",
+        },
+        {"line_id": "win", "line": "You win."},
+        {"line_id": "aye", "line": "Aye."},
+    ]
+    transcripts = [
+        "I surrender.",
+        "You win.",
+        "Aye.",
+        "I surrender.",
+    ]
+    segments = [
+        {
+            "start_seconds": index * 1.1,
+            "end_seconds": index * 1.1 + 1.0,
+            "transcript": transcript,
+            "asr_probability": 0.95,
+        }
+        for index, transcript in enumerate(transcripts)
+    ]
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": index,
+            "count": 1,
+            "line_index": line_index,
+            "match_score": text_similarity(
+                lines[line_index]["line"],
+                transcript,
+            ),
+            "transcript": transcript,
+            "duration_plausibility": 80.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+        for index, (line_index, transcript) in enumerate(
+            zip([2, 1, 2, 0], transcripts)
+        )
+    ]
+    words = [
+        {"word": " Win", "start": 1.2, "end": 1.8},
+        {"word": " I", "start": 2.3, "end": 2.5},
+        {"word": " I", "start": 2.5, "end": 2.7},
+        {"word": " surrender", "start": 3.4, "end": 3.9},
+    ]
+    transcription = {
+        "segments": [{"start": 1.2, "end": 3.9, "words": words}]
+    }
+
+    without_fallback = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_segments": 4,
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+            "fragment_join_fallback_max_actions": 0,
+        },
+        transcription=transcription,
+    )
+    with_fallback = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_segments": 4,
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+            "fragment_join_fallback_max_actions": 2,
+        },
+        transcription=transcription,
+    )
+
+    assert not any(
+        action["start_index"] == 1 and action["count"] == 3
+        for action in without_fallback
+    )
+    restored = next(
+        action
+        for action in with_fallback
+        if action["start_index"] == 1 and action["count"] == 3
+    )
+    assert restored["fragment_join_fallback"] is True
+    assert restored["match_score"] >= 90.0
+    assert (
+        sum(
+            bool(action.get("fragment_join_fallback"))
+            for action in with_fallback
+        )
+        == 2
+    )
+
+
+def test_oversized_base_segment_can_recover_pause_bounded_trim() -> None:
+    line_text = (
+        "Oh! Is that all? Not that I ever say anything true while drunk."
+    )
+    lines = [{"line_id": "target", "line": line_text}]
+    word_text = [
+        "Oh",
+        "is",
+        "that",
+        "all",
+        "Not",
+        "that",
+        "I",
+        "ever",
+        "say",
+        "anything",
+        "true",
+        "while",
+        "drunk",
+    ]
+    words = [
+        {
+            "word": f" {word}",
+            "start": index * 0.2,
+            "end": index * 0.2 + 0.18,
+        }
+        for index, word in enumerate(word_text)
+    ]
+    words.extend(
+        [
+            {"word": " Yes", "start": 3.2, "end": 3.5},
+            {"word": " appended", "start": 3.5, "end": 3.9},
+            {"word": " sentence", "start": 3.9, "end": 4.3},
+        ]
+    )
+    full_transcript = " ".join(
+        str(word["word"]).strip() for word in words
+    )
+    base_start_sample = 1000
+    segment = {
+        "segment_id": "session__s00001",
+        "start_sample": base_start_sample,
+        "end_sample": base_start_sample + 5 * 48000,
+        "start_seconds": 10.0,
+        "end_seconds": 15.0,
+        "transcript": full_transcript,
+        "asr_probability": 0.95,
+        "segment_asr": {
+            "primary": {
+                "transcript": full_transcript,
+                "words": words,
+            }
+        },
+    }
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": text_similarity(line_text, full_transcript),
+        "transcript": full_transcript,
+        "duration_plausibility": 60.0,
+        "order_hint": 0.0,
+        "top_matches": [],
+    }
+
+    trimmed = _intra_segment_trim_actions(
+        [action],
+        lines=lines,
+        base_segments=[segment],
+        sample_rate=48000,
+        settings={},
+        evaluator=TranscriptEvaluator(lines, {}),
+    )
+
+    assert len(trimmed) == 1
+    assert trimmed[0]["intra_segment_trim"] is True
+    assert trimmed[0]["trim_start_sample"] == base_start_sample
+    assert trimmed[0]["trim_end_sample"] < segment["end_sample"]
+    assert trimmed[0]["transcript"].endswith("drunk")
+    assert "appended" not in trimmed[0]["transcript"]
+    assert trimmed[0]["match_score"] == 100.0
+    expanded = _expand_alignment_actions(
+        trimmed,
+        lines=lines,
+        settings={},
+    )
+    assert expanded[0]["intra_segment_trim"] is True
+    assert (
+        expanded[0]["trim_end_sample"]
+        == trimmed[0]["trim_end_sample"]
+    )
 
 
 def test_secondary_near_complete_match_can_seed_fragment_join() -> None:

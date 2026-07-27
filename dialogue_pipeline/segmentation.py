@@ -14,6 +14,7 @@ from .audio import (
 )
 from .project import inventory_by_path
 from .util import (
+    normalize_spoken_text,
     read_json,
     relpath_for_config,
     resolve_project_path,
@@ -385,6 +386,89 @@ def materialize_derived_segment(
         "asr_probability": (
             sum(probabilities) / len(probabilities) if probabilities else None
         ),
+        "metrics": metrics,
+    }
+    session_entry.setdefault("derived_segments", []).append(derived)
+    return derived
+
+
+def materialize_trimmed_segment(
+    *,
+    project_dir: Path,
+    project: dict[str, Any],
+    session_entry: dict[str, Any],
+    base_segments: list[dict[str, Any]],
+    base_index: int,
+    start_sample: int,
+    end_sample: int,
+    transcript: str,
+    asr_probability: float | None,
+) -> dict[str, Any]:
+    """Materialize a word-timestamp-bounded portion of one base segment."""
+
+    base = base_segments[base_index]
+    base_start = int(base["start_sample"])
+    base_end = int(base["end_sample"])
+    start_sample = max(base_start, min(int(start_sample), base_end))
+    end_sample = max(start_sample, min(int(end_sample), base_end))
+    if start_sample == base_start and end_sample == base_end:
+        return base
+    if end_sample <= start_sample:
+        raise ValueError(
+            f"Invalid trimmed segment bounds: {start_sample}..{end_sample}"
+        )
+
+    segment_id = (
+        f"{session_entry['session_id']}__t{base_index + 1:05d}_"
+        f"{start_sample:010d}_{end_sample:010d}"
+    )
+    existing = next(
+        (
+            segment
+            for segment in session_entry.get("derived_segments", [])
+            if segment["segment_id"] == segment_id
+        ),
+        None,
+    )
+    if existing and resolve_project_path(project_dir, existing["file"]).is_file():
+        return existing
+
+    audio_path = resolve_project_path(
+        project_dir,
+        session_entry.get("working_audio", session_entry["audio"]),
+    )
+    output_path = (
+        project_dir
+        / "segments"
+        / session_entry["session_id"]
+        / f"{segment_id}.wav"
+    )
+    metrics = cut_pcm_wav(
+        audio_path,
+        output_path,
+        start_sample=start_sample,
+        end_sample=end_sample,
+        fade_ms=float(
+            (project.get("segmentation") or {}).get("fade_ms", 5.0)
+        ),
+    )
+    sample_rate = int(session_entry["sample_rate"])
+    derived = {
+        "segment_id": segment_id,
+        "kind": "trimmed",
+        "session_id": session_entry["session_id"],
+        "source_audio": session_entry["audio"],
+        "source_sha256": session_entry["source_sha256"],
+        "base_indices": [base_index],
+        "start_sample": start_sample,
+        "end_sample": end_sample,
+        "start_seconds": start_sample / sample_rate,
+        "end_seconds": end_sample / sample_rate,
+        "file": output_path.relative_to(project_dir).as_posix(),
+        "transcript": transcript,
+        "word_count": len(normalize_spoken_text(transcript).split()),
+        "asr_probability": asr_probability,
+        "transcript_source": "segment_asr_word_trim",
         "metrics": metrics,
     }
     session_entry.setdefault("derived_segments", []).append(derived)

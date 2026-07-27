@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import heapq
 import math
 import re
 from bisect import bisect_left, bisect_right
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from rapidfuzz import fuzz
 
+from .alignment_settings import AlignmentSettings
 from .project import load_source_data
 from .review import (
     REVIEW_FILE_NAME,
@@ -34,37 +37,74 @@ from .util import (
 from .workbook_io import lines_for_session
 
 
-def text_similarity(expected: str, observed: str) -> float:
-    expected_normalized = normalize_spoken_text(
-        expected,
-        remove_parenthetical_cues=True,
+@dataclass(frozen=True)
+class TextFeatures:
+    normalized: str
+    tokens: tuple[str, ...]
+    counts: Counter[str]
+    compact: str
+
+
+@dataclass(frozen=True)
+class TranscriptEvaluation:
+    match_score: float
+    fidelity: dict[str, float | int]
+    sentence: dict[str, Any]
+
+
+def _text_features(
+    value: str,
+    *,
+    remove_parenthetical_cues: bool = False,
+) -> TextFeatures:
+    normalized = normalize_spoken_text(
+        value,
+        remove_parenthetical_cues=remove_parenthetical_cues,
     )
-    observed_normalized = normalize_spoken_text(observed)
-    if not expected_normalized or not observed_normalized:
+    tokens = tuple(normalized.split())
+    return TextFeatures(
+        normalized=normalized,
+        tokens=tokens,
+        counts=Counter(tokens),
+        compact=normalized.replace(" ", "").replace("'", ""),
+    )
+
+
+def _text_similarity_features(
+    expected: TextFeatures,
+    observed: TextFeatures,
+) -> float:
+    if not expected.normalized or not observed.normalized:
         return 0.0
-    expected_tokens = expected_normalized.split()
-    observed_tokens = observed_normalized.split()
-    expected_counts = Counter(expected_tokens)
-    observed_counts = Counter(observed_tokens)
+    expected_tokens = expected.tokens
+    observed_tokens = observed.tokens
     covered = sum(
-        min(count, observed_counts.get(token, 0))
-        for token, count in expected_counts.items()
+        min(count, observed.counts.get(token, 0))
+        for token, count in expected.counts.items()
     )
     coverage = 100.0 * covered / max(1, len(expected_tokens))
-    ratio = fuzz.ratio(expected_normalized, observed_normalized)
-    weighted = fuzz.WRatio(expected_normalized, observed_normalized)
-    partial = fuzz.partial_ratio(expected_normalized, observed_normalized)
-    token_sort = fuzz.token_sort_ratio(expected_normalized, observed_normalized)
-    token_set = fuzz.token_set_ratio(expected_normalized, observed_normalized)
-    compact_ratio = fuzz.ratio(
-        expected_normalized.replace(" ", "").replace("'", ""),
-        observed_normalized.replace(" ", "").replace("'", ""),
+    ratio = fuzz.ratio(expected.normalized, observed.normalized)
+    weighted = fuzz.WRatio(expected.normalized, observed.normalized)
+    partial = fuzz.partial_ratio(expected.normalized, observed.normalized)
+    token_sort = fuzz.token_sort_ratio(
+        expected.normalized,
+        observed.normalized,
     )
+    token_set = fuzz.token_set_ratio(
+        expected.normalized,
+        observed.normalized,
+    )
+    compact_ratio = fuzz.ratio(expected.compact, observed.compact)
 
     if len(expected_tokens) <= 3:
         score = 0.55 * ratio + 0.25 * weighted + 0.20 * coverage
     else:
-        score = 0.40 * ratio + 0.30 * weighted + 0.15 * partial + 0.15 * coverage
+        score = (
+            0.40 * ratio
+            + 0.30 * weighted
+            + 0.15 * partial
+            + 0.15 * coverage
+        )
 
     length_ratio = len(observed_tokens) / max(1, len(expected_tokens))
     if length_ratio < 0.45:
@@ -88,37 +128,11 @@ def text_similarity(expected: str, observed: str) -> float:
     return max(0.0, min(100.0, score))
 
 
-def _fuzzy_token_match_count(
-    expected_tokens: list[str],
-    observed_tokens: list[str],
-    *,
-    token_min_similarity: float,
-) -> int:
-    possible_matches = sorted(
-        (
-            (
-                fuzz.ratio(expected_token, observed_token),
-                expected_index,
-                observed_index,
-            )
-            for expected_index, expected_token in enumerate(expected_tokens)
-            for observed_index, observed_token in enumerate(observed_tokens)
-        ),
-        reverse=True,
+def text_similarity(expected: str, observed: str) -> float:
+    return _text_similarity_features(
+        _text_features(expected, remove_parenthetical_cues=True),
+        _text_features(observed),
     )
-    matched_expected: set[int] = set()
-    matched_observed: set[int] = set()
-    for score, expected_index, observed_index in possible_matches:
-        if score < token_min_similarity:
-            break
-        if (
-            expected_index in matched_expected
-            or observed_index in matched_observed
-        ):
-            continue
-        matched_expected.add(expected_index)
-        matched_observed.add(observed_index)
-    return len(matched_expected)
 
 
 def _ordered_token_edit_operations(
@@ -129,6 +143,22 @@ def _ordered_token_edit_operations(
 ) -> list[str]:
     """Align tokens while preserving insertions/deletions at line boundaries."""
 
+    return [
+        operation
+        for operation, _, _ in _ordered_token_alignment(
+            expected_tokens,
+            observed_tokens,
+            token_min_similarity=token_min_similarity,
+        )
+    ]
+
+
+def _ordered_token_alignment(
+    expected_tokens: list[str],
+    observed_tokens: list[str],
+    *,
+    token_min_similarity: float,
+) -> list[tuple[str, int | None, int | None]]:
     expected_count = len(expected_tokens)
     observed_count = len(observed_tokens)
     costs = [
@@ -182,18 +212,22 @@ def _ordered_token_edit_operations(
             costs[expected_index][observed_index] = cost
             operations[expected_index][observed_index] = operation
 
-    result = []
+    result: list[tuple[str, int | None, int | None]] = []
     expected_index = expected_count
     observed_index = observed_count
     while expected_index or observed_index:
         operation = operations[expected_index][observed_index]
-        result.append(operation)
         if operation in {"match", "substitute"}:
+            result.append(
+                (operation, expected_index - 1, observed_index - 1)
+            )
             expected_index -= 1
             observed_index -= 1
         elif operation == "delete":
+            result.append((operation, expected_index - 1, None))
             expected_index -= 1
         else:
+            result.append((operation, None, observed_index - 1))
             observed_index -= 1
     result.reverse()
     return result
@@ -228,13 +262,25 @@ def transcript_fidelity(
 ) -> dict[str, float | int]:
     """Measure ordered agreement separately from tolerant candidate retrieval."""
 
-    expected_normalized = normalize_spoken_text(
-        expected,
-        remove_parenthetical_cues=True,
+    return _transcript_fidelity_features(
+        _text_features(expected, remove_parenthetical_cues=True),
+        _text_features(observed),
+        token_min_similarity=token_min_similarity,
+        boundary_window_tokens=boundary_window_tokens,
+        boundary_observed_slack_tokens=boundary_observed_slack_tokens,
     )
-    observed_normalized = normalize_spoken_text(observed)
-    expected_tokens = expected_normalized.split()
-    observed_tokens = observed_normalized.split()
+
+
+def _transcript_fidelity_features(
+    expected: TextFeatures,
+    observed: TextFeatures,
+    *,
+    token_min_similarity: float,
+    boundary_window_tokens: int,
+    boundary_observed_slack_tokens: int,
+) -> dict[str, float | int]:
+    expected_tokens = list(expected.tokens)
+    observed_tokens = list(observed.tokens)
     if not expected_tokens or not observed_tokens:
         return {
             "ordered_similarity": 0.0,
@@ -245,8 +291,6 @@ def transcript_fidelity(
             "suffix_token_coverage": 0.0,
             "prefix_missing_token_count": len(expected_tokens),
             "suffix_missing_token_count": len(expected_tokens),
-            "start_token_similarity": 0.0,
-            "end_token_similarity": 0.0,
             "leading_missing_token_count": len(expected_tokens),
             "leading_extra_token_count": len(observed_tokens),
             "leading_substitution_count": 0,
@@ -255,11 +299,12 @@ def transcript_fidelity(
             "trailing_substitution_count": 0,
         }
 
-    matched_count = _fuzzy_token_match_count(
+    operations = _ordered_token_edit_operations(
         expected_tokens,
         observed_tokens,
         token_min_similarity=token_min_similarity,
     )
+    matched_count = operations.count("match")
     boundary_size = min(
         len(expected_tokens),
         max(1, int(boundary_window_tokens)),
@@ -268,27 +313,21 @@ def transcript_fidelity(
         len(observed_tokens),
         boundary_size + max(0, int(boundary_observed_slack_tokens)),
     )
-    prefix_match_count = _fuzzy_token_match_count(
+    prefix_match_count = _ordered_token_edit_operations(
         expected_tokens[:boundary_size],
         observed_tokens[:observed_boundary_size],
         token_min_similarity=token_min_similarity,
-    )
-    suffix_match_count = _fuzzy_token_match_count(
+    ).count("match")
+    suffix_match_count = _ordered_token_edit_operations(
         expected_tokens[-boundary_size:],
         observed_tokens[-observed_boundary_size:],
         token_min_similarity=token_min_similarity,
-    )
-    boundary_edits = _boundary_edit_counts(
-        _ordered_token_edit_operations(
-            expected_tokens,
-            observed_tokens,
-            token_min_similarity=token_min_similarity,
-        )
-    )
+    ).count("match")
+    boundary_edits = _boundary_edit_counts(operations)
     return {
         "ordered_similarity": fuzz.ratio(
-            expected_normalized,
-            observed_normalized,
+            expected.normalized,
+            observed.normalized,
         ),
         "token_coverage": matched_count / len(expected_tokens),
         "token_precision": matched_count / len(observed_tokens),
@@ -297,14 +336,6 @@ def transcript_fidelity(
         "suffix_token_coverage": suffix_match_count / boundary_size,
         "prefix_missing_token_count": boundary_size - prefix_match_count,
         "suffix_missing_token_count": boundary_size - suffix_match_count,
-        "start_token_similarity": fuzz.ratio(
-            expected_tokens[0],
-            observed_tokens[0],
-        ),
-        "end_token_similarity": fuzz.ratio(
-            expected_tokens[-1],
-            observed_tokens[-1],
-        ),
         **boundary_edits,
     }
 
@@ -329,21 +360,63 @@ def sentence_fidelity(
     short_clause_max_words: int = 4,
     short_clause_min_token_coverage: float = 1.0,
 ) -> dict[str, Any]:
-    clauses = script_clauses(expected)
-    observed_normalized = normalize_spoken_text(observed)
+    return _sentence_fidelity_features(
+        tuple(script_clauses(expected)),
+        _text_features(observed),
+        token_min_similarity=token_min_similarity,
+        minimum_clause_score=minimum_clause_score,
+        short_clause_max_words=short_clause_max_words,
+        short_clause_min_token_coverage=short_clause_min_token_coverage,
+    )
+
+
+def _sentence_fidelity_features(
+    clauses: tuple[str, ...],
+    observed: TextFeatures,
+    *,
+    token_min_similarity: float,
+    minimum_clause_score: float,
+    short_clause_max_words: int,
+    short_clause_min_token_coverage: float,
+) -> dict[str, Any]:
+    observed_normalized = observed.normalized
     clause_scores = []
     clause_token_coverages = []
     clause_word_counts = []
+    clause_feature_list = [_text_features(clause) for clause in clauses]
+    expected_tokens = [
+        token
+        for clause_features in clause_feature_list
+        for token in clause_features.tokens
+    ]
+    observed_positions_by_expected = {
+        int(expected_index): int(observed_index)
+        for operation, expected_index, observed_index in (
+            _ordered_token_alignment(
+                expected_tokens,
+                list(observed.tokens),
+                token_min_similarity=token_min_similarity,
+            )
+        )
+        if (
+            operation == "match"
+            and expected_index is not None
+            and observed_index is not None
+        )
+    }
     clause_positions = []
-    for clause in clauses:
-        clause_fidelity = transcript_fidelity(
-            clause,
+    expected_offset = 0
+    for clause, clause_features in zip(clauses, clause_feature_list):
+        clause_fidelity = _transcript_fidelity_features(
+            clause_features,
             observed,
             token_min_similarity=token_min_similarity,
+            boundary_window_tokens=4,
+            boundary_observed_slack_tokens=2,
         )
         partial_score = (
             fuzz.partial_ratio(
-                normalize_spoken_text(clause),
+                clause_features.normalized,
                 observed_normalized,
             )
             if observed_normalized
@@ -357,33 +430,18 @@ def sentence_fidelity(
             float(clause_fidelity["token_coverage"])
         )
         clause_word_counts.append(word_count(clause))
-        clause_tokens = normalize_spoken_text(clause).split()
-        observed_tokens = observed_normalized.split()
-        best_position = -1
-        best_alignment_score = -1.0
-        if clause_tokens and observed_tokens:
-            minimum_window = max(1, len(clause_tokens) - 2)
-            maximum_window = min(
-                len(observed_tokens),
-                len(clause_tokens) + 2,
+        matched_positions = [
+            observed_positions_by_expected[expected_index]
+            for expected_index in range(
+                expected_offset,
+                expected_offset + len(clause_features.tokens),
             )
-            clause_text = " ".join(clause_tokens)
-            for window_size in range(minimum_window, maximum_window + 1):
-                for start in range(
-                    0,
-                    len(observed_tokens) - window_size + 1,
-                ):
-                    window_text = " ".join(
-                        observed_tokens[start : start + window_size]
-                    )
-                    alignment_score = fuzz.ratio(
-                        clause_text,
-                        window_text,
-                    )
-                    if alignment_score > best_alignment_score:
-                        best_alignment_score = alignment_score
-                        best_position = start
-        clause_positions.append(best_position)
+            if expected_index in observed_positions_by_expected
+        ]
+        clause_positions.append(
+            min(matched_positions) if matched_positions else -1
+        )
+        expected_offset += len(clause_features.tokens)
     minimum_score = min(clause_scores) if clause_scores else 0.0
     missing_clauses = [
         score < minimum_clause_score
@@ -404,7 +462,7 @@ def sentence_fidelity(
         "clause_word_counts": clause_word_counts,
         "clause_positions": clause_positions,
         "clauses_in_order": all(
-            left <= right
+            left >= 0 and right >= 0 and left <= right
             for left, right in zip(
                 clause_positions,
                 clause_positions[1:],
@@ -413,6 +471,121 @@ def sentence_fidelity(
         "minimum_clause_score": minimum_score,
         "missing_clause_count": sum(missing_clauses),
     }
+
+
+@dataclass(frozen=True)
+class ScriptLineFeatures:
+    text: TextFeatures
+    clauses: tuple[str, ...]
+    word_count: int
+
+
+class TranscriptEvaluator:
+    """Session-local cache for normalized text and line/transcript scoring."""
+
+    def __init__(
+        self,
+        lines: list[dict[str, Any]],
+        settings: Mapping[str, Any] | AlignmentSettings,
+    ) -> None:
+        self.settings = AlignmentSettings.from_value(settings)
+        self.lines = lines
+        self.line_features = []
+        for line in lines:
+            text = _text_features(
+                str(line["line"]),
+                remove_parenthetical_cues=True,
+            )
+            self.line_features.append(
+                ScriptLineFeatures(
+                    text=text,
+                    clauses=tuple(script_clauses(str(line["line"]))),
+                    word_count=len(text.tokens),
+                )
+            )
+        self._observed_features: dict[str, TextFeatures] = {}
+        self._match_cache: OrderedDict[
+            tuple[int, str],
+            float,
+        ] = OrderedDict()
+        self._evaluation_cache: dict[
+            tuple[int, str],
+            TranscriptEvaluation,
+        ] = {}
+
+    def observed_features(self, observed: str) -> TextFeatures:
+        cached = self._observed_features.get(observed)
+        if cached is None:
+            cached = _text_features(observed)
+            self._observed_features[observed] = cached
+        return cached
+
+    def match(self, line_index: int, observed: str) -> float:
+        observed_features = self.observed_features(observed)
+        key = (line_index, observed_features.normalized)
+        cached = self._match_cache.get(key)
+        if cached is None:
+            cached = _text_similarity_features(
+                self.line_features[line_index].text,
+                observed_features,
+            )
+            self._match_cache[key] = cached
+            if len(self._match_cache) > 50_000:
+                self._match_cache.popitem(last=False)
+        else:
+            self._match_cache.move_to_end(key)
+        return cached
+
+    def evaluate(
+        self,
+        line_index: int,
+        observed: str,
+    ) -> TranscriptEvaluation:
+        observed_features = self.observed_features(observed)
+        key = (line_index, observed_features.normalized)
+        cached = self._evaluation_cache.get(key)
+        if cached is not None:
+            return cached
+
+        line_features = self.line_features[line_index]
+        fidelity = _transcript_fidelity_features(
+            line_features.text,
+            observed_features,
+            token_min_similarity=float(
+                self.settings["fidelity_token_min_similarity"]
+            ),
+            boundary_window_tokens=int(
+                self.settings["reliable_boundary_window_tokens"]
+            ),
+            boundary_observed_slack_tokens=int(
+                self.settings["reliable_boundary_observed_slack_tokens"]
+            ),
+        )
+        sentence = _sentence_fidelity_features(
+            line_features.clauses,
+            observed_features,
+            token_min_similarity=float(
+                self.settings["fidelity_token_min_similarity"]
+            ),
+            minimum_clause_score=float(
+                self.settings["reliable_min_clause_score"]
+            ),
+            short_clause_max_words=int(
+                self.settings["reliable_short_clause_max_words"]
+            ),
+            short_clause_min_token_coverage=float(
+                self.settings[
+                    "reliable_short_clause_min_token_coverage"
+                ]
+            ),
+        )
+        cached = TranscriptEvaluation(
+            match_score=self.match(line_index, observed),
+            fidelity=fidelity,
+            sentence=sentence,
+        )
+        self._evaluation_cache[key] = cached
+        return cached
 
 
 def _technical_score(segment: dict[str, Any]) -> float:
@@ -454,6 +627,108 @@ def _valid_span(
         if gap > max_merge_gap_seconds:
             return False
     return True
+
+
+class SpanCatalog:
+    """Enumerate valid contiguous spans once and cache transcript previews."""
+
+    def __init__(
+        self,
+        segments: list[dict[str, Any]],
+        settings: Mapping[str, Any] | AlignmentSettings,
+        *,
+        transcription: dict[str, Any] | None = None,
+    ) -> None:
+        self.segments = segments
+        self.settings = AlignmentSettings.from_value(settings)
+        self.transcription = transcription
+        self.word_index = _transcription_word_index(transcription)
+        self.maximum_segments = max(
+            int(self.settings["max_merge_segments"]),
+            int(self.settings["fragment_join_max_segments"]),
+        )
+        self._base_previews: dict[tuple[int, int], dict[str, Any]] = {}
+        self._previews: dict[
+            tuple[int, int],
+            list[dict[str, Any]],
+        ] = {}
+        self._counts_by_start: list[list[int]] = [
+            [] for _ in range(len(segments))
+        ]
+        for start_index in range(len(segments)):
+            for count in range(1, self.maximum_segments + 1):
+                if not _valid_span(
+                    segments,
+                    start_index,
+                    count,
+                    max_merge_gap_seconds=float(
+                        self.settings["max_merge_gap_seconds"]
+                    ),
+                    max_span_seconds=float(
+                        self.settings["max_span_seconds"]
+                    ),
+                ):
+                    break
+                self._counts_by_start[start_index].append(count)
+
+    def is_valid(self, start_index: int, count: int) -> bool:
+        return (
+            0 <= start_index < len(self._counts_by_start)
+            and count in self._counts_by_start[start_index]
+        )
+
+    def counts_from(
+        self,
+        start_index: int,
+        *,
+        maximum: int | None = None,
+    ) -> list[int]:
+        counts = self._counts_by_start[start_index]
+        if maximum is None:
+            return counts
+        return [count for count in counts if count <= maximum]
+
+    def base_preview(
+        self,
+        start_index: int,
+        count: int,
+    ) -> dict[str, Any]:
+        key = (start_index, count)
+        preview = self._base_previews.get(key)
+        if preview is None:
+            if not self.is_valid(start_index, count):
+                raise KeyError(f"Invalid span: {key}")
+            preview = _span_preview(self.segments, start_index, count)
+            preview["transcript_source"] = "segment_asr_span"
+            self._base_previews[key] = preview
+        return preview
+
+    def transcript_previews(
+        self,
+        start_index: int,
+        count: int,
+    ) -> list[dict[str, Any]]:
+        key = (start_index, count)
+        previews = self._previews.get(key)
+        if previews is not None:
+            return previews
+        base = self.base_preview(start_index, count)
+        previews = [base]
+        if self.transcription:
+            timestamp_span = _span_preview_with_transcription(
+                self.segments,
+                start_index,
+                count,
+                transcription=self.transcription,
+                settings=dict(self.settings),
+                word_index=self.word_index,
+            )
+            if normalize_text(timestamp_span["transcript"]) != normalize_text(
+                base["transcript"]
+            ):
+                previews.append(timestamp_span)
+        self._previews[key] = previews
+        return previews
 
 
 def _span_preview(
@@ -606,14 +881,20 @@ def _restore_source_line_indexes(
 def _duration_plausibility(
     line: dict[str, Any],
     span: dict[str, Any],
+    *,
+    expected_word_count: int | None = None,
 ) -> float:
     expected_words = max(
         1,
-        len(
-            normalize_spoken_text(
-                line["line"],
-                remove_parenthetical_cues=True,
-            ).split()
+        (
+            int(expected_word_count)
+            if expected_word_count is not None
+            else len(
+                normalize_spoken_text(
+                    line["line"],
+                    remove_parenthetical_cues=True,
+                ).split()
+            )
         ),
     )
     expected_seconds = max(0.35, expected_words / 2.7)
@@ -641,7 +922,10 @@ def _order_hint(
 def order_independent_align(
     segments: list[dict[str, Any]],
     lines: list[dict[str, Any]],
-    settings: dict[str, Any],
+    settings: Mapping[str, Any] | AlignmentSettings,
+    *,
+    evaluator: TranscriptEvaluator | None = None,
+    span_catalog: SpanCatalog | None = None,
 ) -> list[dict[str, Any]]:
     """Match non-overlapping audio spans without requiring script order.
 
@@ -650,15 +934,17 @@ def order_independent_align(
     how repeated takes are represented.
     """
 
+    settings = AlignmentSettings.from_value(settings)
+    all_lines = lines
     lines, source_indexes = _text_matchable_lines(lines)
     if not segments or not lines:
         return []
+    evaluator = evaluator or TranscriptEvaluator(all_lines, settings)
+    span_catalog = span_catalog or SpanCatalog(segments, settings)
 
     segment_count = len(segments)
     line_count = len(lines)
     max_merge = int(settings.get("max_merge_segments", 8))
-    max_gap = float(settings.get("max_merge_gap_seconds", 2.5))
-    max_span = float(settings.get("max_span_seconds", 35.0))
     minimum_score = float(settings.get("candidate_min_score", 45.0))
     top_k = max(1, int(settings.get("candidate_top_k", 8)))
     noise_penalty = float(settings.get("noise_penalty", 2.2))
@@ -670,15 +956,10 @@ def order_independent_align(
         [] for _ in range(segment_count)
     ]
     for segment_index in range(segment_count):
-        for count in range(1, max_merge + 1):
-            if not _valid_span(
-                segments,
-                segment_index,
-                count,
-                max_merge_gap_seconds=max_gap,
-                max_span_seconds=max_span,
-            ):
-                break
+        for count in span_catalog.counts_from(
+            segment_index,
+            maximum=max_merge,
+        ):
             if (
                 count > 1
                 and bool(settings.get("merge_require_text_boundaries", True))
@@ -695,16 +976,29 @@ def order_independent_align(
                 )
             ):
                 continue
-            span = _span_preview(segments, segment_index, count)
+            span = span_catalog.base_preview(segment_index, count)
             line_matches = []
             for line_index, line in enumerate(lines):
-                match_score = text_similarity(line["line"], span["transcript"])
-                duration_score = _duration_plausibility(line, span)
-                order_score = _order_hint(
-                    segment_index=segment_index,
-                    segment_count=segment_count,
-                    line_index=line_index,
-                    line_count=line_count,
+                match_score = evaluator.match(
+                    source_indexes[line_index],
+                    span["transcript"],
+                )
+                duration_score = _duration_plausibility(
+                    line,
+                    span,
+                    expected_word_count=evaluator.line_features[
+                        source_indexes[line_index]
+                    ].word_count,
+                )
+                order_score = (
+                    _order_hint(
+                        segment_index=segment_index,
+                        segment_count=segment_count,
+                        line_index=line_index,
+                        line_count=line_count,
+                    )
+                    if order_weight
+                    else 0.0
                 )
                 ranking_score = (
                     match_score
@@ -720,24 +1014,28 @@ def order_independent_align(
                         "order_hint": order_score,
                     }
                 )
-            line_matches.sort(
+            pure_scores = heapq.nlargest(
+                2,
+                (
+                    (
+                        match["match_score"],
+                        int(match["line_index"]),
+                    )
+                    for match in line_matches
+                ),
+            )
+            line_matches = heapq.nlargest(
+                top_k,
+                line_matches,
                 key=lambda match: (
                     match["ranking_score"],
                     match["match_score"],
                     -match["line_index"],
                 ),
-                reverse=True,
             )
-            pure_scores = sorted(
-                (
-                    match["match_score"],
-                    int(match["line_index"]),
-                )
-                for match in line_matches
-            )
-            best_pure = pure_scores[-1] if pure_scores else (0.0, -1)
+            best_pure = pure_scores[0] if pure_scores else (0.0, -1)
             second_pure = (
-                pure_scores[-2] if len(pure_scores) > 1 else (0.0, -1)
+                pure_scores[1] if len(pure_scores) > 1 else (0.0, -1)
             )
             for match in line_matches:
                 other_score = (
@@ -757,6 +1055,7 @@ def order_independent_align(
                 "count": count,
                 "line_index": primary["line_index"],
                 "match_score": primary["match_score"],
+                "confidence_margin": primary["confidence_margin"],
                 "transcript": span["transcript"],
                 "duration_plausibility": primary["duration_plausibility"],
                 "order_hint": primary["order_hint"],
@@ -803,8 +1102,9 @@ def _apply_duplicate_line_policy(
     *,
     lines: list[dict[str, Any]],
     base_segments: list[dict[str, Any]],
-    settings: dict[str, Any],
+    settings: Mapping[str, Any] | AlignmentSettings,
 ) -> None:
+    settings = AlignmentSettings.from_value(settings)
     policy = str(settings.get("duplicate_line_policy", "review")).lower()
     if policy not in {"review", "weak_order", "reuse"}:
         raise ValueError(
@@ -927,9 +1227,18 @@ def _multisentence_fragment_join_actions(
     *,
     lines: list[dict[str, Any]],
     base_segments: list[dict[str, Any]],
-    settings: dict[str, Any],
+    settings: Mapping[str, Any] | AlignmentSettings,
     transcription: dict[str, Any] | None = None,
+    evaluator: TranscriptEvaluator | None = None,
+    span_catalog: SpanCatalog | None = None,
 ) -> list[dict[str, Any]]:
+    settings = AlignmentSettings.from_value(settings)
+    evaluator = evaluator or TranscriptEvaluator(lines, settings)
+    span_catalog = span_catalog or SpanCatalog(
+        base_segments,
+        settings,
+        transcription=transcription,
+    )
     if not bool(settings.get("fragment_join_enabled", True)):
         return []
     secondary_seed_minimum_score = float(
@@ -1004,25 +1313,11 @@ def _multisentence_fragment_join_actions(
         1,
         int(settings.get("fragment_join_max_actions", 10)),
     )
-    maximum_gap = float(settings.get("max_merge_gap_seconds", 2.5))
-    maximum_span = float(settings.get("max_span_seconds", 35.0))
-    minimum_match_gain = float(
-        settings.get("fragment_join_min_match_gain", 1.0)
-    )
-    minimum_clause_gain = float(
-        settings.get("fragment_join_min_clause_gain", 20.0)
-    )
-    minimum_coverage_gain = float(
-        settings.get("fragment_join_min_token_coverage_gain", 0.15)
-    )
     minimum_token_coverage = float(
         settings.get("fragment_join_min_token_coverage", 0.85)
     )
     minimum_token_precision = float(
         settings.get("fragment_join_min_token_precision", 0.83)
-    )
-    minimum_boundary_coverage = float(
-        settings.get("reliable_min_boundary_token_coverage", 0.60)
     )
     maximum_boundary_missing_tokens = max(
         0,
@@ -1056,12 +1351,6 @@ def _multisentence_fragment_join_actions(
     only_incomplete_lines = bool(
         settings.get("fragment_join_only_incomplete_lines", True)
     )
-    token_min_similarity = float(
-        settings.get("fidelity_token_min_similarity", 78.0)
-    )
-    minimum_clause_score = float(
-        settings.get("reliable_min_clause_score", 55.0)
-    )
     existing = {
         (
             int(action["line_index"]),
@@ -1071,8 +1360,6 @@ def _multisentence_fragment_join_actions(
         for action in recovery_actions
     }
     evaluated: set[tuple[int, int, int]] = set()
-    preview_cache: dict[tuple[int, int], list[dict[str, Any]]] = {}
-    word_index = _transcription_word_index(transcription)
     joined = []
 
     def has_complete_boundaries(fidelity: dict[str, Any]) -> bool:
@@ -1090,44 +1377,16 @@ def _multisentence_fragment_join_actions(
         )
 
     def score_preview(
-        line_text: str,
+        line_index: int,
         preview: dict[str, Any],
     ) -> dict[str, Any]:
         transcript = str(preview.get("transcript") or "")
-        fidelity = transcript_fidelity(
-            line_text,
-            transcript,
-            token_min_similarity=token_min_similarity,
-            boundary_window_tokens=int(
-                settings.get("reliable_boundary_window_tokens", 4)
-            ),
-            boundary_observed_slack_tokens=int(
-                settings.get(
-                    "reliable_boundary_observed_slack_tokens",
-                    2,
-                )
-            ),
-        )
-        sentence = sentence_fidelity(
-            line_text,
-            transcript,
-            token_min_similarity=token_min_similarity,
-            minimum_clause_score=minimum_clause_score,
-            short_clause_max_words=int(
-                settings.get("reliable_short_clause_max_words", 4)
-            ),
-            short_clause_min_token_coverage=float(
-                settings.get(
-                    "reliable_short_clause_min_token_coverage",
-                    1.0,
-                )
-            ),
-        )
+        evaluation = evaluator.evaluate(line_index, transcript)
         return {
             "preview": preview,
-            "match": text_similarity(line_text, transcript),
-            "fidelity": fidelity,
-            "sentence": sentence,
+            "match": evaluation.match_score,
+            "fidelity": evaluation.fidelity,
+            "sentence": evaluation.sentence,
         }
 
     def preview_quality(scored: dict[str, Any]) -> tuple[Any, ...]:
@@ -1169,19 +1428,13 @@ def _multisentence_fragment_join_actions(
             line_index = int(action["line_index"])
             if line_index in complete_line_indexes:
                 continue
-            line_text = lines[line_index]["line"]
             scored = score_preview(
-                line_text,
+                line_index,
                 {"transcript": str(action.get("transcript") or "")},
             )
             expected_words = max(
                 1,
-                len(
-                    normalize_spoken_text(
-                        line_text,
-                        remove_parenthetical_cues=True,
-                    ).split()
-                ),
+                evaluator.line_features[line_index].word_count,
             )
             observed_text = str(action.get("transcript") or "")
             observed_words = len(
@@ -1189,13 +1442,10 @@ def _multisentence_fragment_join_actions(
             )
             length_ratio = observed_words / expected_words
             expected_counts = Counter(
-                normalize_spoken_text(
-                    line_text,
-                    remove_parenthetical_cues=True,
-                ).split()
+                evaluator.line_features[line_index].text.tokens
             )
             observed_counts = Counter(
-                normalize_spoken_text(observed_text).split()
+                evaluator.observed_features(observed_text).tokens
             )
             repeated_excess = any(
                 count >= 2 and count > expected_counts.get(token, 0)
@@ -1207,10 +1457,6 @@ def _multisentence_fragment_join_actions(
                 >= minimum_complete_ordered
                 and int(scored["sentence"]["missing_clause_count"]) == 0
                 and bool(scored["sentence"]["clauses_in_order"])
-                and float(scored["fidelity"]["prefix_token_coverage"])
-                >= minimum_boundary_coverage
-                and float(scored["fidelity"]["suffix_token_coverage"])
-                >= minimum_boundary_coverage
                 and has_complete_boundaries(scored["fidelity"])
                 and minimum_length_ratio
                 <= length_ratio
@@ -1249,13 +1495,7 @@ def _multisentence_fragment_join_actions(
                 if key in existing or key in evaluated:
                     continue
                 evaluated.add(key)
-                if not _valid_span(
-                    base_segments,
-                    start_index,
-                    count,
-                    max_merge_gap_seconds=maximum_gap,
-                    max_span_seconds=maximum_span,
-                ):
+                if not span_catalog.is_valid(start_index, count):
                     continue
 
                 if require_text_boundaries and (
@@ -1268,33 +1508,12 @@ def _multisentence_fragment_join_actions(
                 ):
                     continue
 
-                span_key = (start_index, count)
-                previews = preview_cache.get(span_key)
-                if previews is None:
-                    base_span = _span_preview(
-                        base_segments,
-                        start_index,
-                        count,
-                    )
-                    base_span["transcript_source"] = "segment_asr_span"
-                    previews = [base_span]
-                    if transcription:
-                        timestamp_span = _span_preview_with_transcription(
-                            base_segments,
-                            start_index,
-                            count,
-                            transcription=transcription,
-                            settings=settings,
-                            word_index=word_index,
-                        )
-                        if (
-                            normalize_text(timestamp_span["transcript"])
-                            != normalize_text(base_span["transcript"])
-                        ):
-                            previews.append(timestamp_span)
-                    preview_cache[span_key] = previews
+                previews = span_catalog.transcript_previews(
+                    start_index,
+                    count,
+                )
                 scored_previews = [
-                    score_preview(line["line"], preview)
+                    score_preview(line_index, preview)
                     for preview in previews
                     if str(preview.get("transcript") or "").strip()
                 ]
@@ -1318,13 +1537,9 @@ def _multisentence_fragment_join_actions(
                     <= end_index
                 ]
                 comparison_actions = contained_actions or [seed_action]
-                fragment_match = max(
-                    float(action["match_score"])
-                    for action in comparison_actions
-                )
                 fragment_metrics = [
                     score_preview(
-                        line["line"],
+                        line_index,
                         {
                             "transcript": str(
                                 action.get("transcript") or ""
@@ -1333,26 +1548,6 @@ def _multisentence_fragment_join_actions(
                     )
                     for action in comparison_actions
                 ]
-                fragment_clause_score = max(
-                    float(metric["sentence"]["minimum_clause_score"])
-                    for metric in fragment_metrics
-                )
-                fragment_missing_clauses = min(
-                    int(metric["sentence"]["missing_clause_count"])
-                    for metric in fragment_metrics
-                )
-                fragment_token_coverage = max(
-                    float(metric["fidelity"]["token_coverage"])
-                    for metric in fragment_metrics
-                )
-                fragment_has_complete_boundaries = any(
-                    has_complete_boundaries(metric["fidelity"])
-                    for metric in fragment_metrics
-                )
-                boundary_completeness_gain = bool(
-                    has_complete_boundaries(combined_fidelity)
-                    and not fragment_has_complete_boundaries
-                )
                 line_clauses = script_clauses(line["line"])
                 comparison_start = min(
                     int(action["start_index"])
@@ -1410,33 +1605,12 @@ def _multisentence_fragment_join_actions(
                         )
                     )
                 )
-                match_gain = combined_match - fragment_match
-                coverage_gain = (
-                    float(combined_fidelity["token_coverage"])
-                    - fragment_token_coverage
-                )
-                missing_clause_gain = (
-                    fragment_missing_clauses
-                    - int(combined_sentence["missing_clause_count"])
-                )
                 if (
-                    match_gain < minimum_match_gain
-                    and coverage_gain < minimum_coverage_gain
-                    and missing_clause_gain <= 0
-                    and not boundary_completeness_gain
-                    and not boundary_audio_rescue
-                ):
-                    continue
-                clause_gain = (
-                    float(combined_sentence["minimum_clause_score"])
-                    - fragment_clause_score
-                )
-                if (
-                    len(line_clauses) >= 2
-                    and clause_gain < minimum_clause_gain
-                    and missing_clause_gain <= 0
-                    and coverage_gain < minimum_coverage_gain
-                    and not boundary_completeness_gain
+                    preview_quality(combined)
+                    <= max(
+                        preview_quality(metric)
+                        for metric in fragment_metrics
+                    )
                     and not boundary_audio_rescue
                 ):
                     continue
@@ -1454,14 +1628,6 @@ def _multisentence_fragment_join_actions(
                     >= minimum_ordered_score
                     and float(combined_fidelity["token_precision"])
                     >= minimum_token_precision
-                    and float(
-                        combined_fidelity["prefix_token_coverage"]
-                    )
-                    >= minimum_boundary_coverage
-                    and float(
-                        combined_fidelity["suffix_token_coverage"]
-                    )
-                    >= minimum_boundary_coverage
                     and has_complete_boundaries(combined_fidelity)
                 )
                 provisional_preview = bool(
@@ -1495,13 +1661,10 @@ def _multisentence_fragment_join_actions(
                     continue
 
                 expected_counts = Counter(
-                    normalize_spoken_text(
-                        line["line"],
-                        remove_parenthetical_cues=True,
-                    ).split()
+                    evaluator.line_features[line_index].text.tokens
                 )
                 observed_counts = Counter(
-                    normalize_spoken_text(span["transcript"]).split()
+                    evaluator.observed_features(span["transcript"]).tokens
                 )
                 repeated_excess = any(
                     count >= 2 and count > expected_counts.get(token, 0)
@@ -1522,17 +1685,20 @@ def _multisentence_fragment_join_actions(
 
                 other_score = max(
                     (
-                        text_similarity(
-                            other_line["line"],
-                            span["transcript"],
-                        )
+                        evaluator.match(other_index, span["transcript"])
                         for other_index, other_line in enumerate(lines)
                         if other_index != line_index
                         and not is_vocalization_script(other_line["line"])
                     ),
                     default=0.0,
                 )
-                duration_score = _duration_plausibility(line, span)
+                duration_score = _duration_plausibility(
+                    line,
+                    span,
+                    expected_word_count=evaluator.line_features[
+                        line_index
+                    ].word_count,
+                )
                 relevant_hints = contained_actions or [seed_action]
                 order_score = sum(
                     float(action.get("order_hint", 0.0))
@@ -1545,6 +1711,7 @@ def _multisentence_fragment_join_actions(
                         "count": count,
                         "line_index": line_index,
                         "match_score": combined_match,
+                        "confidence_margin": combined_match - other_score,
                         "transcript": span["transcript"],
                         "transcript_source": span.get(
                             "transcript_source",
@@ -1583,11 +1750,9 @@ def _multisentence_fragment_join_actions(
         joined_by_line[int(action["line_index"])].append(action)
     selected_joins = []
     for line_index, line_actions in joined_by_line.items():
-        line_text = lines[line_index]["line"]
-
         def action_quality(action: dict[str, Any]) -> tuple[Any, ...]:
             scored = score_preview(
-                line_text,
+                line_index,
                 {"transcript": str(action.get("transcript") or "")},
             )
             return (
@@ -1620,98 +1785,94 @@ def _multisentence_fragment_join_actions(
 def _expand_alignment_actions(
     actions: list[dict[str, Any]],
     *,
-    base_segments: list[dict[str, Any]],
-    session_id: str,
-    settings: dict[str, Any],
+    lines: list[dict[str, Any]],
+    settings: Mapping[str, Any] | AlignmentSettings,
 ) -> list[dict[str, Any]]:
-    take_group_gap = float(settings.get("take_group_gap_seconds", 12.0))
-    group_number = 0
-    previous_primary: dict[str, Any] | None = None
-    expanded = []
+    """Expand only identical-row targets, not every diagnostic top match."""
 
+    settings = AlignmentSettings.from_value(settings)
+    policy = str(settings["duplicate_line_policy"])
+    duplicate_indexes: dict[str, list[int]] = defaultdict(list)
+    for line_index, line in enumerate(lines):
+        normalized = normalize_spoken_text(
+            line["line"],
+            remove_parenthetical_cues=True,
+        )
+        if normalized:
+            duplicate_indexes[normalized].append(line_index)
+
+    expanded = []
     for action in actions:
         primary_line_index = int(action["line_index"])
         start_index = int(action["start_index"])
         count = int(action["count"])
-        start_seconds = float(base_segments[start_index]["start_seconds"])
-        end_seconds = float(
-            base_segments[start_index + count - 1]["end_seconds"]
+        normalized = normalize_spoken_text(
+            lines[primary_line_index]["line"],
+            remove_parenthetical_cues=True,
         )
-        if (
-            previous_primary is not None
-            and int(previous_primary["line_index"]) == primary_line_index
-            and start_seconds - float(previous_primary["end_seconds"])
-            <= take_group_gap
-        ):
-            take_group_id = str(previous_primary["take_group_id"])
+        identical_indexes = duplicate_indexes.get(
+            normalized,
+            [primary_line_index],
+        )
+        if policy in {"review", "reuse"} and len(identical_indexes) > 1:
+            target_indexes = identical_indexes
         else:
-            group_number += 1
-            take_group_id = f"{session_id}__g{group_number:05d}"
-        previous_primary = {
-            "line_index": primary_line_index,
-            "end_seconds": end_seconds,
-            "take_group_id": take_group_id,
-        }
-
-        matches = action.get("top_matches") or [
-            {
-                "line_index": primary_line_index,
-                "match_score": action["match_score"],
-                "duration_plausibility": action.get(
-                    "duration_plausibility", 0.0
-                ),
-                "order_hint": action.get("order_hint", 0.0),
-            }
-        ]
-        for match_rank, match in enumerate(matches, start=1):
+            target_indexes = [primary_line_index]
+        for target_index in target_indexes:
+            duplicate_resolved = bool(
+                action.get("duplicate_resolved", False)
+                or (
+                    policy == "reuse"
+                    and len(identical_indexes) > 1
+                )
+            )
             expanded.append(
                 {
                     "type": "assigned",
                     "start_index": start_index,
                     "count": count,
-                    "line_index": int(match["line_index"]),
-                    "primary_line_index": primary_line_index,
-                    "match_score": float(match["match_score"]),
+                    "line_index": target_index,
+                    "primary_line_index": target_index,
+                    "match_score": float(action["match_score"]),
                     "transcript": action["transcript"],
                     "duration_plausibility": float(
-                        match.get("duration_plausibility", 0.0)
+                        action.get("duration_plausibility", 0.0)
                     ),
-                    "order_hint": float(match.get("order_hint", 0.0)),
+                    "order_hint": float(action.get("order_hint", 0.0)),
                     "confidence_margin": float(
-                        match.get("confidence_margin", 0.0)
+                        action.get("confidence_margin", 0.0)
                     ),
-                    "segment_match_rank": match_rank,
-                    "is_primary_match": match_rank == 1,
-                    "take_group_id": (
-                        take_group_id if match_rank == 1 else None
+                    "segment_match_rank": 1,
+                    "is_primary_match": True,
+                    "duplicate_resolution": (
+                        action.get("duplicate_resolution")
+                        or (
+                            policy
+                            if len(identical_indexes) > 1
+                            else None
+                        )
                     ),
-                    "duplicate_resolution": action.get(
-                        "duplicate_resolution"
-                    ),
-                    "duplicate_resolved": bool(
-                        action.get("duplicate_resolved", False)
-                        and match_rank == 1
-                    ),
-                    "fragment_join": bool(
-                        action.get("fragment_join", False)
-                        and match_rank == 1
-                    ),
-                    "fragment_source_count": (
-                        int(action.get("fragment_source_count", 0))
-                        if match_rank == 1
-                        else 0
+                    "duplicate_resolved": duplicate_resolved,
+                    "fragment_join": bool(action.get("fragment_join", False)),
+                    "fragment_source_count": int(
+                        action.get("fragment_source_count", 0)
                     ),
                     "fragment_join_provisional": bool(
                         action.get("fragment_join_provisional", False)
-                        and match_rank == 1
                     ),
-                    "forced_review_reason": (
-                        str(action.get("forced_review_reason") or "")
-                        if match_rank == 1
-                        else ""
+                    "forced_review_reason": str(
+                        action.get("forced_review_reason") or ""
                     ),
                 }
             )
+
+    expanded.sort(
+        key=lambda action: (
+            int(action["start_index"]),
+            int(action["count"]),
+            int(action["line_index"]),
+        )
+    )
     return expanded
 
 
@@ -1722,7 +1883,7 @@ def _reroute_actions_to_exact_asr_primary_matches(
     exact_scores_by_segment: dict[str, list[float]],
     minimum_score: float,
 ) -> list[dict[str, Any]]:
-    """Ensure exact-span ASR can correct a preview-time line assignment."""
+    """Choose one exact-ASR primary line per unique audio span."""
 
     actions_by_span: dict[
         tuple[int, int],
@@ -1733,70 +1894,82 @@ def _reroute_actions_to_exact_asr_primary_matches(
             (int(action["start_index"]), int(action["count"]))
         ].append(action)
 
-    augmented = list(actions)
+    routed_actions = []
     for span_key, span_actions in actions_by_span.items():
         segment = materialized_by_span.get(span_key)
-        if segment is None:
-            continue
-        scores = exact_scores_by_segment.get(str(segment["segment_id"]))
-        if not scores:
-            continue
-        best_line_index = max(
-            range(len(scores)),
-            key=lambda line_index: scores[line_index],
+        scores = (
+            exact_scores_by_segment.get(str(segment["segment_id"]))
+            if segment is not None
+            else None
         )
-        best_score = float(scores[best_line_index])
-        if best_score < minimum_score:
-            continue
-        second_score = max(
-            (
-                float(score)
-                for line_index, score in enumerate(scores)
-                if line_index != best_line_index
-            ),
-            default=0.0,
-        )
-        representative = next(
-            (
-                action
-                for action in span_actions
-                if bool(action.get("is_primary_match", False))
-            ),
-            span_actions[0],
-        )
-        best_action = next(
-            (
+        if scores:
+            best_line_index = max(
+                range(len(scores)),
+                key=lambda line_index: scores[line_index],
+            )
+            best_score = float(scores[best_line_index])
+        else:
+            best_line_index = -1
+            best_score = 0.0
+
+        if best_score >= minimum_score:
+            matching_actions = [
                 action
                 for action in span_actions
                 if int(action["line_index"]) == best_line_index
-            ),
-            None,
-        )
-        if best_action is None:
-            best_action = dict(representative)
-            augmented.append(best_action)
-        best_action.update(
-            {
-                "line_index": best_line_index,
-                "primary_line_index": best_line_index,
-                "match_score": best_score,
-                "confidence_margin": best_score - second_score,
-                "segment_match_rank": 1,
-                "is_primary_match": True,
-                "take_group_id": representative.get("take_group_id"),
-                "fragment_join": bool(
-                    representative.get("fragment_join", False)
+            ]
+            source = max(
+                matching_actions or span_actions,
+                key=lambda action: (
+                    not bool(action.get("forced_review_reason")),
+                    float(action.get("match_score", 0.0)),
+                    bool(action.get("fragment_join", False)),
                 ),
-                "fragment_source_count": int(
-                    representative.get("fragment_source_count", 0)
+            )
+            routed = dict(source)
+            second_score = max(
+                (
+                    float(score)
+                    for line_index, score in enumerate(scores)
+                    if line_index != best_line_index
                 ),
-                "fragment_join_provisional": bool(
-                    representative.get("fragment_join_provisional", False)
-                ),
-            }
-        )
+                default=0.0,
+            )
+            routed.update(
+                {
+                    "line_index": best_line_index,
+                    "primary_line_index": best_line_index,
+                    "match_score": best_score,
+                    "confidence_margin": best_score - second_score,
+                    "segment_match_rank": 1,
+                    "is_primary_match": True,
+                    "exact_asr_rerouted": (
+                        int(source["line_index"]) != best_line_index
+                    ),
+                    "forced_review_reason": (
+                        str(source.get("forced_review_reason") or "")
+                        if int(source["line_index"]) == best_line_index
+                        else ""
+                    ),
+                }
+            )
+        else:
+            routed = dict(
+                max(
+                    span_actions,
+                    key=lambda action: (
+                        float(action.get("match_score", 0.0)),
+                        bool(action.get("fragment_join", False)),
+                    ),
+                )
+            )
+            routed["primary_line_index"] = int(routed["line_index"])
+            routed["segment_match_rank"] = 1
+            routed["is_primary_match"] = True
+        routed_actions.append(routed)
+
     return sorted(
-        augmented,
+        routed_actions,
         key=lambda action: (
             int(action["start_index"]),
             int(action["count"]),
@@ -1805,19 +1978,51 @@ def _reroute_actions_to_exact_asr_primary_matches(
     )
 
 
+def _exact_line_scores(
+    lines: list[dict[str, Any]],
+    evaluator: TranscriptEvaluator,
+    transcript: str,
+) -> list[float]:
+    """Score only normal dialogue lines during exact-ASR routing."""
+
+    return [
+        (
+            0.0
+            if is_vocalization_script(line["line"])
+            else evaluator.match(line_index, transcript)
+        )
+        for line_index, line in enumerate(lines)
+    ]
+
+
 def _candidate_reliability(
     *,
     line: dict[str, Any],
     match_score: float,
     margin: float,
-    settings: dict[str, Any],
+    settings: Mapping[str, Any] | AlignmentSettings,
     observed: str | None = None,
-    duplicate_text: bool = False,
+    ambiguity_resolved: bool = False,
     unsafe_untranscribed_merge: bool = False,
     duration_plausibility: float | None = None,
+    evaluation: TranscriptEvaluation | None = None,
+    technical_score: float | None = None,
+    clipping_samples: int = 0,
 ) -> tuple[bool, str]:
+    settings = AlignmentSettings.from_value(settings)
     if is_nonverbal_script(line["line"]):
         return False, "NONVERBAL_SCRIPT"
+    if (
+        clipping_samples > 0
+        and bool(settings.get("auto_reject_clipping", True))
+    ):
+        return False, "TECHNICAL_CLIPPING"
+    if (
+        technical_score is not None
+        and technical_score
+        < float(settings.get("auto_min_technical_score", 0.0))
+    ):
+        return False, "LOW_TECHNICAL_QUALITY"
     if unsafe_untranscribed_merge:
         return False, "MERGED_UNTRANSCRIBED_AUDIO"
     if (
@@ -1826,51 +2031,45 @@ def _candidate_reliability(
         < float(settings.get("reliable_min_duration_plausibility", 25.0))
     ):
         return False, "POSSIBLE_REPEATED_TAKES"
-    if (
-        observed
-        and not duplicate_text
-        and normalize_spoken_text(
+    if evaluation is None:
+        fidelity = transcript_fidelity(
             line["line"],
-            remove_parenthetical_cues=True,
+            observed or "",
+            token_min_similarity=float(
+                settings.get("fidelity_token_min_similarity", 78.0)
+            ),
+            boundary_window_tokens=int(
+                settings.get("reliable_boundary_window_tokens", 4)
+            ),
+            boundary_observed_slack_tokens=int(
+                settings.get(
+                    "reliable_boundary_observed_slack_tokens",
+                    2,
+                )
+            ),
         )
-        == normalize_spoken_text(observed)
-    ):
-        return True, ""
-    fidelity = transcript_fidelity(
-        line["line"],
-        observed or "",
-        token_min_similarity=float(
-            settings.get("fidelity_token_min_similarity", 78.0)
-        ),
-        boundary_window_tokens=int(
-            settings.get("reliable_boundary_window_tokens", 4)
-        ),
-        boundary_observed_slack_tokens=int(
-            settings.get(
-                "reliable_boundary_observed_slack_tokens",
-                2,
-            )
-        ),
-    )
-    sentence = sentence_fidelity(
-        line["line"],
-        observed or "",
-        token_min_similarity=float(
-            settings.get("fidelity_token_min_similarity", 78.0)
-        ),
-        minimum_clause_score=float(
-            settings.get("reliable_min_clause_score", 55.0)
-        ),
-        short_clause_max_words=int(
-            settings.get("reliable_short_clause_max_words", 4)
-        ),
-        short_clause_min_token_coverage=float(
-            settings.get(
-                "reliable_short_clause_min_token_coverage",
-                1.0,
-            )
-        ),
-    )
+        sentence = sentence_fidelity(
+            line["line"],
+            observed or "",
+            token_min_similarity=float(
+                settings.get("fidelity_token_min_similarity", 78.0)
+            ),
+            minimum_clause_score=float(
+                settings.get("reliable_min_clause_score", 55.0)
+            ),
+            short_clause_max_words=int(
+                settings.get("reliable_short_clause_max_words", 4)
+            ),
+            short_clause_min_token_coverage=float(
+                settings.get(
+                    "reliable_short_clause_min_token_coverage",
+                    1.0,
+                )
+            ),
+        )
+    else:
+        fidelity = evaluation.fidelity
+        sentence = evaluation.sentence
     is_short_line = (
         len(
             normalize_spoken_text(
@@ -1883,109 +2082,113 @@ def _candidate_reliability(
     if is_short_line:
         minimum_score = float(settings.get("short_line_min_score", 88.0))
         minimum_margin = float(settings.get("short_line_min_margin", 15.0))
-        if match_score < minimum_score:
-            return False, "SHORT_LINE_LOW_SCORE"
-        if margin < minimum_margin:
-            return False, "SHORT_LINE_AMBIGUOUS"
-        if (
-            sentence["clause_count"] >= 2
-            and sentence["missing_clause_count"] > 0
-        ):
-            return False, "MISSING_SENTENCE"
-        if fidelity["token_coverage"] < float(
+        minimum_coverage = float(
             settings.get("short_line_min_token_coverage", 1.0)
-        ):
-            return False, "SHORT_LINE_INCOMPLETE_TRANSCRIPT"
-        if fidelity["token_precision"] < float(
+        )
+        minimum_precision = float(
             settings.get("short_line_min_token_precision", 1.0)
-        ):
-            return False, "SHORT_LINE_EXTRA_WORDS"
-        if fidelity["ordered_similarity"] < float(
+        )
+        minimum_ordered = float(
             settings.get("short_line_min_ordered_score", 70.0)
-        ):
-            return False, "SHORT_LINE_ORDER_MISMATCH"
-        return True, ""
-    if match_score < float(settings.get("reliable_min_score", 72.0)):
-        return False, "LOW_MATCH_SCORE"
-    if margin < float(settings.get("reliable_min_margin", 8.0)):
-        return False, "AMBIGUOUS_MATCH"
+        )
+        low_score_reason = "SHORT_LINE_LOW_SCORE"
+        ambiguous_reason = "SHORT_LINE_AMBIGUOUS"
+        incomplete_reason = "SHORT_LINE_INCOMPLETE_TRANSCRIPT"
+        extra_reason = "SHORT_LINE_EXTRA_WORDS"
+        order_reason = "SHORT_LINE_ORDER_MISMATCH"
+    else:
+        minimum_score = float(settings.get("reliable_min_score", 72.0))
+        minimum_margin = float(settings.get("reliable_min_margin", 8.0))
+        minimum_coverage = float(
+            settings.get("reliable_min_token_coverage", 0.60)
+        )
+        minimum_precision = float(
+            settings.get("reliable_min_token_precision", 0.70)
+        )
+        minimum_ordered = float(
+            settings.get("reliable_min_ordered_score", 55.0)
+        )
+        low_score_reason = "LOW_MATCH_SCORE"
+        ambiguous_reason = "AMBIGUOUS_MATCH"
+        incomplete_reason = "INCOMPLETE_TRANSCRIPT"
+        extra_reason = "EXCESS_TRANSCRIPT_WORDS"
+        order_reason = "LOW_ORDERED_SIMILARITY"
+
+    if match_score < minimum_score:
+        return False, low_score_reason
+    if margin < minimum_margin and not ambiguity_resolved:
+        return False, ambiguous_reason
     if (
         sentence["clause_count"] >= 2
         and sentence["missing_clause_count"] > 0
     ):
         return False, "MISSING_SENTENCE"
-    if fidelity["token_precision"] < float(
-        settings.get("reliable_min_token_precision", 0.70)
-    ):
-        return False, "EXCESS_TRANSCRIPT_WORDS"
     if (
-        sentence["clause_count"] >= 2
+        is_short_line
+        and float(fidelity["ordered_similarity"]) < minimum_ordered
+    ):
+        return False, order_reason
+    if (
+        is_short_line
+        and float(fidelity["token_coverage"]) < minimum_coverage
+    ):
+        return False, incomplete_reason
+    if float(fidelity["token_precision"]) < minimum_precision:
+        return False, extra_reason
+    if (
+        not is_short_line
+        and sentence["clause_count"] >= 2
         and not bool(sentence["clauses_in_order"])
     ):
         return False, "SENTENCE_ORDER_MISMATCH"
-    maximum_boundary_missing_tokens = max(
-        0,
-        int(settings.get("reliable_max_boundary_missing_tokens", 0)),
-    )
-    leading_extra = int(fidelity["leading_extra_token_count"]) > 0
-    trailing_extra = int(fidelity["trailing_extra_token_count"]) > 0
-    leading_anchor_mismatch = bool(
-        int(fidelity["leading_missing_token_count"]) > 0
-        or int(fidelity["leading_substitution_count"]) > 0
-    )
-    trailing_anchor_mismatch = bool(
-        int(fidelity["trailing_missing_token_count"]) > 0
-        or int(fidelity["trailing_substitution_count"]) > 0
-    )
-    if leading_extra and not leading_anchor_mismatch:
-        return False, "EXTRA_LINE_START"
-    if trailing_extra and not trailing_anchor_mismatch:
-        return False, "EXTRA_LINE_END"
-    leading_boundary_mismatch = bool(
-        leading_anchor_mismatch
-        or int(fidelity["prefix_missing_token_count"])
-        > maximum_boundary_missing_tokens
-    )
-    trailing_boundary_mismatch = bool(
-        trailing_anchor_mismatch
-        or int(fidelity["suffix_missing_token_count"])
-        > maximum_boundary_missing_tokens
-    )
-    if leading_boundary_mismatch and trailing_boundary_mismatch:
-        return False, "MISSING_LINE_BOUNDARIES"
-    if leading_boundary_mismatch:
-        return False, "MISSING_LINE_START"
-    if trailing_boundary_mismatch:
-        return False, "MISSING_LINE_END"
-    if leading_extra:
-        return False, "EXTRA_LINE_START"
-    if trailing_extra:
-        return False, "EXTRA_LINE_END"
-    minimum_boundary_coverage = float(
-        settings.get("reliable_min_boundary_token_coverage", 0.60)
-    )
-    missing_start = (
-        float(fidelity["prefix_token_coverage"])
-        < minimum_boundary_coverage
-    )
-    missing_end = (
-        float(fidelity["suffix_token_coverage"])
-        < minimum_boundary_coverage
-    )
-    if missing_start and missing_end:
-        return False, "MISSING_LINE_BOUNDARIES"
-    if missing_start:
-        return False, "MISSING_LINE_START"
-    if missing_end:
-        return False, "MISSING_LINE_END"
-    if fidelity["token_coverage"] < float(
-        settings.get("reliable_min_token_coverage", 0.60)
+
+    if not is_short_line:
+        maximum_boundary_missing_tokens = max(
+            0,
+            int(settings.get("reliable_max_boundary_missing_tokens", 0)),
+        )
+        leading_extra = int(fidelity["leading_extra_token_count"]) > 0
+        trailing_extra = int(fidelity["trailing_extra_token_count"]) > 0
+        leading_anchor_mismatch = bool(
+            int(fidelity["leading_missing_token_count"]) > 0
+            or int(fidelity["leading_substitution_count"]) > 0
+        )
+        trailing_anchor_mismatch = bool(
+            int(fidelity["trailing_missing_token_count"]) > 0
+            or int(fidelity["trailing_substitution_count"]) > 0
+        )
+        if leading_extra and not leading_anchor_mismatch:
+            return False, "EXTRA_LINE_START"
+        if trailing_extra and not trailing_anchor_mismatch:
+            return False, "EXTRA_LINE_END"
+        leading_boundary_mismatch = bool(
+            leading_anchor_mismatch
+            or int(fidelity["prefix_missing_token_count"])
+            > maximum_boundary_missing_tokens
+        )
+        trailing_boundary_mismatch = bool(
+            trailing_anchor_mismatch
+            or int(fidelity["suffix_missing_token_count"])
+            > maximum_boundary_missing_tokens
+        )
+        if leading_boundary_mismatch and trailing_boundary_mismatch:
+            return False, "MISSING_LINE_BOUNDARIES"
+        if leading_boundary_mismatch:
+            return False, "MISSING_LINE_START"
+        if trailing_boundary_mismatch:
+            return False, "MISSING_LINE_END"
+        if leading_extra:
+            return False, "EXTRA_LINE_START"
+        if trailing_extra:
+            return False, "EXTRA_LINE_END"
+
+    if (
+        not is_short_line
+        and float(fidelity["token_coverage"]) < minimum_coverage
     ):
-        return False, "INCOMPLETE_TRANSCRIPT"
-    if fidelity["ordered_similarity"] < float(
-        settings.get("reliable_min_ordered_score", 55.0)
-    ):
-        return False, "LOW_ORDERED_SIMILARITY"
+        return False, incomplete_reason
+    if float(fidelity["ordered_similarity"]) < minimum_ordered:
+        return False, order_reason
     return True, ""
 
 
@@ -1993,8 +2196,9 @@ def _has_unsafe_untranscribed_merge(
     *,
     action: dict[str, Any],
     base_segments: list[dict[str, Any]],
-    settings: dict[str, Any],
+    settings: Mapping[str, Any] | AlignmentSettings,
 ) -> bool:
+    settings = AlignmentSettings.from_value(settings)
     if not bool(settings.get("auto_reject_untranscribed_merge", True)):
         return False
     start_index = int(action["start_index"])
@@ -2053,7 +2257,7 @@ def align_project(
     manifest = read_json(manifest_path)
     source_data = load_source_data(project_dir, project)
     line_by_id = {line["line_id"]: line for line in source_data["lines"]}
-    settings = dict(project.get("alignment") or {})
+    settings = AlignmentSettings.from_value(project.get("alignment"))
     manifest_session_by_id = {
         entry["session_id"]: entry for entry in manifest["sessions"]
     }
@@ -2078,33 +2282,11 @@ def align_project(
         session_lines = lines_for_session(source_data, session)
         if not session_lines:
             continue
-        text_matchable_session_lines = [
-            line
-            for line in session_lines
-            if not is_vocalization_script(line["line"])
-        ]
-        normalized_line_counts = Counter(
-            normalize_spoken_text(
-                line["line"],
-                remove_parenthetical_cues=True,
-            )
-            for line in session_lines
-        )
+        evaluator = TranscriptEvaluator(session_lines, settings)
         print(
             f"[align {session_index}] {session['id']}: "
             f"{len(base_segments)} segments → {len(session_lines)} lines",
             flush=True,
-        )
-        primary_actions = order_independent_align(
-            base_segments,
-            session_lines,
-            settings,
-        )
-        _apply_duplicate_line_policy(
-            primary_actions,
-            lines=session_lines,
-            base_segments=base_segments,
-            settings=settings,
         )
         transcription_path = (
             project_dir / "transcripts" / f"{session['id']}.json"
@@ -2114,12 +2296,26 @@ def align_project(
             if transcription_path.is_file()
             else None
         )
+        span_catalog = SpanCatalog(
+            base_segments,
+            settings,
+            transcription=session_transcription,
+        )
+        primary_actions = order_independent_align(
+            base_segments,
+            session_lines,
+            settings,
+            evaluator=evaluator,
+            span_catalog=span_catalog,
+        )
         fragment_join_actions = _multisentence_fragment_join_actions(
             primary_actions,
             lines=session_lines,
             base_segments=base_segments,
             settings=settings,
             transcription=session_transcription,
+            evaluator=evaluator,
+            span_catalog=span_catalog,
         )
         candidate_actions = sorted(
             [*primary_actions, *fragment_join_actions],
@@ -2128,12 +2324,7 @@ def align_project(
                 int(action["count"]),
             ),
         )
-        actions = _expand_alignment_actions(
-            candidate_actions,
-            base_segments=base_segments,
-            session_id=session["id"],
-            settings=settings,
-        )
+        actions = candidate_actions
         verification_enabled = bool(
             segment_asr_settings.get("enabled", False)
             and segment_asr_settings.get(
@@ -2194,15 +2385,27 @@ def align_project(
         for segment_id, exact_asr in exact_asr_by_segment.items():
             exact_text = str(exact_asr.get("transcript") or "").strip()
             if exact_text and not exact_asr.get("error"):
-                exact_scores_by_segment[segment_id] = [
-                    text_similarity(line["line"], exact_text)
-                    for line in session_lines
-                ]
+                exact_scores_by_segment[segment_id] = _exact_line_scores(
+                    session_lines,
+                    evaluator,
+                    exact_text,
+                )
         actions = _reroute_actions_to_exact_asr_primary_matches(
             actions,
             materialized_by_span=materialized_by_span,
             exact_scores_by_segment=exact_scores_by_segment,
             minimum_score=float(settings.get("candidate_min_score", 45.0)),
+        )
+        _apply_duplicate_line_policy(
+            actions,
+            lines=session_lines,
+            base_segments=base_segments,
+            settings=settings,
+        )
+        actions = _expand_alignment_actions(
+            actions,
+            lines=session_lines,
+            settings=settings,
         )
         reliable_coverage: set[int] = set()
         assignment_by_base: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -2298,14 +2501,12 @@ def align_project(
             else:
                 all_scores = sorted(
                     (
-                        text_similarity(
-                            other_line["line"],
-                            observed_transcript,
-                        ),
+                        evaluator.match(other_index, observed_transcript),
                         other_line["line_id"],
                     )
-                    for other_line in session_lines
+                    for other_index, other_line in enumerate(session_lines)
                     if other_line["line_id"] != line["line_id"]
+                    and not is_vocalization_script(other_line["line"])
                 )
                 second_score = all_scores[-1][0] if all_scores else 0.0
                 margin = match_score - second_score
@@ -2326,68 +2527,42 @@ def align_project(
                     remove_parenthetical_cues=True,
                 )
             )
-            fidelity = transcript_fidelity(
-                line["line"],
+            evaluation = evaluator.evaluate(
+                int(action["line_index"]),
                 observed_transcript,
-                token_min_similarity=float(
-                    settings.get("fidelity_token_min_similarity", 78.0)
-                ),
-                boundary_window_tokens=int(
-                    settings.get("reliable_boundary_window_tokens", 4)
-                ),
-                boundary_observed_slack_tokens=int(
-                    settings.get(
-                        "reliable_boundary_observed_slack_tokens",
-                        2,
-                    )
-                ),
             )
-            sentence = sentence_fidelity(
-                line["line"],
-                observed_transcript,
-                token_min_similarity=float(
-                    settings.get("fidelity_token_min_similarity", 78.0)
-                ),
-                minimum_clause_score=float(
-                    settings.get("reliable_min_clause_score", 55.0)
-                ),
-                short_clause_max_words=int(
-                    settings.get("reliable_short_clause_max_words", 4)
-                ),
-                short_clause_min_token_coverage=float(
-                    settings.get(
-                        "reliable_short_clause_min_token_coverage",
-                        1.0,
-                    )
-                ),
-            )
+            fidelity = evaluation.fidelity
+            sentence = evaluation.sentence
             unsafe_untranscribed_merge = _has_unsafe_untranscribed_merge(
                 action=action,
                 base_segments=base_segments,
                 settings=settings,
             )
+            technical_score = _technical_score(segment)
             reliable, reason = _candidate_reliability(
                 line=line,
                 match_score=match_score,
                 margin=margin,
                 settings=settings,
                 observed=observed_transcript,
-                duplicate_text=(
-                    normalized_line_counts[
-                        normalize_spoken_text(
-                            line["line"],
-                            remove_parenthetical_cues=True,
-                        )
-                    ]
-                    > 1
-                    and not action.get("duplicate_resolved", False)
-                    and not reusable_duplicate
+                ambiguity_resolved=bool(
+                    action.get("duplicate_resolved", False)
+                    or reusable_duplicate
                 ),
                 unsafe_untranscribed_merge=unsafe_untranscribed_merge,
                 duration_plausibility=(
                     float(action["duration_plausibility"])
                     if action.get("duration_plausibility") is not None
                     else None
+                ),
+                evaluation=evaluation,
+                technical_score=technical_score,
+                clipping_samples=int(
+                    (segment.get("metrics") or {}).get(
+                        "clipping_samples",
+                        0,
+                    )
+                    or 0
                 ),
             )
             if verification_required and not exact_span_asr_verified:
@@ -2424,7 +2599,6 @@ def align_project(
             if action.get("forced_review_reason"):
                 reliable = False
                 reason = str(action["forced_review_reason"])
-            technical_score = _technical_score(segment)
             selection_score = (
                 match_score
                 + 0.10 * technical_score
@@ -2496,7 +2670,6 @@ def align_project(
                 "segment_match_rank": int(
                     action.get("segment_match_rank", 1)
                 ),
-                "take_group_id": action.get("take_group_id"),
                 "duration_plausibility": float(
                     action.get("duration_plausibility", 0.0)
                 ),
@@ -2514,10 +2687,8 @@ def align_project(
                     action.get("fragment_join_provisional", False)
                 ),
             }
-            if (
-                match_score
-                >= float(settings.get("candidate_min_score", 45.0))
-                or action.get("force_candidate", False)
+            if match_score >= float(
+                settings.get("candidate_min_score", 45.0)
             ):
                 candidates.append(candidate)
             for base_index in segment["base_indices"]:
@@ -2532,11 +2703,12 @@ def align_project(
             transcript = segment.get("transcript", "")
             suggestions = sorted(
                 (
-                    text_similarity(line["line"], transcript),
+                    evaluator.match(line_index, transcript),
                     line["line_id"],
                     line["line"],
                 )
-                for line in text_matchable_session_lines
+                for line_index, line in enumerate(session_lines)
+                if not is_vocalization_script(line["line"])
             )
             best = suggestions[-1] if suggestions else (0.0, "", "")
             second = suggestions[-2] if len(suggestions) > 1 else (0.0, "", "")

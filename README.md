@@ -158,7 +158,7 @@ the status to `MANUALLY_REVIEWED`; unselecting it changes the status to
 `REVIEW`, or back to `MISSING` when no alignment candidate exists.
 
 The review candidate list is intentionally narrower than the diagnostic
-candidate set in `alignment.json`. It keeps primary line matches, removes
+candidate set in `alignment.json`. It removes
 lower-scoring spans contained by a better candidate, retains candidates within
 15 score points of the best match, and cuts the list sooner when adjacent
 scores have a gap of at least 12 points. Manual selections survive later
@@ -168,10 +168,11 @@ candidate cluster.
 Every valid audio span is scored against every line enabled for the session; a
 global interval resolver then chooses non-overlapping spans without requiring
 the actor to follow sheet or row order. Repeated nearby matches to one line are
-retained as separate takes. `candidate_top_k` controls how many competing line
-matches are retained per chosen span, while `order_hint_weight` is `0.0` by
-default and may be set to a small positive value when recording order is known
-to be useful only as a tie-breaker.
+retained as separate takes. Competing line matches remain attached to each span
+during discovery and fragment recovery instead of being expanded into
+review-ineligible duplicate candidates. `candidate_top_k` controls that
+internal alternative set. `order_hint_weight` is `0.0` by default and may be
+set to a small positive value when recording order is useful as a tie-breaker.
 
 Candidate discovery deliberately tolerates reordered or imperfect ASR text,
 but `AUTO_OK` uses separate transcript-fidelity gates. Detailed diagnostics
@@ -191,7 +192,11 @@ forms are canonicalized before scoring, including contractions such as
 `could've`/`could have`, `I've`/`I have`, and colloquialisms such as
 `c'mon`/`come on`. A merged span containing substantial,
 non-quiet audio with no transcript is kept for review with reason
-`MERGED_UNTRANSCRIBED_AUDIO` rather than accepted automatically.
+`MERGED_UNTRANSCRIBED_AUDIO` rather than accepted automatically. A take with
+clipped samples also stays in review with `TECHNICAL_CLIPPING` by default.
+Within the reliable candidate cluster, automatic selection uses the combined
+selection score so technical quality, ASR confidence, and clause completeness
+can favor a cleaner take over one with a trivially higher text score.
 
 Multi-sentence lines also use clause-level completeness. Every clause separated
 by `.`, `?`, or `!` must reach `reliable_min_clause_score`, otherwise the
@@ -234,8 +239,9 @@ untranscribed pieces receive `MERGED_UNTRANSCRIBED_AUDIO`, and candidates below
 duration gate covers short segments where ASR collapses two or more audible
 performances into a single exact transcript.
 
-Before a candidate can become `AUTO_OK`, the exact WAV that would be exported
-must have an unprompted independent transcript. Base candidates reuse their
+With the default segment-transcription and candidate-verification settings,
+a candidate cannot become `AUTO_OK` until the exact WAV that would be exported
+has an unprompted independent transcript. Base candidates reuse their
 base-clip result; serious merged candidates are decoded again as one continuous
 span and cached separately. Uncached merged spans are deduplicated and decoded
 in batches using `segment_transcription.batch_size`; changing only batch size
@@ -258,6 +264,52 @@ when a nonverbal line is selected.
   distribute those spans chronologically instead of leaving later rows missing.
 - `"reuse"`: permit one exact segment to satisfy duplicate text. Pair this with
   `export.allow_segment_reuse: true` or `finalize --allow-segment-reuse`.
+
+### Alignment configuration
+
+New projects write a compact grouped configuration:
+
+```json
+{
+  "alignment": {
+    "span_search": {
+      "max_segments": 10,
+      "max_gap_seconds": 2.5,
+      "max_duration_seconds": 35.0,
+      "minimum_score": 45.0
+    },
+    "duplicates": {
+      "policy": "weak_order",
+      "take_group_gap_seconds": 12.0
+    },
+    "reliability": {
+      "normal": {
+        "minimum_score": 72.0,
+        "minimum_margin": 8.0
+      },
+      "short": {
+        "minimum_score": 88.0,
+        "minimum_margin": 15.0
+      }
+    },
+    "recovery": {
+      "enabled": true,
+      "max_candidates_per_line": 10,
+      "max_segments": 10
+    },
+    "quality": {
+      "reject_clipping": true,
+      "reject_untranscribed_merge": true
+    }
+  }
+}
+```
+
+Existing projects using the original flat alignment keys remain supported.
+When both forms specify the same option, the flat legacy value wins. Defaults
+and validation are centralized in `dialogue_pipeline/alignment_settings.py`;
+advanced recovery constants no longer need to be copied into every new
+`project.json`.
 
 ### 6. Finalize selected files
 

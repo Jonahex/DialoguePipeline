@@ -12,14 +12,21 @@ import pytest
 from dialogue_pipeline.alignment import (
     _apply_duplicate_line_policy,
     _candidate_reliability,
+    _exact_line_scores,
+    _expand_alignment_actions,
     _has_unsafe_untranscribed_merge,
     _multisentence_fragment_join_actions,
     _reroute_actions_to_exact_asr_primary_matches,
+    TranscriptEvaluator,
     align_project,
     order_independent_align,
     sentence_fidelity,
     text_similarity,
     transcript_fidelity,
+)
+from dialogue_pipeline.alignment_settings import (
+    AlignmentSettings,
+    default_alignment_config,
 )
 from dialogue_pipeline.audio import cut_pcm_wav, prepare_pcm_segmentation_source
 from dialogue_pipeline.finalize import finalize_review
@@ -366,7 +373,34 @@ def test_exact_asr_can_reroute_join_to_better_script_line() -> None:
     assert corrected["match_score"] == 100.0
 
 
-def test_exact_short_match_is_reliable_unless_script_text_is_duplicated() -> None:
+def test_exact_line_scores_exclude_nonverbal_and_vocalization_lines() -> None:
+    lines = [
+        {"line": "(cough)"},
+        {"line": "oof"},
+        {"line": "Oof, that hurt."},
+    ]
+    evaluator = TranscriptEvaluator(lines, {})
+
+    scores = _exact_line_scores(lines, evaluator, "oof")
+
+    assert scores[:2] == [0.0, 0.0]
+    assert scores[2] > 0.0
+
+
+def test_grouped_alignment_settings_support_legacy_overrides() -> None:
+    configured = default_alignment_config()
+    configured["span_search"]["max_segments"] = 9
+    configured["max_merge_segments"] = 7
+
+    settings = AlignmentSettings.from_value(configured)
+
+    assert settings["max_merge_segments"] == 7
+    assert settings["fragment_join_max_segments"] == 10
+    assert settings["duplicate_line_policy"] == "weak_order"
+    assert settings["auto_reject_clipping"] is True
+
+
+def test_exact_short_match_still_requires_resolved_ambiguity() -> None:
     settings = {
         "short_line_min_score": 88.0,
         "short_line_min_margin": 15.0,
@@ -379,16 +413,27 @@ def test_exact_short_match_is_reliable_unless_script_text_is_duplicated() -> Non
         margin=5.0,
         settings=settings,
         observed="Goodbye",
-        duplicate_text=False,
-    ) == (True, "")
+    ) == (False, "SHORT_LINE_AMBIGUOUS")
     assert _candidate_reliability(
         line=line,
         match_score=100.0,
         margin=5.0,
         settings=settings,
         observed="Goodbye",
-        duplicate_text=True,
-    ) == (False, "SHORT_LINE_AMBIGUOUS")
+        ambiguity_resolved=True,
+    ) == (True, "")
+
+
+def test_clipping_blocks_automatic_reliability() -> None:
+    assert _candidate_reliability(
+        line={"line": "This transcript is otherwise complete."},
+        match_score=100.0,
+        margin=100.0,
+        settings={},
+        observed="This transcript is otherwise complete.",
+        clipping_samples=1,
+        technical_score=65.0,
+    ) == (False, "TECHNICAL_CLIPPING")
 
 
 def test_short_line_auto_reliability_requires_order_and_no_extra_words() -> None:
@@ -1642,6 +1687,42 @@ def test_duplicate_weak_order_distributes_nearby_distinct_takes() -> None:
     assert all(action["duplicate_resolved"] for action in actions)
 
 
+def test_duplicate_review_and_reuse_expand_only_identical_targets() -> None:
+    lines = [
+        {"line": "Same words."},
+        {"line": "Same words!"},
+        {"line": "Different words."},
+    ]
+    action = {
+        "type": "assigned",
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 100.0,
+        "confidence_margin": 0.0,
+        "transcript": "Same words",
+        "duration_plausibility": 100.0,
+        "order_hint": 0.0,
+    }
+
+    review_actions = _expand_alignment_actions(
+        [action],
+        lines=lines,
+        settings={"duplicate_line_policy": "review"},
+    )
+    reuse_actions = _expand_alignment_actions(
+        [action],
+        lines=lines,
+        settings={"duplicate_line_policy": "reuse"},
+    )
+
+    assert [item["line_index"] for item in review_actions] == [0, 1]
+    assert all(item["is_primary_match"] for item in review_actions)
+    assert not any(item["duplicate_resolved"] for item in review_actions)
+    assert [item["line_index"] for item in reuse_actions] == [0, 1]
+    assert all(item["duplicate_resolved"] for item in reuse_actions)
+
+
 def test_line_review_types_nonverbal_lines_and_uses_audible_unmatched_pool(
     tmp_path: Path,
 ) -> None:
@@ -1756,6 +1837,51 @@ def test_review_candidates_keep_primary_top_score_cluster() -> None:
         "segment2",
         "segment3",
     ]
+
+
+def test_review_auto_selects_best_quality_within_reliable_cluster() -> None:
+    line = {
+        "line_id": "Sheet::R3",
+        "sheet": "Sheet",
+        "excel_row": 3,
+        "line": "Choose the clean take.",
+        "target_filename": "clean_take",
+    }
+    candidates = [
+        {
+            "segment_id": "highest_text",
+            "segment_file": "highest_text.wav",
+            "session_id": "session",
+            "base_indices": [0],
+            "match_score": 100.0,
+            "selection_score": 105.0,
+            "technical_score": 50.0,
+            "is_primary_match": True,
+            "reliable": True,
+            "reliability_reason": "",
+        },
+        {
+            "segment_id": "cleanest",
+            "segment_file": "cleanest.wav",
+            "session_id": "session",
+            "base_indices": [1],
+            "match_score": 99.0,
+            "selection_score": 116.0,
+            "technical_score": 100.0,
+            "is_primary_match": True,
+            "reliable": True,
+            "reliability_reason": "",
+        },
+    ]
+
+    review = build_line_review(
+        source_lines=[line],
+        candidates_by_line={line["line_id"]: candidates},
+        unmatched_segments=[],
+    )
+
+    assert review["lines"][0]["status"] == "AUTO_OK"
+    assert review["lines"][0]["selected_segment_id"] == "cleanest"
 
 
 def test_review_candidates_keep_best_fragment_join_when_none_are_reliable() -> None:

@@ -24,6 +24,8 @@ STRUCTURALLY_INCOMPLETE_REASONS = {
     "SEGMENT_BETTER_MATCH_ELSEWHERE",
     "SENTENCE_ORDER_MISMATCH",
     "SHORT_LINE_LOW_SCORE",
+    "TECHNICAL_CLIPPING",
+    "LOW_TECHNICAL_QUALITY",
     "UNCERTAIN_BOUNDARY_AUDIO",
 }
 
@@ -235,9 +237,21 @@ def build_line_review(
         review_candidates = [_review_candidate(candidate) for candidate in candidates]
         for rank, candidate in enumerate(review_candidates, start=1):
             candidate["rank"] = rank
-        reliable_best = next(
-            (candidate for candidate in review_candidates if candidate["reliable"]),
-            None,
+        reliable_candidates = [
+            candidate
+            for candidate in review_candidates
+            if candidate["reliable"]
+        ]
+        reliable_best = (
+            max(
+                reliable_candidates,
+                key=lambda candidate: (
+                    float(candidate.get("selection_score", 0.0)),
+                    float(candidate.get("match_score", 0.0)),
+                ),
+            )
+            if reliable_candidates
+            else None
         )
 
         if line_type == "nonverbal":

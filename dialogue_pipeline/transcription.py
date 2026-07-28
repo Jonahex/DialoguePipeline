@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import math
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from rapidfuzz import fuzz
 
+from .cancellation import check_processing_cancelled
 from .project import inventory_by_path, load_source_data
 from .util import (
     is_vocalization_script,
@@ -20,6 +23,180 @@ from .util import (
     write_json,
 )
 from .workbook_io import lines_for_session
+
+
+_AUTOMATIC_BATCH_STEPS = (1, 2, 4, 8, 12, 16, 24, 32)
+
+
+def _batch_size_request(value: Any) -> int | str:
+    """Normalize a configured batch size to a positive integer or ``auto``."""
+    if value is None:
+        return "auto"
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized or normalized == "auto":
+            return "auto"
+        value = normalized
+    if isinstance(value, bool):
+        raise ValueError("batch_size must be 'auto' or a positive integer")
+    try:
+        batch_size = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "batch_size must be 'auto' or a positive integer"
+        ) from error
+    if batch_size < 1:
+        raise ValueError("batch_size must be 'auto' or a positive integer")
+    return batch_size
+
+
+def _gpu_memory_info() -> dict[str, Any] | None:
+    """Return memory telemetry for the CUDA device used by default."""
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                nvidia_smi,
+                "--query-gpu=index,name,memory.total,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    first_line = next(
+        (line.strip() for line in completed.stdout.splitlines() if line.strip()),
+        "",
+    )
+    fields = [field.strip() for field in first_line.split(",", 3)]
+    if len(fields) != 4:
+        return None
+    try:
+        return {
+            "index": int(fields[0]),
+            "name": fields[1],
+            "total_mib": int(fields[2]),
+            "free_mib": int(fields[3]),
+        }
+    except ValueError:
+        return None
+
+
+def _automatic_batch_size(
+    *,
+    device: str,
+    model_name: str,
+    compute_type: str,
+    maximum: int = 32,
+    memory_info: dict[str, Any] | None = None,
+) -> tuple[int, str, dict[str, Any] | None]:
+    """Choose a conservative inference batch from currently free GPU memory."""
+    maximum = max(1, int(maximum))
+    if str(device).lower() != "cuda":
+        return 1, "automatic CPU fallback", None
+
+    memory_info = memory_info if memory_info is not None else _gpu_memory_info()
+    if not memory_info:
+        return 1, "automatic fallback (GPU memory telemetry unavailable)", None
+
+    total_mib = max(0, int(memory_info.get("total_mib", 0)))
+    free_mib = max(0, int(memory_info.get("free_mib", 0)))
+    # The model has already been loaded when this is called, so memory.free
+    # reflects its resident weights. Keep headroom for CUDA workspaces, audio
+    # features, and other applications before estimating per-item capacity.
+    reserve_mib = max(1024, math.ceil(total_mib * 0.12))
+
+    normalized_model = str(model_name).lower()
+    if "tiny" in normalized_model:
+        per_item_mib = 140
+    elif "base" in normalized_model:
+        per_item_mib = 180
+    elif "small" in normalized_model:
+        per_item_mib = 240
+    elif "medium" in normalized_model:
+        per_item_mib = 320
+    elif "turbo" in normalized_model or "distil" in normalized_model:
+        per_item_mib = 340
+    else:
+        per_item_mib = 400
+
+    normalized_compute = str(compute_type).lower()
+    if normalized_compute == "float32":
+        per_item_mib = math.ceil(per_item_mib * 1.7)
+    elif normalized_compute.startswith("int8"):
+        per_item_mib = math.ceil(per_item_mib * 0.75)
+
+    estimated_capacity = max(
+        1,
+        (free_mib - reserve_mib) // max(1, per_item_mib),
+    )
+    upper_bound = min(maximum, estimated_capacity)
+    choices = [
+        size
+        for size in _AUTOMATIC_BATCH_STEPS
+        if size <= upper_bound
+    ]
+    batch_size = choices[-1] if choices else 1
+    reason = (
+        f"automatic from {free_mib} MiB free/{total_mib} MiB total "
+        f"on {memory_info.get('name') or 'CUDA GPU'}"
+    )
+    return batch_size, reason, memory_info
+
+
+def _resolve_profile_batch_size(
+    *,
+    profile: dict[str, Any],
+    runtime: dict[str, Any],
+) -> int:
+    request = _batch_size_request(profile.get("batch_size", "auto"))
+    maximum = max(1, int(profile.get("batch_size_max", 32)))
+    identity = (
+        request,
+        maximum,
+        str(profile.get("model") or runtime.get("model_name") or ""),
+        str(runtime.get("device") or profile.get("device") or ""),
+        str(runtime.get("compute_type") or profile.get("compute_type") or ""),
+    )
+    if runtime.get("batch_size_identity") == identity:
+        return int(runtime["batch_size"])
+
+    if isinstance(request, int):
+        batch_size = request
+        source = "configured"
+        memory_info = None
+    else:
+        batch_size, source, memory_info = _automatic_batch_size(
+            device=str(runtime.get("device") or profile.get("device") or ""),
+            model_name=str(
+                profile.get("model") or runtime.get("model_name") or ""
+            ),
+            compute_type=str(
+                runtime.get("compute_type")
+                or profile.get("compute_type")
+                or ""
+            ),
+            maximum=maximum,
+        )
+
+    runtime.update(
+        {
+            "batch_size": batch_size,
+            "batch_size_request": request,
+            "batch_size_source": source,
+            "batch_size_memory": memory_info,
+            "batch_size_identity": identity,
+        }
+    )
+    profile["resolved_batch_size"] = batch_size
+    return batch_size
 
 
 def _session_hotwords(lines: list[dict[str, Any]], max_characters: int = 1200) -> str:
@@ -134,12 +311,18 @@ def _segment_transcription_profile(
                 source_settings.get("beam_size", 5),
             )
         ),
-        "batch_size": max(
+        "batch_size": _batch_size_request(
+            settings.get(
+                "batch_size",
+                source_settings.get("batch_size", "auto"),
+            )
+        ),
+        "batch_size_max": max(
             1,
             int(
                 settings.get(
-                    "batch_size",
-                    source_settings.get("batch_size", 16),
+                    "batch_size_max",
+                    source_settings.get("batch_size_max", 32),
                 )
             ),
         ),
@@ -176,12 +359,14 @@ def _ensure_clip_model(
         f"[segment ASR] Loading {profile['model']} from {model_root}",
         flush=True,
     )
+    check_processing_cancelled()
     model, resolved_device, resolved_compute = _make_model(
         str(profile["model"]),
         device=str(profile["device"]),
         compute_type=str(profile["compute_type"]),
         download_root=model_root,
     )
+    check_processing_cancelled()
     from faster_whisper import BatchedInferencePipeline
 
     runtime.update(
@@ -286,12 +471,14 @@ def _fall_back_clip_runtime_to_cpu(
     profile: dict[str, Any],
     runtime: dict[str, Any],
 ) -> None:
+    check_processing_cancelled()
     model, resolved_device, resolved_compute = _make_model(
         str(profile["model"]),
         device="cpu",
         compute_type="int8",
         download_root=Path(runtime["model_root"]),
     )
+    check_processing_cancelled()
     from faster_whisper import BatchedInferencePipeline
 
     runtime.update(
@@ -302,6 +489,7 @@ def _fall_back_clip_runtime_to_cpu(
             "compute_type": resolved_compute,
         }
     )
+    _resolve_profile_batch_size(profile=profile, runtime=runtime)
 
 
 def _decode_clip(
@@ -331,7 +519,11 @@ def _decode_clip(
             str(audio_path),
             **kwargs,
         )
-        return list(segments_iter), info
+        decoded = []
+        for segment in segments_iter:
+            check_processing_cancelled()
+            decoded.append(segment)
+        return decoded, info
 
     try:
         decoded, info = run_decode()
@@ -464,10 +656,12 @@ def _decode_clips_batched(
     from faster_whisper.audio import decode_audio
 
     sampling_rate = int(runtime["model"].feature_extractor.sampling_rate)
-    waveforms = [
-        decode_audio(str(audio_path), sampling_rate=sampling_rate)
-        for audio_path in audio_paths
-    ]
+    waveforms = []
+    for audio_path in audio_paths:
+        check_processing_cancelled()
+        waveforms.append(
+            decode_audio(str(audio_path), sampling_rate=sampling_rate)
+        )
     offsets: list[tuple[int, int]] = []
     cursor = 0
     for waveform in waveforms:
@@ -491,7 +685,7 @@ def _decode_clips_batched(
         "beam_size": int(profile.get("beam_size", 5)),
         "batch_size": min(
             len(audio_paths),
-            int(profile.get("batch_size", 16)),
+            _resolve_profile_batch_size(profile=profile, runtime=runtime),
         ),
         "word_timestamps": True,
         "without_timestamps": False,
@@ -508,7 +702,11 @@ def _decode_clips_batched(
             combined,
             **kwargs,
         )
-        return list(segments_iter), info
+        decoded = []
+        for segment in segments_iter:
+            check_processing_cancelled()
+            decoded.append(segment)
+        return decoded, info
 
     try:
         decoded, info = run_decode()
@@ -526,6 +724,10 @@ def _decode_clips_batched(
         _fall_back_clip_runtime_to_cpu(
             profile=profile,
             runtime=runtime,
+        )
+        kwargs["batch_size"] = min(
+            len(audio_paths),
+            _resolve_profile_batch_size(profile=profile, runtime=runtime),
         )
         decoded, info = run_decode()
 
@@ -646,6 +848,7 @@ def transcribe_candidate_spans(
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     for segment in segments:
+        check_processing_cancelled()
         segment_id = str(segment["segment_id"])
         if segment_id in seen:
             continue
@@ -709,13 +912,14 @@ def transcribe_candidate_spans(
         profile=profile,
         runtime=runtime,
     )
-    batch_size = int(profile.get("batch_size", 16))
+    batch_size = _resolve_profile_batch_size(profile=profile, runtime=runtime)
     print(
         f"[candidate ASR] {len(results)} cached, {len(pending)} pending "
-        f"(batch size {batch_size})",
+        f"(batch size {batch_size}, {runtime['batch_size_source']})",
         flush=True,
     )
     for batch_start in range(0, len(pending), batch_size):
+        check_processing_cancelled()
         batch = pending[batch_start : batch_start + batch_size]
         print(
             f"[candidate ASR] batch "
@@ -734,6 +938,7 @@ def transcribe_candidate_spans(
         except Exception as batch_error:
             decoded_or_errors = []
             for entry in batch:
+                check_processing_cancelled()
                 try:
                     decoded_or_errors.append(
                         _decode_clips_batched(
@@ -752,6 +957,7 @@ def transcribe_candidate_spans(
                     )
 
         for entry, decoded in zip(batch, decoded_or_errors):
+            check_processing_cancelled()
             segment = entry["segment"]
             segment_id = str(segment["segment_id"])
             if decoded.get("error"):
@@ -918,6 +1124,7 @@ def transcribe_segments_project(
     cached = 0
     prompted_count = 0
     for session_entry in manifest.get("sessions", []):
+        check_processing_cancelled()
         session = session_config.get(session_entry["session_id"])
         if not session:
             continue
@@ -935,12 +1142,13 @@ def transcribe_segments_project(
         print(
             f"[segment ASR] {session['id']}: "
             f"{len(base_segments)} independent clips "
-            f"(batch size {profile['batch_size']})",
+            f"(batch size request {profile['batch_size']})",
             flush=True,
         )
         primary_entries: list[dict[str, Any]] = []
         pending_entries: list[dict[str, Any]] = []
         for segment in base_segments:
+            check_processing_cancelled()
             audio_path = resolve_project_path(project_dir, segment["file"])
             cache_identity = {
                 "kind": "base_segment",
@@ -990,26 +1198,38 @@ def transcribe_segments_project(
                 profile=profile,
                 runtime=runtime,
             )
-        batch_size = int(profile.get("batch_size", 16))
-        for batch_start in range(0, len(pending_entries), batch_size):
-            batch = pending_entries[batch_start : batch_start + batch_size]
-            decoded_batch = _decode_clips_batched(
-                audio_paths=[entry["audio_path"] for entry in batch],
-                project=project,
+            batch_size = _resolve_profile_batch_size(
                 profile=profile,
                 runtime=runtime,
             )
-            for entry, decoded in zip(batch, decoded_batch):
-                primary = _clip_payload(
-                    cache_key=entry["cache_key"],
-                    cache_identity=entry["cache_identity"],
-                    decoding_identity=entry["decoding_identity"],
-                    decoded=decoded,
+            print(
+                f"[segment ASR] {session['id']}: "
+                f"{len(pending_entries)} pending "
+                f"(batch size {batch_size}, {runtime['batch_size_source']})",
+                flush=True,
+            )
+            for batch_start in range(0, len(pending_entries), batch_size):
+                check_processing_cancelled()
+                batch = pending_entries[batch_start : batch_start + batch_size]
+                decoded_batch = _decode_clips_batched(
+                    audio_paths=[entry["audio_path"] for entry in batch],
+                    project=project,
+                    profile=profile,
+                    runtime=runtime,
                 )
-                write_json(entry["cache_path"], primary)
-                entry["primary"] = primary
+                for entry, decoded in zip(batch, decoded_batch):
+                    check_processing_cancelled()
+                    primary = _clip_payload(
+                        cache_key=entry["cache_key"],
+                        cache_identity=entry["cache_identity"],
+                        decoding_identity=entry["decoding_identity"],
+                        decoded=decoded,
+                    )
+                    write_json(entry["cache_path"], primary)
+                    entry["primary"] = primary
 
         for index, entry in enumerate(primary_entries, start=1):
+            check_processing_cancelled()
             segment = entry["segment"]
             audio_path = entry["audio_path"]
             cache_identity = entry["cache_identity"]
@@ -1090,7 +1310,9 @@ def transcribe_segments_project(
         "model": profile["model"],
         "device": runtime.get("device", profile["device"]),
         "compute_type": runtime.get("compute_type", profile["compute_type"]),
-        "batch_size": profile["batch_size"],
+        "batch_size_requested": profile["batch_size"],
+        "batch_size": runtime.get("batch_size", profile["batch_size"]),
+        "batch_size_source": runtime.get("batch_size_source"),
         "processed_segment_count": processed,
         "manifest_cache_hits": cached,
         "prompted_fallback_count": prompted_count,
@@ -1127,6 +1349,96 @@ def transcribe_candidate_span(
     return payload
 
 
+def _recording_cache_identity(
+    *,
+    audio_sha256: str,
+    project: dict[str, Any],
+    settings: dict[str, Any],
+    model_name: str,
+    device: str,
+    compute_type: str,
+    hotwords: str,
+) -> dict[str, Any]:
+    """Describe only inputs that can change an individual ASR result."""
+    return {
+        "kind": "recording_transcript",
+        "audio_sha256": audio_sha256,
+        "decoding": {
+            "model": model_name,
+            "device_request": device,
+            "compute_type_request": compute_type,
+            "language": project.get("language", "en"),
+            "beam_size": int(settings.get("beam_size", 5)),
+            "word_timestamps": True,
+            "without_timestamps": False,
+            "condition_on_previous_text": bool(
+                settings.get("condition_on_previous_text", False)
+            ),
+            "vad_filter": bool(settings.get("vad_filter", True)),
+            "vad_min_silence_ms": int(
+                settings.get("vad_min_silence_ms", 500)
+            ),
+            "hotwords": hotwords,
+        },
+    }
+
+
+def _recording_cache_matches(
+    *,
+    existing: dict[str, Any],
+    cache_key: str,
+    cache_identity: dict[str, Any],
+    settings: dict[str, Any],
+    audio_sha256: str,
+    model_name: str,
+    device: str,
+    compute_type: str,
+    language: str,
+) -> bool:
+    if existing.get("cache_key") == cache_key:
+        return True
+    if existing.get("cache_identity") == cache_identity:
+        return True
+
+    # Compatibility with schema-v1 recording caches, whose hash included
+    # batch_size twice (directly and inside the complete settings object).
+    # Reconstruct both possible old settings shapes so changing only this
+    # execution knob does not discard an already valid transcript.
+    legacy_batch_size = existing.get("batch_size")
+    try:
+        legacy_batch_size = int(legacy_batch_size)
+    except (TypeError, ValueError):
+        return False
+
+    legacy_settings_variants = []
+    for retain_maximum in (True, False):
+        legacy_settings_with_batch = dict(settings)
+        legacy_settings_with_batch["batch_size"] = legacy_batch_size
+        if not retain_maximum:
+            legacy_settings_with_batch.pop("batch_size_max", None)
+        legacy_settings_without_batch = dict(legacy_settings_with_batch)
+        legacy_settings_without_batch.pop("batch_size", None)
+        legacy_settings_variants.extend(
+            (legacy_settings_with_batch, legacy_settings_without_batch)
+        )
+    for legacy_settings in legacy_settings_variants:
+        legacy_key = stable_hash(
+            {
+                "audio_sha256": audio_sha256,
+                "model": model_name,
+                "device_request": device,
+                "compute_type_request": compute_type,
+                "language": language,
+                "batched_inference": True,
+                "batch_size": legacy_batch_size,
+                "settings": legacy_settings,
+            }
+        )
+        if existing.get("cache_key") == legacy_key:
+            return True
+    return False
+
+
 def transcribe_project(
     *,
     project_dir: Path,
@@ -1142,7 +1454,15 @@ def transcribe_project(
     model_name = model_override or settings.get("model", "large-v3")
     device = device_override or settings.get("device", "auto")
     compute_type = settings.get("compute_type", "auto")
-    batch_size = max(1, int(settings.get("batch_size", 16)))
+    batch_request = _batch_size_request(settings.get("batch_size", "auto"))
+    batch_profile = {
+        "model": model_name,
+        "device": device,
+        "compute_type": compute_type,
+        "batch_size": batch_request,
+        "batch_size_max": max(1, int(settings.get("batch_size_max", 32))),
+    }
+    batch_runtime: dict[str, Any] = {}
     model_root = resolve_model_cache_root(project_dir, settings)
     model_root.mkdir(parents=True, exist_ok=True)
     transcript_dir = project_dir / "transcripts"
@@ -1161,9 +1481,11 @@ def transcribe_project(
     batched_model = None
     resolved_device = device
     resolved_compute = compute_type
+    batch_size: int | None = None
     written = []
 
     for index, session in enumerate(sessions, start=1):
+        check_processing_cancelled()
         audio_path = resolve_project_path(project_dir, session["audio"])
         inventory_item = inventory.get(audio_path.resolve())
         if not inventory_item:
@@ -1177,23 +1499,31 @@ def transcribe_project(
             )
             continue
 
-        cache_key_data = {
-            "audio_sha256": inventory_item["sha256"],
-            "model": model_name,
-            "device_request": device,
-            "compute_type_request": compute_type,
-            "language": project.get("language", "en"),
-            "batched_inference": True,
-            "batch_size": batch_size,
-            "settings": settings,
-        }
-        cache_key = stable_hash(cache_key_data)
+        hotwords = _session_hotwords(session_lines)
+        cache_identity = _recording_cache_identity(
+            audio_sha256=inventory_item["sha256"],
+            project=project,
+            settings=settings,
+            model_name=model_name,
+            device=device,
+            compute_type=compute_type,
+            hotwords=hotwords,
+        )
+        cache_key = stable_hash(cache_identity)
         output_path = transcript_dir / f"{session['id']}.json"
         if output_path.exists() and not force:
-            from .util import read_json
-
             existing = read_json(output_path)
-            if existing.get("cache_key") == cache_key:
+            if _recording_cache_matches(
+                existing=existing,
+                cache_key=cache_key,
+                cache_identity=cache_identity,
+                settings=settings,
+                audio_sha256=inventory_item["sha256"],
+                model_name=model_name,
+                device=device,
+                compute_type=compute_type,
+                language=project.get("language", "en"),
+            ):
                 print(
                     f"[transcribe {index}/{len(sessions)}] Cached: {session['id']}",
                     flush=True,
@@ -1202,6 +1532,7 @@ def transcribe_project(
                 continue
 
         if model is None:
+            check_processing_cancelled()
             print(f"[model cache] {model_root}", flush=True)
             model, resolved_device, resolved_compute = _make_model(
                 model_name,
@@ -1209,13 +1540,27 @@ def transcribe_project(
                 compute_type=compute_type,
                 download_root=model_root,
             )
+            check_processing_cancelled()
+            check_processing_cancelled()
             from faster_whisper import BatchedInferencePipeline
 
             batched_model = BatchedInferencePipeline(model=model)
+            batch_runtime.update(
+                {
+                    "model_name": model_name,
+                    "device": resolved_device,
+                    "compute_type": resolved_compute,
+                }
+            )
+            batch_size = _resolve_profile_batch_size(
+                profile=batch_profile,
+                runtime=batch_runtime,
+            )
 
         print(
             f"[transcribe {index}/{len(sessions)}] {session['id']} "
-            f"({resolved_device}/{resolved_compute})",
+            f"({resolved_device}/{resolved_compute}, batch size {batch_size}, "
+            f"{batch_runtime['batch_size_source']})",
             flush=True,
         )
         kwargs = {
@@ -1223,7 +1568,7 @@ def transcribe_project(
             "beam_size": int(settings.get("beam_size", 5)),
             "word_timestamps": True,
             "without_timestamps": False,
-            "batch_size": batch_size,
+            "batch_size": int(batch_size),
             "condition_on_previous_text": bool(
                 settings.get("condition_on_previous_text", False)
             ),
@@ -1234,7 +1579,6 @@ def transcribe_project(
                 )
             },
         }
-        hotwords = _session_hotwords(session_lines)
         if hotwords:
             kwargs["hotwords"] = hotwords
 
@@ -1245,6 +1589,7 @@ def transcribe_project(
             )
             segment_records = []
             for segment in segments_iter:
+                check_processing_cancelled()
                 words = [
                     {
                         "start": word.start,
@@ -1281,42 +1626,60 @@ def transcribe_project(
             from faster_whisper import BatchedInferencePipeline
 
             batched_model = BatchedInferencePipeline(model=model)
+            batch_runtime.update(
+                {
+                    "model_name": model_name,
+                    "device": resolved_device,
+                    "compute_type": resolved_compute,
+                }
+            )
+            batch_size = _resolve_profile_batch_size(
+                profile=batch_profile,
+                runtime=batch_runtime,
+            )
+            kwargs["batch_size"] = batch_size
             segments_iter, info = batched_model.transcribe(
                 str(audio_path),
                 **kwargs,
             )
-            segment_records = [
-                {
-                    "id": segment.id,
-                    "start": segment.start,
-                    "end": segment.end,
-                    "text": segment.text.strip(),
-                    "avg_logprob": segment.avg_logprob,
-                    "no_speech_prob": segment.no_speech_prob,
-                    "words": [
-                        {
-                            "start": word.start,
-                            "end": word.end,
-                            "word": word.word,
-                            "probability": word.probability,
-                        }
-                        for word in (segment.words or [])
-                    ],
-                }
-                for segment in segments_iter
-            ]
+            segment_records = []
+            for segment in segments_iter:
+                check_processing_cancelled()
+                segment_records.append(
+                    {
+                        "id": segment.id,
+                        "start": segment.start,
+                        "end": segment.end,
+                        "text": segment.text.strip(),
+                        "avg_logprob": segment.avg_logprob,
+                        "no_speech_prob": segment.no_speech_prob,
+                        "words": [
+                            {
+                                "start": word.start,
+                                "end": word.end,
+                                "word": word.word,
+                                "probability": word.probability,
+                            }
+                            for word in (segment.words or [])
+                        ],
+                    }
+                )
 
+        check_processing_cancelled()
         payload = {
             "schema_version": 1,
             "session_id": session["id"],
             "audio": session["audio"],
             "audio_sha256": inventory_item["sha256"],
             "cache_key": cache_key,
+            "cache_identity": cache_identity,
             "model": model_name,
             "device": resolved_device,
             "compute_type": resolved_compute,
             "batched_inference": True,
-            "batch_size": batch_size,
+            "batch_size_requested": batch_request,
+            "batch_size": int(batch_size),
+            "batch_size_source": batch_runtime["batch_size_source"],
             "language": info.language,
             "language_probability": info.language_probability,
             "duration_seconds": info.duration,

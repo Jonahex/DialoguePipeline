@@ -4,6 +4,7 @@ import statistics
 from pathlib import Path
 from typing import Any
 
+from .cancellation import check_processing_cancelled
 from .audio import (
     acoustic_regions,
     cut_pcm_wav,
@@ -132,6 +133,7 @@ def segment_project(
         raise ValueError("No enabled sessions matched the requested filter.")
 
     for index, session in enumerate(sessions, start=1):
+        check_processing_cancelled()
         transcript_path = transcript_dir / f"{session['id']}.json"
         if not transcript_path.is_file():
             raise FileNotFoundError(
@@ -185,6 +187,7 @@ def segment_project(
             channels=output_channels,
             bits_per_sample=output_bits,
         )
+        check_processing_cancelled()
         if normalized:
             print(
                 f"[segment {index}/{len(sessions)}] Using normalized PCM source: "
@@ -202,6 +205,7 @@ def segment_project(
                 settings.get("silence_detection_min_seconds", 0.35)
             ),
         )
+        check_processing_cancelled()
         sample_rate = working_shape["sample_rate"]
         source_frames = working_shape["frame_count"]
         duration_seconds = source_frames / sample_rate
@@ -231,6 +235,7 @@ def segment_project(
             flush=True,
         )
         for segment_index, region in enumerate(regions, start=1):
+            check_processing_cancelled()
             segment_id = f"{session['id']}__s{segment_index:05d}"
             output_path = session_dir / f"{segment_id}.wav"
             start_sample = seconds_to_sample(region["start"], sample_rate)
@@ -309,6 +314,7 @@ def segment_project(
         "settings": settings,
         "sessions": session_outputs,
     }
+    check_processing_cancelled()
     write_json(manifest_path, manifest)
     return manifest_path
 

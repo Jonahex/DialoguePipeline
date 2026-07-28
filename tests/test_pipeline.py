@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import subprocess
+import threading
 import wave
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,7 +31,16 @@ from dialogue_pipeline.alignment_settings import (
     default_alignment_config,
 )
 from dialogue_pipeline.audio import cut_pcm_wav, prepare_pcm_segmentation_source
+from dialogue_pipeline.cancellation import (
+    ProcessingCancelled,
+    cancellation_scope,
+    check_processing_cancelled,
+)
 from dialogue_pipeline.finalize import finalize_review
+from dialogue_pipeline.project import (
+    create_project,
+    editable_project_settings,
+)
 from dialogue_pipeline.review import (
     build_line_review,
     load_line_review,
@@ -43,12 +53,15 @@ from dialogue_pipeline.segmentation import (
     split_regions_on_word_gaps,
 )
 from dialogue_pipeline.transcription import (
+    _automatic_batch_size,
     transcribe_candidate_span,
     transcribe_candidate_spans,
     transcribe_project,
     transcribe_segments_project,
 )
 from dialogue_pipeline.ui import (
+    DialogueReviewApp,
+    _project_settings_from_values,
     _selected_segment_score,
     _uses_unmatched_candidates,
 )
@@ -57,6 +70,7 @@ from dialogue_pipeline.util import (
     read_json,
     resolve_model_cache_root,
     sha256_file,
+    stable_hash,
     write_json,
 )
 from dialogue_pipeline.workbook_io import parse_workbook
@@ -149,6 +163,305 @@ def test_sample_workbook_schema() -> None:
     assert result["sheet_count"] == 21
     assert result["line_count"] == 457
     assert len({line["target_filename"] for line in result["lines"]}) == 457
+
+
+def test_new_project_settings_are_validated_and_merged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.project as project_module
+
+    workbook = tmp_path / "lines.xlsx"
+    workbook.touch()
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    _write_tone(audio_dir / "Actor.wav")
+    monkeypatch.setattr(
+        project_module,
+        "parse_workbook",
+        lambda _path: {
+            "sheet_count": 1,
+            "line_count": 0,
+            "sheets": [
+                {
+                    "name": "Actor",
+                    "line_count": 0,
+                    "voice_header": "",
+                }
+            ],
+            "lines": [],
+        },
+    )
+    values = editable_project_settings()
+    values["language"] = "de"
+    values["transcription"].update(
+        {
+            "model": "medium",
+            "device": "cuda",
+            "compute_type": "float16",
+            "batch_size": "8",
+            "batch_size_max": "24",
+        }
+    )
+    values["segment_transcription"]["enabled"] = False
+    settings = _project_settings_from_values(
+        values,
+        editable_project_settings(),
+    )
+
+    project = create_project(
+        workbook_path=workbook,
+        audio_dir=audio_dir,
+        project_dir=tmp_path / "work",
+        project_settings=settings,
+    )
+
+    assert project["language"] == "de"
+    assert project["transcription"]["model"] == "medium"
+    assert project["transcription"]["batch_size"] == 8
+    assert project["transcription"]["batch_size_max"] == 24
+    assert project["transcription"]["vad_filter"] is True
+    assert project["segment_transcription"]["enabled"] is False
+    assert project["segment_transcription"]["prompt_fallback_enabled"] is True
+    assert set(settings) == {
+        "language",
+        "transcription",
+        "segment_transcription",
+        "segmentation",
+        "alignment",
+        "export",
+    }
+
+    invalid = editable_project_settings()
+    invalid["transcription"]["batch_size"] = "zero"
+    with pytest.raises(ValueError, match="Batch size"):
+        _project_settings_from_values(
+            invalid,
+            editable_project_settings(),
+        )
+
+
+def test_create_button_shows_existing_settings_before_reprocessing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.ui as ui_module
+
+    project_dir = tmp_path / "existing"
+    project_dir.mkdir()
+    write_json(project_dir / "project.json", {"schema_version": 1})
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    selected = []
+    shown = []
+
+    def settings_dialog(settings, *, reprocessing):
+        shown.append((settings, reprocessing))
+        return settings
+
+    app.ask_project_settings = settings_dialog
+    app.run_existing_project = lambda path, settings: selected.append(
+        (path, settings)
+    )
+    app.run_new_project = lambda **_kwargs: pytest.fail(
+        "Existing projects must not be initialized again"
+    )
+    monkeypatch.setattr(
+        ui_module.filedialog,
+        "askdirectory",
+        lambda **_kwargs: str(project_dir),
+    )
+    monkeypatch.setattr(
+        ui_module.filedialog,
+        "askopenfilename",
+        lambda **_kwargs: pytest.fail(
+            "Existing projects must not ask for a workbook"
+        ),
+    )
+
+    app.choose_new_project()
+
+    assert len(shown) == 1
+    assert shown[0][1] is True
+    assert shown[0][0] == editable_project_settings({"schema_version": 1})
+    assert selected == [(project_dir.resolve(), shown[0][0])]
+
+
+def test_create_button_collects_settings_only_for_new_project(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.ui as ui_module
+
+    project_dir = tmp_path / "new"
+    workbook = tmp_path / "lines.xlsx"
+    audio_dir = tmp_path / "audio"
+    settings = {"language": "en", "transcription": {"model": "small"}}
+    selected_directories = iter((str(project_dir), str(audio_dir)))
+    monkeypatch.setattr(
+        ui_module.filedialog,
+        "askdirectory",
+        lambda **_kwargs: next(selected_directories),
+    )
+    monkeypatch.setattr(
+        ui_module.filedialog,
+        "askopenfilename",
+        lambda **_kwargs: str(workbook),
+    )
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    app.ask_project_settings = (
+        lambda current, *, reprocessing: (
+            settings
+            if not reprocessing and current == editable_project_settings()
+            else pytest.fail("Unexpected settings dialog state")
+        )
+    )
+    captured = {}
+    app.run_new_project = lambda **kwargs: captured.update(kwargs)
+    app.run_existing_project = lambda _path, _settings: pytest.fail(
+        "A new folder must initialize a project"
+    )
+
+    app.choose_new_project()
+
+    assert captured == {
+        "workbook_path": workbook,
+        "audio_dir": audio_dir,
+        "project_dir": project_dir.resolve(),
+        "project_settings": settings,
+    }
+
+
+def test_existing_project_reprocess_pipeline_preserves_folder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.ui as ui_module
+
+    project_dir = tmp_path / "existing"
+    project_dir.mkdir()
+    write_json(
+        project_dir / "project.json",
+        {"schema_version": 1, "custom_setting": "keep-me"},
+    )
+    sentinel = project_dir / "do-not-delete.txt"
+    sentinel.write_text("preserved", encoding="utf-8")
+    calls = []
+
+    def record(phase: str):
+        def run(*, project_dir: Path, project: dict, **_kwargs):
+            calls.append((phase, project_dir, project["custom_setting"]))
+
+        return run
+
+    monkeypatch.setattr(ui_module, "transcribe_project", record("transcribe"))
+    monkeypatch.setattr(ui_module, "segment_project", record("segment"))
+    monkeypatch.setattr(
+        ui_module,
+        "transcribe_segments_project",
+        record("transcribe_segments"),
+    )
+    monkeypatch.setattr(ui_module, "align_project", record("align"))
+    monkeypatch.setattr(
+        ui_module,
+        "create_project",
+        lambda **_kwargs: pytest.fail(
+            "Reprocessing must not recreate project.json"
+        ),
+    )
+
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    progress = []
+    finished = []
+    app.show_progress = lambda path, *, title: progress.append((path, title))
+    app._pipeline_finished = lambda path: finished.append(path)
+    app._start_worker = lambda function, callback: callback(function())
+
+    project_settings = editable_project_settings(
+        {
+            "schema_version": 1,
+            "custom_setting": "keep-me",
+        }
+    )
+    project_settings["language"] = "fr"
+    app.run_existing_project(project_dir, project_settings)
+
+    assert [phase for phase, _path, _setting in calls] == [
+        "transcribe",
+        "segment",
+        "transcribe_segments",
+        "align",
+    ]
+    assert all(path == project_dir.resolve() for _phase, path, _setting in calls)
+    assert all(setting == "keep-me" for _phase, _path, setting in calls)
+    assert progress == [(project_dir, "Reprocessing project")]
+    assert finished == [project_dir.resolve()]
+    assert sentinel.read_text(encoding="utf-8") == "preserved"
+    saved_project = read_json(project_dir / "project.json")
+    assert saved_project["custom_setting"] == "keep-me"
+    assert saved_project["language"] == "fr"
+
+
+def test_processing_cancellation_scope_is_thread_local() -> None:
+    event = threading.Event()
+    with cancellation_scope(event):
+        check_processing_cancelled()
+        event.set()
+        with pytest.raises(ProcessingCancelled):
+            check_processing_cancelled()
+    check_processing_cancelled()
+
+
+def test_project_creation_stops_before_writing_when_already_cancelled(
+    tmp_path: Path,
+) -> None:
+    workbook = tmp_path / "lines.xlsx"
+    workbook.touch()
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    event = threading.Event()
+    event.set()
+
+    with cancellation_scope(event), pytest.raises(ProcessingCancelled):
+        create_project(
+            workbook_path=workbook,
+            audio_dir=audio_dir,
+            project_dir=tmp_path / "work",
+        )
+
+    assert not (tmp_path / "work").exists()
+
+
+def test_processing_screen_cancel_signals_worker_and_returns_to_start() -> None:
+    class FakeRoot:
+        def after(self, _delay, _callback):
+            return None
+
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    app.root = FakeRoot()
+    app._cancel_event = threading.Event()
+    app._cancel_button = None
+    app._cancel_status = None
+    app._worker_messages = None
+    app._worker_thread = None
+    app._progress = None
+    app._log_text = None
+    starts = []
+    completions = []
+    app.show_start = lambda: starts.append(True)
+    app._pipeline_failed = lambda error: pytest.fail(str(error))
+
+    app.cancel_processing()
+    app._start_worker(
+        lambda: check_processing_cancelled(),
+        lambda result: completions.append(result),
+    )
+    assert app._worker_thread is not None
+    app._worker_thread.join(timeout=2)
+    app._poll_worker()
+
+    assert starts == [True]
+    assert completions == []
+    assert app._worker_messages is None
 
 
 def test_text_similarity() -> None:
@@ -2448,7 +2761,42 @@ def test_segment_asr_batches_independent_clips_with_configured_size(
     )
 
 
-def test_recording_asr_uses_batched_pipeline_with_default_size(
+def test_automatic_batch_size_uses_free_gpu_memory_conservatively() -> None:
+    batch_size, source, memory = _automatic_batch_size(
+        device="cuda",
+        model_name="large-v3",
+        compute_type="float16",
+        memory_info={
+            "index": 0,
+            "name": "Test GPU",
+            "total_mib": 16384,
+            "free_mib": 10000,
+        },
+    )
+    assert batch_size == 16
+    assert "10000 MiB free" in source
+    assert memory and memory["name"] == "Test GPU"
+
+    assert _automatic_batch_size(
+        device="cuda",
+        model_name="large-v3",
+        compute_type="float16",
+        maximum=8,
+        memory_info={
+            "index": 0,
+            "name": "Test GPU",
+            "total_mib": 16384,
+            "free_mib": 10000,
+        },
+    )[0] == 8
+    assert _automatic_batch_size(
+        device="cpu",
+        model_name="large-v3",
+        compute_type="int8",
+    )[0] == 1
+
+
+def test_recording_asr_auto_sizes_cpu_and_batch_changes_reuse_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2536,11 +2884,47 @@ def test_recording_asr_uses_batched_pipeline_with_default_size(
     )
 
     assert len(outputs) == 1
-    assert calls[0]["batch_size"] == 16
+    assert calls[0]["batch_size"] == 1
     assert calls[0]["without_timestamps"] is False
     payload = read_json(outputs[0])
     assert payload["batched_inference"] is True
-    assert payload["batch_size"] == 16
+    assert payload["batch_size_requested"] == "auto"
+    assert payload["batch_size"] == 1
+
+    stable_cache_key = payload["cache_key"]
+    project["transcription"]["batch_size"] = 8
+    cached_outputs = transcribe_project(
+        project_dir=tmp_path,
+        project=project,
+    )
+    assert len(calls) == 1
+    assert read_json(cached_outputs[0])["cache_key"] == stable_cache_key
+
+    # A cache written by the previous schema is also reusable when only the
+    # batch size changes.
+    legacy_settings = dict(project["transcription"])
+    legacy_settings.pop("batch_size")
+    legacy_batch_size = 16
+    payload.pop("cache_identity")
+    payload.pop("batch_size_requested")
+    payload.pop("batch_size_source")
+    payload["batch_size"] = legacy_batch_size
+    payload["cache_key"] = stable_hash(
+        {
+            "audio_sha256": "source-hash",
+            "model": "large-v3",
+            "device_request": "cpu",
+            "compute_type_request": "int8",
+            "language": "en",
+            "batched_inference": True,
+            "batch_size": legacy_batch_size,
+            "settings": legacy_settings,
+        }
+    )
+    write_json(outputs[0], payload)
+    project["transcription"]["batch_size"] = 4
+    transcribe_project(project_dir=tmp_path, project=project)
+    assert len(calls) == 1
 
 
 def test_prompted_segment_asr_is_evidence_but_cannot_verify_auto_ok(
@@ -2801,6 +3185,7 @@ def test_candidate_span_asr_batches_unique_uncached_spans(
         segments=[segments[0], segments[1], segments[0], segments[2]],
         runtime=runtime,
     )
+    project["segment_transcription"]["batch_size"] = 8
     cached = transcribe_candidate_spans(
         project_dir=tmp_path,
         project=project,

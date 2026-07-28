@@ -35,10 +35,18 @@ Launch the complete create/review/finalize workflow with:
 ```
 
 `Open Project` accepts a project directory containing `project.json` and
-`line_review.json`. `Create New Project` asks for the lines workbook, recorded
-WAV directory, and a destination project directory, then runs inventory,
-transcription, segmentation, segment transcription, and alignment in the
-background while showing the pipeline log.
+`line_review.json`. `Create or Reprocess Project` first asks for a destination.
+If it already contains `project.json`, the existing configuration, mappings,
+caches, and manual selections are preserved. A scrollable settings dialog
+shows every editable project setting in collapsible General, Transcription,
+Segment Transcription, Segmentation, Alignment, and Export groups before the
+cache-aware pipeline runs again. New destinations use the same settings dialog
+after the UI asks for the lines workbook and recorded WAV directory, then run
+inventory, transcription, segmentation, segment transcription, and alignment
+in the background while showing the pipeline log.
+The processing screen includes `Cancel`. Cancellation stops further work at the
+next safe inventory, ASR, segmentation, or alignment boundary and returns to
+the start screen without treating the cancellation as a pipeline failure.
 
 The review screen lists script lines on the left and candidate segments on the
 right. Filter lines by status, click a line-column header to sort, use the `▶`
@@ -79,7 +87,12 @@ user-level cache shown by `doctor` (on Windows, normally
 `DIALOGUE_VA_MODEL_CACHE` to choose a different shared location, or set
 `transcription.model_cache` in `project.json` for an explicit project override.
 Recording transcription uses batched inference; configure
-`transcription.batch_size` (default `16`) according to available GPU memory.
+`transcription.batch_size` (default `"auto"`) to have the pipeline choose a
+conservative batch from currently free GPU memory after the model is loaded.
+Set a positive integer for an explicit override, and optionally lower
+`transcription.batch_size_max` from its default of `32` to cap automatic
+sizing. CPU execution and unavailable GPU telemetry fall back to batch size
+`1`.
 Use `--device cpu` when the CUDA 12/cuDNN 9 runtime is unavailable. For a quick
 experiment, override the model:
 
@@ -124,8 +137,9 @@ pre/post padding from segmentation.
 
 Independent clips are decoded in batches for substantially better accelerator
 utilization. Configure the number of clips per inference batch with
-`segment_transcription.batch_size`; the default is `16`. Reduce it if GPU
-memory is insufficient.
+`segment_transcription.batch_size`; the default is `"auto"` and uses the same
+free-GPU-memory calculation. A positive integer is a fixed override, while
+`segment_transcription.batch_size_max` caps automatic sizing (default `32`).
 
 Unprompted clip ASR is the canonical evidence. When it is empty, low-confidence,
 or has poor ordered similarity, a second script-prompted decode may be stored
@@ -256,7 +270,9 @@ has an unprompted independent transcript. Base candidates reuse their
 base-clip result; serious merged candidates are decoded again as one continuous
 span and cached separately. Uncached merged spans are deduplicated and decoded
 in batches using `segment_transcription.batch_size`; changing only batch size
-does not invalidate their transcript cache. The resulting exact-span text—not the concatenated
+does not invalidate recording, base-clip, or candidate-span transcript caches,
+including caches written by older versions. The resulting exact-span text—not
+the concatenated
 base transcripts or script-prompted fallback—drives the final similarity,
 clause, extra-word, and repetition gates. Empty or failed verification receives
 `EXACT_SPAN_ASR_FAILED`.

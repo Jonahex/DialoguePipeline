@@ -9,6 +9,8 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Iterable
 
+from .cancellation import check_processing_cancelled
+
 
 def read_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
@@ -36,6 +38,7 @@ def sha256_file(path: Path, chunk_size: int = 4 * 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         while chunk := handle.read(chunk_size):
+            check_processing_cancelled()
             digest.update(chunk)
     return digest.hexdigest()
 

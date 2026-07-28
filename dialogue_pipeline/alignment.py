@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from rapidfuzz import fuzz
 
 from .alignment_settings import AlignmentSettings
+from .cancellation import check_processing_cancelled
 from .project import load_source_data
 from .review import (
     REVIEW_FILE_NAME,
@@ -959,6 +960,7 @@ def order_independent_align(
         [] for _ in range(segment_count)
     ]
     for segment_index in range(segment_count):
+        check_processing_cancelled()
         for count in span_catalog.counts_from(
             segment_index,
             maximum=max_merge,
@@ -1529,6 +1531,7 @@ def _multisentence_fragment_join_actions(
                 complete_line_indexes.add(line_index)
 
     for seed_action in ordered_actions:
+        check_processing_cancelled()
         line_index = int(seed_action["line_index"])
         line = lines[line_index]
         if (
@@ -1917,6 +1920,7 @@ def _intra_segment_trim_actions(
     proposals: list[dict[str, Any]] = []
     seen: set[tuple[int, int, int, int]] = set()
     for source_action in actions:
+        check_processing_cancelled()
         if int(source_action["count"]) != 1:
             continue
         base_index = int(source_action["start_index"])
@@ -2618,6 +2622,7 @@ def align_project(
     if not selected_sessions:
         raise ValueError("No enabled sessions matched the requested filter.")
     for session_index, session in enumerate(selected_sessions, start=1):
+        check_processing_cancelled()
         session_entry = manifest_session_by_id.get(session["id"])
         if not session_entry:
             raise KeyError(f"Segments missing for session: {session['id']}")
@@ -2651,6 +2656,7 @@ def align_project(
             evaluator=evaluator,
             span_catalog=span_catalog,
         )
+        check_processing_cancelled()
         fragment_join_actions = _multisentence_fragment_join_actions(
             primary_actions,
             lines=session_lines,
@@ -2660,6 +2666,7 @@ def align_project(
             evaluator=evaluator,
             span_catalog=span_catalog,
         )
+        check_processing_cancelled()
         intra_segment_trim_actions = _intra_segment_trim_actions(
             primary_actions,
             lines=session_lines,
@@ -2668,6 +2675,7 @@ def align_project(
             settings=settings,
             evaluator=evaluator,
         )
+        check_processing_cancelled()
         candidate_actions = sorted(
             [
                 *primary_actions,
@@ -2701,6 +2709,7 @@ def align_project(
         ] = {}
         verification_segments: dict[str, dict[str, Any]] = {}
         for action in actions:
+            check_processing_cancelled()
             span_key = _action_span_key(action)
             segment = materialized_by_span.get(span_key)
             if segment is None:
@@ -2751,6 +2760,7 @@ def align_project(
         ]
         exact_scores_by_segment: dict[str, list[float]] = {}
         for segment_id, exact_asr in exact_asr_by_segment.items():
+            check_processing_cancelled()
             exact_text = str(exact_asr.get("transcript") or "").strip()
             if exact_text and not exact_asr.get("error"):
                 exact_scores_by_segment[segment_id] = _exact_line_scores(
@@ -2780,6 +2790,7 @@ def align_project(
         serialized_actions = []
 
         for action in actions:
+            check_processing_cancelled()
             line = session_lines[action["line_index"]]
             segment = materialized_by_span[_action_span_key(action)]
             preliminary_transcript = str(
@@ -3067,6 +3078,7 @@ def align_project(
             serialized_actions.append(candidate)
 
         for base_index, segment in enumerate(base_segments):
+            check_processing_cancelled()
             if base_index in reliable_coverage:
                 continue
             transcript = segment.get("transcript", "")
@@ -3138,6 +3150,7 @@ def align_project(
 
     by_line: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for candidate in candidates:
+        check_processing_cancelled()
         by_line[candidate["line_id"]].append(candidate)
     for line_candidates in by_line.values():
         line_candidates.sort(
@@ -3161,6 +3174,7 @@ def align_project(
             ),
         ),
     }
+    check_processing_cancelled()
     alignment_path = project_dir / "alignment.json"
     write_json(alignment_path, alignment_payload)
     write_json(manifest_path, manifest)

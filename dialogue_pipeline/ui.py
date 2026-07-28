@@ -13,8 +13,19 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from .alignment import align_project
+from .alignment_settings import AlignmentSettings
+from .cancellation import (
+    ProcessingCancelled,
+    cancellation_scope,
+    check_processing_cancelled,
+)
 from .finalize import finalize_review
-from .project import create_project, load_project
+from .project import (
+    apply_project_settings,
+    create_project,
+    editable_project_settings,
+    load_project,
+)
 from .review import (
     LINE_STATUSES,
     REVIEW_FILE_NAME,
@@ -24,10 +35,19 @@ from .review import (
 )
 from .segmentation import segment_project
 from .transcription import transcribe_project, transcribe_segments_project
-from .util import project_file_from_arg
+from .util import project_file_from_arg, write_json
 
 
 APP_TITLE = "Dialogue VA Pipeline"
+COMPUTE_TYPES = (
+    "auto",
+    "float16",
+    "int8",
+    "int8_float16",
+    "int8_float32",
+    "bfloat16",
+    "float32",
+)
 STATUS_COLORS = {
     "AUTO_OK": "#dcfce7",
     "REVIEW": "#fef3c7",
@@ -118,6 +138,477 @@ class QueueWriter:
         return None
 
 
+def _configured_batch_size(value: Any) -> int | str:
+    normalized = str(value).strip().lower()
+    if normalized == "auto":
+        return "auto"
+    try:
+        batch_size = int(normalized)
+    except ValueError as error:
+        raise ValueError(
+            "Batch size must be 'auto' or a positive integer."
+        ) from error
+    if batch_size < 1:
+        raise ValueError("Batch size must be 'auto' or a positive integer.")
+    return batch_size
+
+
+def _setting_label(key: str) -> str:
+    replacements = {
+        "asr": "ASR",
+        "rms": "RMS",
+        "vad": "VAD",
+    }
+    return " ".join(
+        replacements.get(part, part.capitalize())
+        for part in key.split("_")
+    )
+
+
+def _set_nested_value(
+    target: dict[str, Any],
+    path: tuple[str, ...],
+    value: Any,
+) -> None:
+    current = target
+    for component in path[:-1]:
+        current = current.setdefault(component, {})
+    current[path[-1]] = value
+
+
+def _parse_setting_value(
+    path: tuple[str, ...],
+    value: Any,
+    original: Any,
+) -> Any:
+    label = ".".join(path)
+    if isinstance(original, bool):
+        return bool(value)
+
+    text = str(value).strip()
+    if path[-1] == "batch_size":
+        return _configured_batch_size(text)
+    if original is None:
+        return None if value is None or not text else text
+    if isinstance(original, int):
+        try:
+            return int(text)
+        except ValueError as error:
+            raise ValueError(f"{label} must be an integer.") from error
+    if isinstance(original, float):
+        try:
+            return float(text)
+        except ValueError as error:
+            raise ValueError(f"{label} must be a number.") from error
+    return text
+
+
+def _project_settings_from_values(
+    values: dict[str, Any],
+    template: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    template = template or editable_project_settings()
+
+    def parse_tree(
+        raw: dict[str, Any],
+        expected: dict[str, Any],
+        path: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        parsed = {}
+        for key, original in expected.items():
+            raw_value = raw.get(key, original)
+            if isinstance(original, dict):
+                if not isinstance(raw_value, dict):
+                    raise ValueError(f"{'.'.join((*path, key))} must be a group.")
+                parsed[key] = parse_tree(
+                    raw_value,
+                    original,
+                    (*path, key),
+                )
+            else:
+                parsed[key] = _parse_setting_value(
+                    (*path, key),
+                    raw_value,
+                    original,
+                )
+        return parsed
+
+    settings = parse_tree(values, template)
+    language = str(settings.get("language") or "").strip()
+    if not language:
+        raise ValueError("Language cannot be empty.")
+    settings["language"] = language
+
+    for section_name in ("transcription", "segment_transcription"):
+        section = settings.get(section_name) or {}
+        model = section.get("model")
+        if section_name == "transcription" and not str(model or "").strip():
+            raise ValueError("transcription.model cannot be empty.")
+        device = section.get("device")
+        if device is not None and str(device).lower() not in {"auto", "cuda", "cpu"}:
+            raise ValueError(f"{section_name}.device must be auto, cuda, or cpu.")
+        compute_type = section.get("compute_type")
+        if (
+            compute_type is not None
+            and str(compute_type).lower() not in COMPUTE_TYPES
+        ):
+            raise ValueError(
+                f"{section_name}.compute_type must be one of: "
+                f"{', '.join(COMPUTE_TYPES)}."
+            )
+        if int(section.get("beam_size", 1)) < 1:
+            raise ValueError(f"{section_name}.beam_size must be positive.")
+        if int(section.get("batch_size_max", 1)) < 1:
+            raise ValueError(
+                f"{section_name}.batch_size_max must be positive."
+            )
+
+    if "alignment" in settings:
+        AlignmentSettings.from_value(settings["alignment"])
+    export = settings.get("export") or {}
+    if export:
+        if int(export.get("sample_rate", 0)) < 1:
+            raise ValueError("export.sample_rate must be positive.")
+        if int(export.get("channels", 0)) < 1:
+            raise ValueError("export.channels must be positive.")
+        if int(export.get("bits_per_sample", 0)) != 16:
+            raise ValueError("export.bits_per_sample must be 16.")
+        extension = str(export.get("extension") or "").strip()
+        if not extension.startswith(".") or len(extension) < 2:
+            raise ValueError("export.extension must start with a dot.")
+        export["extension"] = extension
+    return settings
+
+
+class CollapsibleSettingsGroup:
+    def __init__(
+        self,
+        parent: tk.Misc,
+        title: str,
+        *,
+        expanded: bool,
+    ) -> None:
+        self.title = title
+        self.expanded = expanded
+        self.frame = ttk.Frame(parent)
+        self.frame.pack(fill="x", pady=(0, 7))
+        self.button = ttk.Button(
+            self.frame,
+            command=self.toggle,
+            style="Heading.TButton",
+        )
+        self.button.pack(fill="x")
+        self.body = ttk.Frame(self.frame, padding=(18, 10, 12, 12))
+        self.body.columnconfigure(1, weight=1)
+        self._render()
+
+    def _render(self) -> None:
+        self.button.configure(
+            text=f"{'▼' if self.expanded else '▶'}  {self.title}"
+        )
+        if self.expanded:
+            self.body.pack(fill="x")
+        else:
+            self.body.pack_forget()
+
+    def toggle(self) -> None:
+        self.expanded = not self.expanded
+        self._render()
+
+    def set_expanded(self, expanded: bool) -> None:
+        self.expanded = expanded
+        self._render()
+
+
+class ProjectSettingsDialog:
+    def __init__(
+        self,
+        parent: tk.Misc,
+        settings: dict[str, Any],
+        *,
+        title: str,
+        submit_label: str,
+    ) -> None:
+        self.result: dict[str, Any] | None = None
+        self.settings = settings
+        self.fields: list[tuple[tuple[str, ...], tk.Variable, Any]] = []
+        self.groups: list[CollapsibleSettingsGroup] = []
+
+        self.window = tk.Toplevel(parent)
+        self.window.title(title)
+        self.window.geometry("860x760")
+        self.window.minsize(680, 520)
+        self.window.transient(parent)
+        self.window.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.window.columnconfigure(0, weight=1)
+        self.window.rowconfigure(1, weight=1)
+
+        heading = ttk.Frame(self.window, padding=(24, 20, 24, 10))
+        heading.grid(row=0, column=0, sticky="ew")
+        heading.columnconfigure(0, weight=1)
+        ttk.Label(
+            heading,
+            text=title,
+            style="Heading.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            heading,
+            text=(
+                "Every editable project.json setting is available below. "
+                "Expand a group to inspect or change it."
+            ),
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        controls = ttk.Frame(heading)
+        controls.grid(row=0, column=1, rowspan=2, sticky="e")
+        ttk.Button(
+            controls,
+            text="Expand all",
+            command=lambda: self._set_all_groups(True),
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            controls,
+            text="Collapse all",
+            command=lambda: self._set_all_groups(False),
+        ).pack(side="left")
+
+        content = ttk.Frame(self.window)
+        content.grid(row=1, column=0, sticky="nsew", padx=(24, 8))
+        content.columnconfigure(0, weight=1)
+        content.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(content, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(
+            content,
+            orient="vertical",
+            command=self.canvas.yview,
+        )
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.form = ttk.Frame(self.canvas)
+        self.form_window = self.canvas.create_window(
+            (0, 0),
+            window=self.form,
+            anchor="nw",
+        )
+        self.form.bind(
+            "<Configure>",
+            lambda _event: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")
+            ),
+        )
+        self.canvas.bind(
+            "<Configure>",
+            lambda event: self.canvas.itemconfigure(
+                self.form_window,
+                width=event.width,
+            ),
+        )
+        self.canvas.bind(
+            "<Enter>",
+            lambda _event: self.canvas.bind_all(
+                "<MouseWheel>",
+                self._on_mousewheel,
+            ),
+        )
+        self.canvas.bind(
+            "<Leave>",
+            lambda _event: self.canvas.unbind_all("<MouseWheel>"),
+        )
+
+        general = {
+            key: value
+            for key, value in settings.items()
+            if not isinstance(value, dict)
+        }
+        grouped = [
+            (key, value)
+            for key, value in settings.items()
+            if isinstance(value, dict)
+        ]
+        if general:
+            self._add_group(
+                "General",
+                general,
+                (),
+                expanded=True,
+            )
+        for index, (key, value) in enumerate(grouped):
+            self._add_group(
+                _setting_label(key),
+                value,
+                (key,),
+                expanded=index == 0,
+            )
+
+        buttons = ttk.Frame(self.window, padding=(24, 12, 24, 20))
+        buttons.grid(row=2, column=0, sticky="ew")
+        ttk.Button(buttons, text="Cancel", command=self.cancel).pack(
+            side="right",
+        )
+        ttk.Button(
+            buttons,
+            text=submit_label,
+            style="Primary.TButton",
+            command=self.accept,
+        ).pack(side="right", padx=(0, 8))
+
+        self.window.bind("<Escape>", lambda _event: self.cancel())
+        self.window.update_idletasks()
+        x = parent.winfo_rootx() + max(
+            0,
+            (parent.winfo_width() - self.window.winfo_width()) // 2,
+        )
+        y = parent.winfo_rooty() + max(
+            0,
+            (parent.winfo_height() - self.window.winfo_height()) // 2,
+        )
+        self.window.geometry(f"+{x}+{y}")
+        self.window.wait_visibility()
+        self.window.grab_set()
+        self.window.wait_window()
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def _set_all_groups(self, expanded: bool) -> None:
+        for group in self.groups:
+            group.set_expanded(expanded)
+        self.form.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _add_group(
+        self,
+        title: str,
+        values: dict[str, Any],
+        path: tuple[str, ...],
+        *,
+        expanded: bool,
+    ) -> None:
+        group = CollapsibleSettingsGroup(
+            self.form,
+            title,
+            expanded=expanded,
+        )
+        self.groups.append(group)
+        self._add_fields(group.body, values, path)
+
+    def _add_fields(
+        self,
+        parent: ttk.Frame,
+        values: dict[str, Any],
+        path: tuple[str, ...],
+        *,
+        depth: int = 0,
+        row: int = 0,
+    ) -> int:
+        for key, value in values.items():
+            field_path = (*path, key)
+            if isinstance(value, dict):
+                ttk.Label(
+                    parent,
+                    text=_setting_label(key),
+                    style="FieldName.TLabel",
+                ).grid(
+                    row=row,
+                    column=0,
+                    columnspan=2,
+                    sticky="w",
+                    padx=(depth * 14, 0),
+                    pady=(10, 3),
+                )
+                row += 1
+                row = self._add_fields(
+                    parent,
+                    value,
+                    field_path,
+                    depth=depth + 1,
+                    row=row,
+                )
+                continue
+
+            ttk.Label(
+                parent,
+                text=_setting_label(key),
+            ).grid(
+                row=row,
+                column=0,
+                sticky="w",
+                padx=(depth * 14, 18),
+                pady=4,
+            )
+            variable, widget = self._setting_widget(
+                parent,
+                field_path,
+                value,
+            )
+            widget.grid(row=row, column=1, sticky="ew", pady=4)
+            self.fields.append((field_path, variable, value))
+            row += 1
+        return row
+
+    def _setting_widget(
+        self,
+        parent: ttk.Frame,
+        path: tuple[str, ...],
+        value: Any,
+    ) -> tuple[tk.Variable, tk.Widget]:
+        if isinstance(value, bool):
+            variable = tk.BooleanVar(value=value)
+            return variable, ttk.Checkbutton(parent, variable=variable)
+
+        display_value = "" if value is None else str(value)
+        variable = tk.StringVar(value=display_value)
+        key = path[-1]
+        choices: tuple[str, ...] | None = None
+        readonly = False
+        if key == "device":
+            choices = ("", "auto", "cuda", "cpu")
+            readonly = True
+        elif key == "compute_type":
+            choices = ("", *COMPUTE_TYPES)
+            readonly = True
+        elif key == "batch_size":
+            choices = ("auto", "1", "2", "4", "8", "12", "16", "24", "32")
+        elif key in {"policy", "duplicate_line_policy"}:
+            choices = ("review", "weak_order", "reuse")
+            readonly = True
+        elif key == "bits_per_sample":
+            choices = ("16",)
+            readonly = True
+
+        if choices is not None:
+            return variable, ttk.Combobox(
+                parent,
+                textvariable=variable,
+                values=choices,
+                state="readonly" if readonly else "normal",
+            )
+        return variable, ttk.Entry(parent, textvariable=variable)
+
+    def accept(self) -> None:
+        raw_values: dict[str, Any] = {}
+        for path, variable, _original in self.fields:
+            _set_nested_value(raw_values, path, variable.get())
+        try:
+            self.result = _project_settings_from_values(
+                raw_values,
+                self.settings,
+            )
+        except ValueError as error:
+            messagebox.showerror(
+                "Invalid project settings",
+                str(error),
+                parent=self.window,
+            )
+            return
+        self.window.destroy()
+
+    def cancel(self) -> None:
+        self.result = None
+        self.window.destroy()
+
+
 class DialogueReviewApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -139,6 +630,10 @@ class DialogueReviewApp:
         self._worker_messages: queue.Queue[tuple[str, Any]] | None = None
         self._log_text: tk.Text | None = None
         self._progress: ttk.Progressbar | None = None
+        self._cancel_event: threading.Event | None = None
+        self._cancel_button: ttk.Button | None = None
+        self._cancel_status: tk.StringVar | None = None
+        self._worker_thread: threading.Thread | None = None
 
         self._configure_styles()
         self.show_start()
@@ -149,11 +644,14 @@ class DialogueReviewApp:
             style.theme_use("vista")
         style.configure("Title.TLabel", font=("Segoe UI", 24, "bold"))
         style.configure("Heading.TLabel", font=("Segoe UI", 13, "bold"))
+        style.configure("Heading.TButton", font=("Segoe UI", 11, "bold"))
         style.configure("FieldName.TLabel", font=("Segoe UI", 9, "bold"))
         style.configure("Muted.TLabel", foreground="#475569")
         style.configure("Primary.TButton", font=("Segoe UI", 11, "bold"))
 
     def close(self) -> None:
+        if self._cancel_event is not None:
+            self._cancel_event.set()
         self.player.stop()
         self.root.destroy()
 
@@ -161,6 +659,10 @@ class DialogueReviewApp:
         self.player.stop()
         for child in self.root.winfo_children():
             child.destroy()
+        self._log_text = None
+        self._progress = None
+        self._cancel_button = None
+        self._cancel_status = None
 
     def show_start(self) -> None:
         self._clear()
@@ -189,7 +691,7 @@ class DialogueReviewApp:
         ).pack(ipady=8, pady=7)
         ttk.Button(
             card,
-            text="Create New Project",
+            text="Create or Reprocess Project",
             style="Primary.TButton",
             command=self.choose_new_project,
             width=28,
@@ -210,32 +712,79 @@ class DialogueReviewApp:
             self.show_start()
 
     def choose_new_project(self) -> None:
+        project_dir_value = filedialog.askdirectory(
+            title="Select a new or existing project directory",
+            mustexist=False,
+        )
+        if not project_dir_value:
+            return
+        project_dir = Path(project_dir_value).resolve()
+        if (project_dir / "project.json").is_file():
+            try:
+                _loaded_dir, project = load_project(
+                    project_file_from_arg(project_dir)
+                )
+            except Exception as error:
+                messagebox.showerror(
+                    "Cannot read project settings",
+                    str(error),
+                    parent=self.root,
+                )
+                return
+            project_settings = self.ask_project_settings(
+                editable_project_settings(project),
+                reprocessing=True,
+            )
+            if project_settings is None:
+                return
+            self.run_existing_project(project_dir, project_settings)
+            return
+
         workbook = filedialog.askopenfilename(
             title="Select lines spreadsheet",
             filetypes=[
                 ("Excel workbooks", "*.xlsm *.xlsx"),
                 ("All files", "*.*"),
             ],
+            initialdir=str(project_dir.parent),
         )
         if not workbook:
             return
         audio_dir = filedialog.askdirectory(
-            title="Select directory containing recorded WAV files"
+            title="Select directory containing recorded WAV files",
+            initialdir=str(Path(workbook).parent),
         )
         if not audio_dir:
             return
-        project_dir = filedialog.askdirectory(
-            title="Select an empty directory for the new project",
-            mustexist=False,
-            initialdir=str(Path(workbook).parent),
+        project_settings = self.ask_project_settings(
+            editable_project_settings(),
+            reprocessing=False,
         )
-        if not project_dir:
+        if project_settings is None:
             return
         self.run_new_project(
             workbook_path=Path(workbook),
             audio_dir=Path(audio_dir),
-            project_dir=Path(project_dir),
+            project_dir=project_dir,
+            project_settings=project_settings,
         )
+
+    def ask_project_settings(
+        self,
+        settings: dict[str, Any],
+        *,
+        reprocessing: bool,
+    ) -> dict[str, Any] | None:
+        return ProjectSettingsDialog(
+            self.root,
+            settings,
+            title=(
+                "Reprocess Project Settings"
+                if reprocessing
+                else "New Project Settings"
+            ),
+            submit_label="Reprocess Project" if reprocessing else "Create Project",
+        ).result
 
     def open_project(self, project_dir: Path) -> None:
         project_dir = project_dir.resolve()
@@ -258,34 +807,79 @@ class DialogueReviewApp:
         workbook_path: Path,
         audio_dir: Path,
         project_dir: Path,
+        project_settings: dict[str, Any],
     ) -> None:
-        self.show_progress(project_dir)
+        self.show_progress(project_dir, title="Creating project")
 
         def work() -> Path:
+            check_processing_cancelled()
             print("[phase 1/5] Creating project and inventory", flush=True)
             project = create_project(
                 workbook_path=workbook_path,
                 audio_dir=audio_dir,
                 project_dir=project_dir,
+                project_settings=project_settings,
             )
+            check_processing_cancelled()
             print("[phase 2/5] Transcribing source recordings", flush=True)
             transcribe_project(project_dir=project_dir, project=project)
+            check_processing_cancelled()
             print("[phase 3/5] Segmenting recordings", flush=True)
             segment_project(project_dir=project_dir, project=project)
+            check_processing_cancelled()
             print("[phase 4/5] Transcribing temporary segments", flush=True)
             transcribe_segments_project(project_dir=project_dir, project=project)
+            check_processing_cancelled()
             print("[phase 5/5] Aligning segments to script lines", flush=True)
             align_project(project_dir=project_dir, project=project)
+            check_processing_cancelled()
             print("Pipeline complete.", flush=True)
             return project_dir
 
         self._start_worker(work, self._pipeline_finished)
 
-    def show_progress(self, project_dir: Path) -> None:
+    def run_existing_project(
+        self,
+        project_dir: Path,
+        project_settings: dict[str, Any],
+    ) -> None:
+        """Rerun an existing project without recreating or clearing it."""
+        self.show_progress(project_dir, title="Reprocessing project")
+
+        def work() -> Path:
+            check_processing_cancelled()
+            loaded_dir, project = load_project(
+                project_file_from_arg(project_dir)
+            )
+            apply_project_settings(project, project_settings)
+            write_json(loaded_dir / "project.json", project)
+            print(
+                "[existing project] Updated settings while preserving mappings "
+                "and cached artifacts.",
+                flush=True,
+            )
+            print("[phase 1/4] Transcribing source recordings", flush=True)
+            transcribe_project(project_dir=loaded_dir, project=project)
+            check_processing_cancelled()
+            print("[phase 2/4] Segmenting recordings", flush=True)
+            segment_project(project_dir=loaded_dir, project=project)
+            check_processing_cancelled()
+            print("[phase 3/4] Transcribing temporary segments", flush=True)
+            transcribe_segments_project(project_dir=loaded_dir, project=project)
+            check_processing_cancelled()
+            print("[phase 4/4] Aligning segments to script lines", flush=True)
+            align_project(project_dir=loaded_dir, project=project)
+            check_processing_cancelled()
+            print("Project reprocessing complete.", flush=True)
+            return loaded_dir
+
+        self._start_worker(work, self._pipeline_finished)
+
+    def show_progress(self, project_dir: Path, *, title: str) -> None:
         self._clear()
         outer = ttk.Frame(self.root, padding=30)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="Creating project", style="Title.TLabel").pack(
+        ttk.Label(outer, text=title, style="Title.TLabel").pack(
             anchor="w"
         )
         ttk.Label(
@@ -306,6 +900,34 @@ class DialogueReviewApp:
             insertbackground="#e2e8f0",
         )
         self._log_text.pack(fill="both", expand=True)
+        controls = ttk.Frame(outer)
+        controls.pack(fill="x", pady=(12, 0))
+        self._cancel_status = tk.StringVar(value="")
+        ttk.Label(
+            controls,
+            textvariable=self._cancel_status,
+            style="Muted.TLabel",
+        ).pack(side="left")
+        self._cancel_button = ttk.Button(
+            controls,
+            text="Cancel",
+            command=self.cancel_processing,
+        )
+        self._cancel_button.pack(side="right")
+        self._cancel_event = threading.Event()
+
+    def cancel_processing(self) -> None:
+        event = self._cancel_event
+        if event is None or event.is_set():
+            return
+        event.set()
+        if self._cancel_button is not None:
+            self._cancel_button.configure(state="disabled")
+        if self._cancel_status is not None:
+            self._cancel_status.set("Cancelling at the next safe point…")
+        self._append_log(
+            "\nCancellation requested; finishing the active safe unit.\n"
+        )
 
     def _start_worker(
         self,
@@ -314,20 +936,31 @@ class DialogueReviewApp:
     ) -> None:
         messages: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._worker_messages = messages
+        cancel_event = self._cancel_event or threading.Event()
+        self._cancel_event = cancel_event
 
         def worker() -> None:
             writer = QueueWriter(messages)
             try:
-                with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(
-                    writer
+                with (
+                    cancellation_scope(cancel_event),
+                    contextlib.redirect_stdout(writer),
+                    contextlib.redirect_stderr(writer),
                 ):
                     result = function()
+                    check_processing_cancelled()
                 messages.put(("done", (on_success, result)))
+            except ProcessingCancelled:
+                messages.put(("cancelled", None))
             except Exception as error:
-                messages.put(("log", traceback.format_exc()))
-                messages.put(("error", error))
+                if cancel_event.is_set():
+                    messages.put(("cancelled", None))
+                else:
+                    messages.put(("log", traceback.format_exc()))
+                    messages.put(("error", error))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._worker_thread = threading.Thread(target=worker, daemon=True)
+        self._worker_thread.start()
         self.root.after(100, self._poll_worker)
 
     def _poll_worker(self) -> None:
@@ -346,12 +979,23 @@ class DialogueReviewApp:
                 callback, result = payload
                 self._stop_progress()
                 self._worker_messages = None
+                self._cancel_event = None
+                self._worker_thread = None
                 callback(result)
                 finished = True
             elif kind == "error":
                 self._stop_progress()
                 self._worker_messages = None
+                self._cancel_event = None
+                self._worker_thread = None
                 self._pipeline_failed(payload)
+                finished = True
+            elif kind == "cancelled":
+                self._stop_progress()
+                self._worker_messages = None
+                self._cancel_event = None
+                self._worker_thread = None
+                self.show_start()
                 finished = True
         if not finished and self._worker_messages is not None:
             self.root.after(100, self._poll_worker)

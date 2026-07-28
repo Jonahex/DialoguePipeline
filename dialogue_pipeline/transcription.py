@@ -1024,6 +1024,7 @@ def _apply_segment_asr_result(
     *,
     primary: dict[str, Any],
     prompted: dict[str, Any] | None,
+    silence_rejected: bool = False,
 ) -> None:
     if "session_transcript" not in segment:
         segment["session_transcript"] = str(segment.get("transcript") or "")
@@ -1033,7 +1034,15 @@ def _apply_segment_asr_result(
     primary_text = str(primary.get("transcript") or "").strip()
     prompted_text = str((prompted or {}).get("transcript") or "").strip()
     session_text = str(segment.get("session_transcript") or "").strip()
-    if primary_text:
+    if silence_rejected:
+        chosen = {
+            "transcript": "",
+            "word_count": 0,
+            "words": [],
+            "asr_probability": primary.get("asr_probability"),
+        }
+        source = "silence_rejected"
+    elif primary_text:
         chosen = primary
         source = "segment_asr"
     elif prompted_text:
@@ -1061,7 +1070,40 @@ def _apply_segment_asr_result(
         "primary": primary,
         "prompted_fallback": prompted,
         "canonical_source": source,
+        "silence_rejected": silence_rejected,
     }
+
+
+def _likely_silence_hallucination(
+    segment: dict[str, Any],
+    primary: dict[str, Any],
+    settings: dict[str, Any],
+) -> bool:
+    if not bool(settings.get("silence_rejection_enabled", True)):
+        return False
+    if not str(primary.get("transcript") or "").strip():
+        return False
+    rms = (segment.get("metrics") or {}).get("rms_dbfs")
+    if rms is None:
+        return False
+    no_speech_values = [
+        float(item["no_speech_prob"])
+        for item in primary.get("segments") or []
+        if item.get("no_speech_prob") is not None
+    ]
+    if not no_speech_values:
+        return False
+    return bool(
+        float(rms)
+        <= float(settings.get("silence_rejection_max_rms_dbfs", -40.0))
+        and max(no_speech_values)
+        >= float(
+            settings.get(
+                "silence_rejection_min_no_speech_probability",
+                0.80,
+            )
+        )
+    )
 
 
 def transcribe_segments_project(
@@ -1123,6 +1165,7 @@ def transcribe_segments_project(
     processed = 0
     cached = 0
     prompted_count = 0
+    silence_rejected_count = 0
     for session_entry in manifest.get("sessions", []):
         check_processing_cancelled()
         session = session_config.get(session_entry["session_id"])
@@ -1241,6 +1284,11 @@ def transcribe_segments_project(
 
             transcript = str(primary.get("transcript") or "").strip()
             probability = primary.get("asr_probability")
+            silence_rejected = _likely_silence_hallucination(
+                segment,
+                primary,
+                settings,
+            )
             duration = float(
                 (segment.get("metrics") or {}).get("duration_seconds")
                 or (
@@ -1251,6 +1299,7 @@ def transcribe_segments_project(
             ordered_score = _best_ordered_script_score(lines, transcript)
             needs_prompt = bool(
                 prompt_enabled
+                and not silence_rejected
                 and duration <= prompt_max_duration
                 and (
                     not transcript
@@ -1296,7 +1345,10 @@ def transcribe_segments_project(
                 segment,
                 primary=primary,
                 prompted=prompted,
+                silence_rejected=silence_rejected,
             )
+            if silence_rejected:
+                silence_rejected_count += 1
             processed += 1
             if index % 25 == 0 or index == len(base_segments):
                 print(
@@ -1316,6 +1368,7 @@ def transcribe_segments_project(
         "processed_segment_count": processed,
         "manifest_cache_hits": cached,
         "prompted_fallback_count": prompted_count,
+        "silence_rejected_count": silence_rejected_count,
     }
     if segment_filter and processed == 0:
         raise ValueError("No base segments matched the requested filter.")

@@ -51,7 +51,10 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument(
         "--force",
         action="store_true",
-        help="Regenerate project metadata and project.json.",
+        help=(
+            "Refresh source metadata while backing up and preserving existing "
+            "settings and reviewed session mappings."
+        ),
     )
 
     transcribe_parser = subparsers.add_parser(

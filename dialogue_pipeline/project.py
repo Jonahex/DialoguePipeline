@@ -5,7 +5,11 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .alignment_settings import default_alignment_config
+from .alignment_settings import (
+    AlignmentSettings,
+    default_alignment_config,
+    grouped_alignment_config,
+)
 from .audio import probe_audio
 from .cancellation import check_processing_cancelled
 from .util import (
@@ -20,12 +24,14 @@ from .workbook_io import parse_workbook
 
 PROJECT_STRUCTURE_KEYS = {
     "schema_version",
+    "settings_version",
     "workbook",
     "audio_dir",
     "source_lines",
     "audio_inventory",
     "sessions",
 }
+PROJECT_SETTINGS_VERSION = 2
 
 
 def _name_key(value: str) -> str:
@@ -44,6 +50,49 @@ def _find_named_sheet(stem: str, sheet_names: list[str]) -> str | None:
     return max(matches, key=lambda name: len(_name_key(name)))
 
 
+def _is_combat_sheet(sheet: dict[str, Any]) -> bool:
+    return "combat" in (
+        f"{sheet.get('name', '')} {sheet.get('voice_header', '')}".lower()
+    )
+
+
+def _generic_sheet_pair(
+    source_data: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    sheets = list(source_data["sheets"])
+    generic_sheets = [
+        sheet for sheet in sheets if int(sheet.get("line_count", 0)) >= 80
+    ]
+    speaking = next(
+        (sheet["name"] for sheet in generic_sheets if not _is_combat_sheet(sheet)),
+        generic_sheets[0]["name"] if generic_sheets else None,
+    )
+    combat = next(
+        (sheet["name"] for sheet in generic_sheets if _is_combat_sheet(sheet)),
+        generic_sheets[1]["name"] if len(generic_sheets) > 1 else None,
+    )
+    return speaking, combat
+
+
+def _bandit_sheet_pair(
+    source_data: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    bandit_sheets = [
+        sheet
+        for sheet in source_data["sheets"]
+        if "bandit" in str(sheet.get("voice_header") or "").lower()
+    ]
+    speaking = next(
+        (sheet["name"] for sheet in bandit_sheets if not _is_combat_sheet(sheet)),
+        None,
+    )
+    combat = next(
+        (sheet["name"] for sheet in bandit_sheets if _is_combat_sheet(sheet)),
+        None,
+    )
+    return speaking, combat
+
+
 def infer_sessions(
     audio_files: list[Path], source_data: dict[str, Any], project_dir: Path
 ) -> list[dict[str, Any]]:
@@ -54,31 +103,8 @@ def infer_sessions(
     generic_sheets = [
         name for name in sheet_names if sheet_counts.get(name, 0) >= 80
     ]
-    speaking_sheet = next(
-        (
-            name
-            for name in generic_sheets
-            if "combat" not in next(
-                sheet["voice_header"].lower()
-                for sheet in source_data["sheets"]
-                if sheet["name"] == name
-            )
-        ),
-        generic_sheets[0] if generic_sheets else None,
-    )
-    combat_sheet = next(
-        (
-            name
-            for name in generic_sheets
-            if "combat"
-            in next(
-                sheet["voice_header"].lower()
-                for sheet in source_data["sheets"]
-                if sheet["name"] == name
-            )
-        ),
-        generic_sheets[1] if len(generic_sheets) > 1 else None,
-    )
+    speaking_sheet, combat_sheet = _generic_sheet_pair(source_data)
+    bandit_speaking_sheet, bandit_combat_sheet = _bandit_sheet_pair(source_data)
 
     named_sheets = {
         match
@@ -98,6 +124,12 @@ def infer_sessions(
         needs_review = False
         if named_sheet:
             sheets = [named_sheet]
+        elif "banditgeneric" in stem_lower:
+            sheets = [bandit_speaking_sheet] if bandit_speaking_sheet else []
+            needs_review = not bool(sheets)
+        elif "banditcombat" in stem_lower:
+            sheets = [bandit_combat_sheet] if bandit_combat_sheet else []
+            needs_review = not bool(sheets)
         elif "combatgenerics" in stem_lower or "speakinggenerics" in stem_lower:
             if stem_lower.find("combatgenerics") < stem_lower.find("speakinggenerics"):
                 sheets = [name for name in [combat_sheet, speaking_sheet] if name]
@@ -110,6 +142,12 @@ def infer_sessions(
                 for name in sheet_names
                 if name not in set(generic_sheets) | named_sheets
             ]
+        elif "generic" in stem_lower:
+            sheets = [speaking_sheet] if speaking_sheet else []
+            needs_review = not bool(sheets)
+        elif "combat" in stem_lower:
+            sheets = [combat_sheet] if combat_sheet else []
+            needs_review = not bool(sheets)
         else:
             sheets = sheet_names.copy()
             needs_review = True
@@ -182,11 +220,14 @@ def default_project_settings() -> dict[str, Any]:
             "prompt_fallback_trigger_ordered_score": 70.0,
             "candidate_verification_enabled": True,
             "candidate_verification_min_match_score": 45.0,
+            "silence_rejection_enabled": True,
+            "silence_rejection_max_rms_dbfs": -40.0,
+            "silence_rejection_min_no_speech_probability": 0.80,
         },
         "segmentation": {
-            "silence_noise_db": -45.0,
-            "silence_detection_min_seconds": 0.35,
-            "split_gap_seconds": 0.35,
+            "silence_noise_db": -40.0,
+            "silence_detection_min_seconds": 0.20,
+            "split_gap_seconds": 0.20,
             "minimum_segment_seconds": 0.15,
             "pre_padding_seconds": 0.15,
             "post_padding_seconds": 0.25,
@@ -195,6 +236,7 @@ def default_project_settings() -> dict[str, Any]:
             "word_split_gap_seconds": 0.3,
             "word_split_min_region_seconds": 1.5,
             "word_split_max_boundaries": 2,
+            "word_split_max_segment_seconds": 8.0,
         },
         "alignment": default_alignment_config(),
         "export": {
@@ -212,6 +254,7 @@ def editable_project_settings(project: dict[str, Any] | None = None) -> dict[str
     if project is None:
         return default_project_settings()
 
+    project = migrate_project_config(project)
     defaults = default_project_settings()
     result: dict[str, Any] = {}
     for key, default_value in defaults.items():
@@ -226,8 +269,6 @@ def editable_project_settings(project: dict[str, Any] | None = None) -> dict[str
             _merge_project_settings(merged, project[key])
             result[key] = merged
         else:
-            # Preserve the exact grouped/legacy alignment representation so
-            # the dialog never creates conflicting duplicate keys.
             result[key] = copy.deepcopy(project[key])
 
     for key, value in project.items():
@@ -245,6 +286,80 @@ def apply_project_settings(
         if key in PROJECT_STRUCTURE_KEYS:
             continue
         project[key] = copy.deepcopy(value)
+    project["settings_version"] = PROJECT_SETTINGS_VERSION
+
+
+def migrate_project_config(project: dict[str, Any]) -> dict[str, Any]:
+    """Return a lossless current settings representation for any project."""
+
+    migrated = copy.deepcopy(project)
+    version = int(migrated.get("settings_version", 1))
+    if version < PROJECT_SETTINGS_VERSION:
+        segmentation = migrated.get("segmentation")
+        if isinstance(segmentation, dict):
+            # Upgrade only values written by the previous defaults; explicit
+            # project tuning remains untouched.
+            if segmentation.get("silence_noise_db") == -45.0:
+                segmentation["silence_noise_db"] = -40.0
+            if segmentation.get("silence_detection_min_seconds") == 0.35:
+                segmentation["silence_detection_min_seconds"] = 0.20
+            if segmentation.get("split_gap_seconds") == 0.35:
+                segmentation["split_gap_seconds"] = 0.20
+    configured = migrated.get("alignment")
+    if configured is not None:
+        values = dict(AlignmentSettings.from_value(configured))
+        is_grouped_v1 = bool(
+            version < PROJECT_SETTINGS_VERSION
+            and isinstance(configured, dict)
+            and "span_search" in configured
+        )
+        if is_grouped_v1:
+            span_search = configured.get("span_search") or {}
+            recovery = configured.get("recovery") or {}
+            # Version 1 accidentally changed both historical defaults from
+            # eight to ten. Preserve explicit legacy-flat overrides, while
+            # restoring values written by the incomplete grouped defaults.
+            if span_search.get("max_segments") == 10:
+                values["max_merge_segments"] = 8
+            if recovery.get("max_segments") == 10:
+                values["fragment_join_max_segments"] = 8
+        migrated["alignment"] = grouped_alignment_config(values)
+    migrated["settings_version"] = PROJECT_SETTINGS_VERSION
+    return migrated
+
+
+def repair_review_session_mappings(
+    *,
+    project_dir: Path,
+    project: dict[str, Any],
+) -> int:
+    """Repair only mappings explicitly marked as inferred and uncertain."""
+
+    if not project.get("source_lines") or not project.get("sessions"):
+        return 0
+    source_path = resolve_project_path(project_dir, project["source_lines"])
+    if not source_path.is_file():
+        return 0
+    source_data = load_source_data(project_dir, project)
+    audio_files = [
+        resolve_project_path(project_dir, session["audio"])
+        for session in project.get("sessions", [])
+    ]
+    inferred_by_id = {
+        session["id"]: session
+        for session in infer_sessions(audio_files, source_data, project_dir)
+    }
+    repaired = 0
+    for session in project.get("sessions", []):
+        if not session.get("needs_mapping_review"):
+            continue
+        inferred = inferred_by_id.get(session["id"])
+        if not inferred or inferred.get("needs_mapping_review"):
+            continue
+        session["sheets"] = list(inferred["sheets"])
+        session["needs_mapping_review"] = False
+        repaired += 1
+    return repaired
 
 
 def create_project(
@@ -259,10 +374,13 @@ def create_project(
     audio_dir = audio_dir.resolve()
     project_dir = project_dir.resolve()
     project_file = project_dir / "project.json"
+    existing_project: dict[str, Any] | None = None
     if project_file.exists() and not force:
         raise FileExistsError(
             f"Project already exists: {project_file}. Use --force to regenerate it."
         )
+    if project_file.exists():
+        existing_project = migrate_project_config(read_json(project_file))
     if not workbook_path.is_file():
         raise FileNotFoundError(workbook_path)
     if not audio_dir.is_dir():
@@ -288,6 +406,7 @@ def create_project(
 
     project = {
         "schema_version": 1,
+        "settings_version": PROJECT_SETTINGS_VERSION,
         "workbook": relpath_for_config(workbook_path, project_dir),
         "audio_dir": relpath_for_config(audio_dir, project_dir),
         "source_lines": "source_lines.json",
@@ -295,6 +414,33 @@ def create_project(
         **default_project_settings(),
         "sessions": infer_sessions(audio_files, source_data, project_dir),
     }
+    if existing_project is not None:
+        backup_path = project_dir / "project.before-force.json"
+        if not backup_path.exists():
+            write_json(backup_path, existing_project)
+        apply_project_settings(
+            project,
+            editable_project_settings(existing_project),
+        )
+        existing_sessions = {
+            session["id"]: session
+            for session in existing_project.get("sessions", [])
+        }
+        for session in project["sessions"]:
+            previous = existing_sessions.get(session["id"])
+            if not previous:
+                continue
+            if (
+                previous.get("needs_mapping_review")
+                and not session.get("needs_mapping_review")
+            ):
+                session["enabled"] = previous.get("enabled", True)
+                continue
+            project_session_defaults = copy.deepcopy(session)
+            project_session_defaults.update(copy.deepcopy(previous))
+            project_session_defaults["audio"] = session["audio"]
+            session.clear()
+            session.update(project_session_defaults)
     if project_settings:
         _merge_project_settings(project, project_settings)
     write_json(project_file, project)
@@ -304,7 +450,8 @@ def create_project(
 def load_project(project_file: Path) -> tuple[Path, dict[str, Any]]:
     project_file = project_file.resolve()
     project_dir = project_file.parent
-    project = read_json(project_file)
+    project = migrate_project_config(read_json(project_file))
+    repair_review_session_mappings(project_dir=project_dir, project=project)
     return project_dir, project
 
 

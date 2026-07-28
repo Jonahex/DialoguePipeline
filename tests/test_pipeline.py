@@ -27,6 +27,7 @@ from dialogue_pipeline.alignment import (
     transcript_fidelity,
 )
 from dialogue_pipeline.alignment_settings import (
+    ALIGNMENT_DEFAULTS,
     AlignmentSettings,
     default_alignment_config,
 )
@@ -40,6 +41,8 @@ from dialogue_pipeline.finalize import finalize_review
 from dialogue_pipeline.project import (
     create_project,
     editable_project_settings,
+    infer_sessions,
+    migrate_project_config,
 )
 from dialogue_pipeline.review import (
     build_line_review,
@@ -49,11 +52,13 @@ from dialogue_pipeline.review import (
     save_line_review,
 )
 from dialogue_pipeline.segmentation import (
+    prevent_region_overlaps,
     segment_project,
     split_regions_on_word_gaps,
 )
 from dialogue_pipeline.transcription import (
     _automatic_batch_size,
+    _likely_silence_hallucination,
     transcribe_candidate_span,
     transcribe_candidate_spans,
     transcribe_project,
@@ -284,6 +289,78 @@ def test_create_button_shows_existing_settings_before_reprocessing(
     assert shown[0][1] is True
     assert shown[0][0] == editable_project_settings({"schema_version": 1})
     assert selected == [(project_dir.resolve(), shown[0][0])]
+
+
+def test_forced_metadata_refresh_backs_up_and_preserves_existing_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.project as project_module
+
+    project_dir = tmp_path / "work"
+    project_dir.mkdir()
+    workbook = tmp_path / "lines.xlsx"
+    workbook.touch()
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    audio = audio_dir / "Actor.wav"
+    audio.touch()
+    write_json(
+        project_dir / "project.json",
+        {
+            "schema_version": 1,
+            "language": "fr",
+            "alignment": {"max_merge_segments": 6},
+            "sessions": [
+                {
+                    "id": "actor",
+                    "audio": "../audio/Actor.wav",
+                    "enabled": False,
+                    "sheets": ["Manual"],
+                    "excel_rows": [],
+                    "line_ids": [],
+                    "pass": "main",
+                    "needs_mapping_review": False,
+                }
+            ],
+        },
+    )
+    source_data = {
+        "sheet_count": 1,
+        "line_count": 0,
+        "sheets": [
+            {
+                "name": "Actor",
+                "line_count": 0,
+                "voice_header": "You are voicing Actor",
+            }
+        ],
+        "lines": [],
+    }
+    monkeypatch.setattr(project_module, "parse_workbook", lambda _path: source_data)
+    monkeypatch.setattr(
+        project_module,
+        "probe_audio",
+        lambda path, include_hash: {
+            "path": str(path.resolve()),
+            "sha256": "hash",
+        },
+    )
+
+    refreshed = create_project(
+        workbook_path=workbook,
+        audio_dir=audio_dir,
+        project_dir=project_dir,
+        force=True,
+    )
+
+    assert refreshed["language"] == "fr"
+    assert AlignmentSettings.from_value(refreshed["alignment"])[
+        "max_merge_segments"
+    ] == 6
+    assert refreshed["sessions"][0]["sheets"] == ["Manual"]
+    assert refreshed["sessions"][0]["enabled"] is False
+    assert read_json(project_dir / "project.before-force.json")["language"] == "fr"
 
 
 def test_create_button_collects_settings_only_for_new_project(
@@ -709,9 +786,106 @@ def test_grouped_alignment_settings_support_legacy_overrides() -> None:
     settings = AlignmentSettings.from_value(configured)
 
     assert settings["max_merge_segments"] == 7
-    assert settings["fragment_join_max_segments"] == 10
+    assert settings["fragment_join_max_segments"] == 8
     assert settings["duplicate_line_policy"] == "weak_order"
     assert settings["auto_reject_clipping"] is True
+
+
+def test_grouped_alignment_settings_expose_every_effective_default() -> None:
+    configured = default_alignment_config()
+
+    settings = AlignmentSettings.from_value(configured)
+
+    assert dict(settings) == ALIGNMENT_DEFAULTS
+    assert settings["max_merge_segments"] == 8
+    assert settings["fragment_join_max_segments"] == 8
+    assert (
+        configured["recovery"]["trim_candidates_per_segment"]
+        == ALIGNMENT_DEFAULTS["intra_segment_trim_max_actions_per_segment"]
+    )
+    assert (
+        configured["recovery"]["complete"]["maximum_length_ratio"]
+        == ALIGNMENT_DEFAULTS["fragment_join_complete_max_length_ratio"]
+    )
+
+
+def test_grouped_v1_defaults_migrate_back_to_historical_limits() -> None:
+    project = {
+        "schema_version": 1,
+        "segmentation": {
+            "silence_noise_db": -45.0,
+            "silence_detection_min_seconds": 0.35,
+            "split_gap_seconds": 0.35,
+        },
+        "alignment": {
+            "span_search": {"max_segments": 10},
+            "recovery": {"max_segments": 10},
+        },
+    }
+
+    migrated = migrate_project_config(project)
+    settings = AlignmentSettings.from_value(migrated["alignment"])
+
+    assert migrated["settings_version"] == 2
+    assert settings["max_merge_segments"] == 8
+    assert settings["fragment_join_max_segments"] == 8
+    assert len(settings) == len(ALIGNMENT_DEFAULTS)
+    assert migrated["segmentation"] == {
+        "silence_noise_db": -40.0,
+        "silence_detection_min_seconds": 0.20,
+        "split_gap_seconds": 0.20,
+    }
+
+
+def test_generic_and_bandit_recordings_infer_narrow_sheet_mappings(
+    tmp_path: Path,
+) -> None:
+    source_data = {
+        "sheets": [
+            {
+                "name": "Any NPC using voice type ARG1RM",
+                "line_count": 97,
+                "voice_header": "You are voicing ARG1RMElfSly",
+            },
+            {
+                "name": "Лист1",
+                "line_count": 150,
+                "voice_header": "You are voicing ARG1RMElfSly (Combat)",
+            },
+            {
+                "name": "Member of faction ARGBanditFact",
+                "line_count": 17,
+                "voice_header": "You are voicing ARGBanditFaction",
+            },
+            {
+                "name": "Лист2",
+                "line_count": 64,
+                "voice_header": "You are voicing ARGBanditFaction (Combat)",
+            },
+        ]
+    }
+    names = [
+        "ARG_MaleElfSly_Generic_POST-PROC.wav",
+        "ARG_MaleElfSly_Combat_POST-PROC.wav",
+        "ARG_MaleElfSly_BanditGeneric_POST-PROC.wav",
+        "ARG_MaleElfSly_BanditCombat_POST-PROC.wav",
+    ]
+    audio_files = [tmp_path / name for name in names]
+
+    sessions = infer_sessions(audio_files, source_data, tmp_path)
+    mappings = {session["id"]: session for session in sessions}
+
+    assert mappings["arg_maleelfsly_generic_post_proc"]["sheets"] == [
+        "Any NPC using voice type ARG1RM"
+    ]
+    assert mappings["arg_maleelfsly_combat_post_proc"]["sheets"] == ["Лист1"]
+    assert mappings["arg_maleelfsly_banditgeneric_post_proc"]["sheets"] == [
+        "Member of faction ARGBanditFact"
+    ]
+    assert mappings["arg_maleelfsly_banditcombat_post_proc"]["sheets"] == [
+        "Лист2"
+    ]
+    assert not any(session["needs_mapping_review"] for session in sessions)
 
 
 def test_exact_short_match_still_requires_resolved_ambiguity() -> None:
@@ -2065,6 +2239,35 @@ def test_untranscribed_audio_in_merge_prevents_auto_acceptance() -> None:
     ) == (False, "MERGED_UNTRANSCRIBED_AUDIO")
 
 
+def test_exact_asr_boundary_gap_rejects_complete_fallback_join() -> None:
+    unsafe = _has_unsafe_untranscribed_merge(
+        action={"start_index": 0, "count": 2},
+        base_segments=[
+            {
+                "transcript": "Thank you.",
+                "metrics": {"duration_seconds": 1.2, "rms_dbfs": -48.0},
+                "segment_asr": {"silence_rejected": True},
+            },
+            {
+                "transcript": "Hello there.",
+                "metrics": {"duration_seconds": 1.5, "rms_dbfs": -20.0},
+            },
+        ],
+        segment={
+            "start_seconds": 0.0,
+            "end_seconds": 2.7,
+            "metrics": {"duration_seconds": 2.7},
+            "words": [
+                {"word": "Hello", "start": 1.2, "end": 1.6},
+                {"word": "there", "start": 1.6, "end": 2.2},
+            ],
+        },
+        settings={},
+    )
+
+    assert unsafe is True
+
+
 def test_word_timestamp_gaps_split_a_region_into_take_candidates() -> None:
     transcription = {
         "segments": [
@@ -2107,6 +2310,79 @@ def test_word_timestamp_gaps_split_a_region_into_take_candidates() -> None:
 
     assert len(refined) == 2
     assert all(region["split_source"] == "word_gap" for region in refined)
+
+
+def test_segment_padding_is_clamped_to_a_shared_silence_boundary() -> None:
+    regions = [
+        {
+            "speech_start": 0.0,
+            "speech_end": 1.0,
+            "start": 0.0,
+            "end": 1.4,
+        },
+        {
+            "speech_start": 1.2,
+            "speech_end": 2.0,
+            "start": 0.9,
+            "end": 2.0,
+        },
+    ]
+
+    result = prevent_region_overlaps(regions)
+
+    assert result[0]["end"] == pytest.approx(1.1)
+    assert result[1]["start"] == pytest.approx(1.1)
+
+
+def test_word_gap_splitting_adapts_beyond_soft_boundary_cap() -> None:
+    words = []
+    for index in range(8):
+        start = index * 4.0 + 0.2
+        words.append(
+            {
+                "start": start,
+                "end": start + 0.5,
+                "word": f" take{index}",
+            }
+        )
+    transcription = {
+        "segments": [
+            {
+                "start": 0.0,
+                "end": 32.0,
+                "text": "takes",
+                "words": words,
+            }
+        ]
+    }
+
+    refined = split_regions_on_word_gaps(
+        [
+            {
+                "speech_start": 0.0,
+                "speech_end": 32.0,
+                "start": 0.0,
+                "end": 32.0,
+            }
+        ],
+        transcription,
+        duration_seconds=32.0,
+        settings={
+            "word_split_enabled": True,
+            "word_split_gap_seconds": 0.3,
+            "word_split_min_region_seconds": 1.5,
+            "word_split_max_boundaries": 2,
+            "word_split_max_segment_seconds": 8.0,
+            "minimum_segment_seconds": 0.15,
+            "pre_padding_seconds": 0.1,
+            "post_padding_seconds": 0.1,
+        },
+    )
+
+    assert len(refined) > 3
+    assert max(
+        region["speech_end"] - region["speech_start"] for region in refined
+    ) <= 8.0
 
 
 def test_duplicate_weak_order_assigns_separate_take_groups() -> None:
@@ -2642,6 +2918,29 @@ def test_segment_asr_transcribes_empty_base_clip_without_vad_and_caches(
         runtime={},
     )
     assert len(calls) == 1
+
+
+def test_high_no_speech_low_rms_transcript_is_rejected_as_hallucination() -> None:
+    segment = {
+        "metrics": {
+            "duration_seconds": 1.1,
+            "rms_dbfs": -48.0,
+        }
+    }
+    primary = {
+        "transcript": "Thank you.",
+        "segments": [{"no_speech_prob": 0.91}],
+    }
+
+    assert _likely_silence_hallucination(segment, primary, {}) is True
+    assert (
+        _likely_silence_hallucination(
+            {**segment, "metrics": {"rms_dbfs": -20.0}},
+            primary,
+            {},
+        )
+        is False
+    )
 
 
 def test_segment_asr_batches_independent_clips_with_configured_size(

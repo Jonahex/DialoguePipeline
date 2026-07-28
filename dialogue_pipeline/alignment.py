@@ -2544,6 +2544,7 @@ def _has_unsafe_untranscribed_merge(
     action: dict[str, Any],
     base_segments: list[dict[str, Any]],
     settings: Mapping[str, Any] | AlignmentSettings,
+    segment: dict[str, Any] | None = None,
 ) -> bool:
     settings = AlignmentSettings.from_value(settings)
     if not bool(settings.get("auto_reject_untranscribed_merge", True)):
@@ -2558,22 +2559,50 @@ def _has_unsafe_untranscribed_merge(
     minimum_rms = float(
         settings.get("untranscribed_merge_min_rms_dbfs", -45.0)
     )
-    for segment in base_segments[start_index : start_index + count]:
-        if str(segment.get("transcript") or "").strip():
+    for base_segment in base_segments[start_index : start_index + count]:
+        if bool(
+            ((base_segment.get("segment_asr") or {}).get("silence_rejected"))
+        ):
+            return True
+        if str(base_segment.get("transcript") or "").strip():
             continue
         duration = float(
-            (segment.get("metrics") or {}).get("duration_seconds")
+            (base_segment.get("metrics") or {}).get("duration_seconds")
             or (
-                float(segment.get("end_seconds", 0.0))
-                - float(segment.get("start_seconds", 0.0))
+                float(base_segment.get("end_seconds", 0.0))
+                - float(base_segment.get("start_seconds", 0.0))
             )
         )
-        rms = (segment.get("metrics") or {}).get("rms_dbfs")
+        rms = (base_segment.get("metrics") or {}).get("rms_dbfs")
         if (
             duration >= minimum_seconds
             and (rms is None or float(rms) >= minimum_rms)
         ):
             return True
+    if segment is not None:
+        words = [
+            word
+            for word in segment.get("words") or []
+            if word.get("start") is not None and word.get("end") is not None
+        ]
+        if words:
+            duration = float(
+                (segment.get("metrics") or {}).get("duration_seconds")
+                or (
+                    float(segment.get("end_seconds", 0.0))
+                    - float(segment.get("start_seconds", 0.0))
+                )
+            )
+            leading_untranscribed = max(0.0, float(words[0]["start"]))
+            trailing_untranscribed = max(
+                0.0,
+                duration - float(words[-1]["end"]),
+            )
+            if (
+                leading_untranscribed >= minimum_seconds
+                or trailing_untranscribed >= minimum_seconds
+            ):
+                return True
     return False
 
 
@@ -2911,6 +2940,7 @@ def align_project(
                 action=action,
                 base_segments=base_segments,
                 settings=settings,
+                segment=segment,
             )
             technical_score = _technical_score(segment)
             reliable, reason = _candidate_reliability(
@@ -3067,6 +3097,11 @@ def align_project(
                     action.get("intra_segment_trim", False)
                 ),
             }
+            if (
+                bool(action.get("fragment_join_fallback"))
+                and unsafe_untranscribed_merge
+            ):
+                continue
             if match_score >= float(
                 settings.get("candidate_min_score", 45.0)
             ):

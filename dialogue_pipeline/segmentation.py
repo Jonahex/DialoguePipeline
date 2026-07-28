@@ -40,6 +40,10 @@ def split_regions_on_word_gaps(
         0,
         int(settings.get("word_split_max_boundaries", 2)),
     )
+    maximum_piece_seconds = max(
+        minimum_region,
+        float(settings.get("word_split_max_segment_seconds", 8.0)),
+    )
     pre_padding = float(settings.get("pre_padding_seconds", 0.15))
     post_padding = float(settings.get("post_padding_seconds", 0.25))
     minimum_segment = float(settings.get("minimum_segment_seconds", 0.15))
@@ -68,12 +72,39 @@ def split_regions_on_word_gaps(
             gap = right_start - left_end
             if gap >= minimum_gap:
                 gap_candidates.append((gap, (left_end + right_start) / 2.0))
-        boundaries = sorted(
-            boundary
-            for _, boundary in sorted(gap_candidates, reverse=True)[
-                :maximum_boundaries
+        ranked_gaps = sorted(gap_candidates, reverse=True)
+        selected = {
+            boundary for _, boundary in ranked_gaps[:maximum_boundaries]
+        }
+        # The configured boundary count remains the normal cap, but it must
+        # not strand many takes inside one exceptionally long region. Add the
+        # strongest remaining gap inside each oversized piece until no
+        # splittable piece exceeds the target duration.
+        while True:
+            edges = [speech_start, *sorted(selected), speech_end]
+            oversized = [
+                (left, right)
+                for left, right in zip(edges, edges[1:])
+                if right - left > maximum_piece_seconds
             ]
-        )
+            if not oversized:
+                break
+            added = False
+            for left, right in oversized:
+                extra = next(
+                    (
+                        boundary
+                        for _gap, boundary in ranked_gaps
+                        if boundary not in selected and left < boundary < right
+                    ),
+                    None,
+                )
+                if extra is not None:
+                    selected.add(extra)
+                    added = True
+            if not added:
+                break
+        boundaries = sorted(selected)
         if not boundaries:
             refined.append(region)
             continue
@@ -97,6 +128,27 @@ def split_regions_on_word_gaps(
         else:
             refined.append(region)
     return refined
+
+
+def prevent_region_overlaps(
+    regions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep padding without duplicating audio across adjacent base clips."""
+
+    ordered = sorted(regions, key=lambda region: float(region["speech_start"]))
+    for left, right in zip(ordered, ordered[1:]):
+        if float(left["end"]) <= float(right["start"]):
+            continue
+        boundary = (
+            float(left["speech_end"]) + float(right["speech_start"])
+        ) / 2.0
+        left["end"] = min(float(left["end"]), boundary)
+        right["start"] = max(float(right["start"]), boundary)
+    return [
+        region
+        for region in ordered
+        if float(region["end"]) > float(region["start"])
+    ]
 
 
 def segment_project(
@@ -200,9 +252,9 @@ def segment_project(
         )
         silences = detect_silences(
             working_audio,
-            noise_db=float(settings.get("silence_noise_db", -45.0)),
+            noise_db=float(settings.get("silence_noise_db", -40.0)),
             minimum_duration_seconds=float(
-                settings.get("silence_detection_min_seconds", 0.35)
+                settings.get("silence_detection_min_seconds", 0.20)
             ),
         )
         check_processing_cancelled()
@@ -212,7 +264,7 @@ def segment_project(
         regions = acoustic_regions(
             duration_seconds,
             silences,
-            split_gap_seconds=float(settings.get("split_gap_seconds", 0.35)),
+            split_gap_seconds=float(settings.get("split_gap_seconds", 0.20)),
             minimum_segment_seconds=float(
                 settings.get("minimum_segment_seconds", 0.15)
             ),
@@ -227,6 +279,7 @@ def segment_project(
             duration_seconds=duration_seconds,
             settings=settings,
         )
+        regions = prevent_region_overlaps(regions)
         session_dir = segment_root / session["id"]
         segment_records = []
 
@@ -279,7 +332,7 @@ def segment_project(
         gap_durations = [
             silence["duration"]
             for silence in silences
-            if silence["duration"] >= float(settings.get("split_gap_seconds", 0.35))
+            if silence["duration"] >= float(settings.get("split_gap_seconds", 0.20))
         ]
         session_outputs.append(
             {

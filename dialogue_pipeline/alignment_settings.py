@@ -6,10 +6,11 @@ from typing import Any
 
 
 # This is the single source of truth for alignment defaults. Existing projects
-# may continue to use the original flat keys; newly created projects use the
-# smaller grouped configuration returned by default_alignment_config().
+# may continue to use the original flat keys; newly created projects serialize
+# every value in the grouped configuration returned by
+# default_alignment_config().
 ALIGNMENT_DEFAULTS: dict[str, Any] = {
-    "max_merge_segments": 10,
+    "max_merge_segments": 8,
     "max_merge_gap_seconds": 2.5,
     "max_span_seconds": 35.0,
     "candidate_top_k": 8,
@@ -38,7 +39,7 @@ ALIGNMENT_DEFAULTS: dict[str, Any] = {
     "fragment_join_max_actions": 10,
     "fragment_join_fallback_max_actions": 2,
     "fragment_join_fallback_min_match_score": 90.0,
-    "fragment_join_max_segments": 10,
+    "fragment_join_max_segments": 8,
     "fragment_join_require_text_boundaries": True,
     "fragment_join_only_incomplete_lines": True,
     "fragment_join_neighbor_radius": 1,
@@ -56,7 +57,7 @@ ALIGNMENT_DEFAULTS: dict[str, Any] = {
     "fragment_join_complete_max_length_ratio": 1.35,
     "intra_segment_trim_enabled": True,
     "intra_segment_trim_max_actions_per_line": 2,
-    "intra_segment_trim_max_actions_per_segment": 3,
+    "intra_segment_trim_max_actions_per_segment": 8,
     "intra_segment_trim_min_gap_seconds": 0.40,
     "intra_segment_trim_min_match_score": 85.0,
     "intra_segment_trim_min_token_coverage": 0.85,
@@ -86,6 +87,12 @@ _GROUPED_KEYS: dict[tuple[str, ...], str] = {
     ("span_search", "candidate_top_k"): "candidate_top_k",
     ("span_search", "minimum_score"): "candidate_min_score",
     ("span_search", "require_text_boundaries"): "merge_require_text_boundaries",
+    ("span_search", "word_min_overlap_seconds"): (
+        "span_word_min_overlap_seconds"
+    ),
+    ("span_search", "word_min_overlap_fraction"): (
+        "span_word_min_overlap_fraction"
+    ),
     ("ranking", "duration_hint_weight"): "duration_hint_weight",
     ("ranking", "order_hint_weight"): "order_hint_weight",
     ("ranking", "merge_span_penalty"): "merge_span_penalty",
@@ -126,6 +133,12 @@ _GROUPED_KEYS: dict[tuple[str, ...], str] = {
         "reliable_max_boundary_missing_tokens"
     ),
     ("reliability", "clauses", "minimum_score"): "reliable_min_clause_score",
+    ("reliability", "clauses", "short_max_words"): (
+        "reliable_short_clause_max_words"
+    ),
+    ("reliability", "clauses", "short_minimum_token_coverage"): (
+        "reliable_short_clause_min_token_coverage"
+    ),
     ("reliability", "minimum_duration_plausibility"): (
         "reliable_min_duration_plausibility"
     ),
@@ -141,13 +154,70 @@ _GROUPED_KEYS: dict[tuple[str, ...], str] = {
         "fragment_join_fallback_min_match_score"
     ),
     ("recovery", "max_segments"): "fragment_join_max_segments",
+    ("recovery", "require_text_boundaries"): (
+        "fragment_join_require_text_boundaries"
+    ),
+    ("recovery", "only_incomplete_lines"): (
+        "fragment_join_only_incomplete_lines"
+    ),
     ("recovery", "neighbor_radius"): "fragment_join_neighbor_radius",
+    ("recovery", "strict", "minimum_token_coverage"): (
+        "fragment_join_min_token_coverage"
+    ),
+    ("recovery", "strict", "minimum_ordered_score"): (
+        "fragment_join_min_ordered_score"
+    ),
+    ("recovery", "strict", "minimum_token_precision"): (
+        "fragment_join_min_token_precision"
+    ),
+    ("recovery", "provisional", "minimum_match_score"): (
+        "fragment_join_provisional_min_match_score"
+    ),
+    ("recovery", "provisional", "minimum_token_coverage"): (
+        "fragment_join_provisional_min_token_coverage"
+    ),
+    ("recovery", "provisional", "minimum_ordered_score"): (
+        "fragment_join_provisional_min_ordered_score"
+    ),
+    ("recovery", "provisional", "minimum_token_precision"): (
+        "fragment_join_provisional_min_token_precision"
+    ),
+    ("recovery", "secondary_seed_minimum_match_score"): (
+        "fragment_join_secondary_seed_min_match_score"
+    ),
+    ("recovery", "complete", "minimum_match_score"): (
+        "fragment_join_complete_min_match_score"
+    ),
+    ("recovery", "complete", "minimum_ordered_score"): (
+        "fragment_join_complete_min_ordered_score"
+    ),
+    ("recovery", "complete", "minimum_length_ratio"): (
+        "fragment_join_complete_min_length_ratio"
+    ),
+    ("recovery", "complete", "maximum_length_ratio"): (
+        "fragment_join_complete_max_length_ratio"
+    ),
     ("recovery", "trim_oversized_segments"): "intra_segment_trim_enabled",
     ("recovery", "trim_candidates_per_line"): (
         "intra_segment_trim_max_actions_per_line"
     ),
+    ("recovery", "trim_candidates_per_segment"): (
+        "intra_segment_trim_max_actions_per_segment"
+    ),
     ("recovery", "trim_minimum_gap_seconds"): (
         "intra_segment_trim_min_gap_seconds"
+    ),
+    ("recovery", "trim_minimum_match_score"): (
+        "intra_segment_trim_min_match_score"
+    ),
+    ("recovery", "trim_minimum_token_coverage"): (
+        "intra_segment_trim_min_token_coverage"
+    ),
+    ("recovery", "trim_minimum_token_precision"): (
+        "intra_segment_trim_min_token_precision"
+    ),
+    ("recovery", "trim_minimum_ordered_score"): (
+        "intra_segment_trim_min_ordered_score"
     ),
     ("quality", "reject_clipping"): "auto_reject_clipping",
     ("quality", "minimum_technical_score"): "auto_min_technical_score",
@@ -164,72 +234,28 @@ _GROUPED_KEYS: dict[tuple[str, ...], str] = {
 
 
 def default_alignment_config() -> dict[str, Any]:
-    """Return the compact, grouped configuration written for new projects."""
+    """Return every alignment default in the grouped project representation."""
 
-    return {
-        "span_search": {
-            "max_segments": 10,
-            "max_gap_seconds": 2.5,
-            "max_duration_seconds": 35.0,
-            "candidate_top_k": 8,
-            "minimum_score": 45.0,
-            "require_text_boundaries": True,
-        },
-        "ranking": {
-            "duration_hint_weight": 1.0,
-            "order_hint_weight": 0.0,
-            "merge_span_penalty": 0.2,
-            "noise_penalty": 2.2,
-            "primary_match_bonus": 2.0,
-            "clause_completeness_weight": 5.0,
-        },
-        "duplicates": {
-            "policy": "weak_order",
-            "take_group_gap_seconds": 12.0,
-        },
-        "reliability": {
-            "normal": {
-                "minimum_score": 72.0,
-                "minimum_margin": 8.0,
-                "minimum_ordered_score": 55.0,
-                "minimum_token_coverage": 0.60,
-                "minimum_token_precision": 0.70,
-            },
-            "short": {
-                "minimum_score": 88.0,
-                "minimum_margin": 15.0,
-                "minimum_ordered_score": 70.0,
-                "minimum_token_coverage": 1.0,
-                "minimum_token_precision": 1.0,
-            },
-            "boundary": {
-                "window_tokens": 4,
-                "observed_slack_tokens": 2,
-                "maximum_missing_tokens": 0,
-            },
-            "clauses": {"minimum_score": 55.0},
-            "minimum_duration_plausibility": 25.0,
-            "fuzzy_token_minimum_similarity": 78.0,
-        },
-        "recovery": {
-            "enabled": True,
-            "max_candidates_per_line": 10,
-            "fallback_candidates_per_line": 2,
-            "fallback_minimum_score": 90.0,
-            "max_segments": 10,
-            "neighbor_radius": 1,
-            "trim_oversized_segments": True,
-            "trim_candidates_per_line": 2,
-            "trim_minimum_gap_seconds": 0.40,
-        },
-        "quality": {
-            "reject_clipping": True,
-            "minimum_technical_score": 0.0,
-            "reject_untranscribed_merge": True,
-            "untranscribed_min_seconds": 0.5,
-            "untranscribed_min_rms_dbfs": -45.0,
-        },
-    }
+    return _grouped_alignment_values(ALIGNMENT_DEFAULTS)
+
+
+def _grouped_alignment_values(values: Mapping[str, Any]) -> dict[str, Any]:
+    grouped: dict[str, Any] = {}
+    for path, legacy_key in _GROUPED_KEYS.items():
+        current = grouped
+        for component in path[:-1]:
+            current = current.setdefault(component, {})
+        current[path[-1]] = values[legacy_key]
+    return grouped
+
+
+def grouped_alignment_config(
+    configured: Mapping[str, Any] | "AlignmentSettings" | None,
+) -> dict[str, Any]:
+    """Migrate grouped or flat settings without dropping implicit values."""
+
+    settings = AlignmentSettings.from_value(configured)
+    return _grouped_alignment_values(settings)
 
 
 @dataclass(frozen=True)

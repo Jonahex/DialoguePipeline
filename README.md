@@ -44,6 +44,10 @@ cache-aware pipeline runs again. New destinations use the same settings dialog
 after the UI asks for the lines workbook and recorded WAV directory, then run
 inventory, transcription, segmentation, segment transcription, and alignment
 in the background while showing the pipeline log.
+Legacy flat alignment settings are migrated losslessly into the complete
+grouped representation. A forced CLI metadata refresh writes
+`project.before-force.json` and carries the existing settings and reviewed
+session mappings forward.
 The processing screen includes `Cancel`. Cancellation stops further work at the
 next safe inventory, ASR, segmentation, or alignment boundary and returns to
 the start screen without treating the cancellation as a pipeline failure.
@@ -116,11 +120,17 @@ pause. Sources that are not already 48 kHz mono 16-bit PCM—including 32-bit
 floating-point post-processed WAVs—are normalized once into the project's
 `normalized_sources` cache before cutting.
 
+The defaults treat post-processed audio below -40 dBFS for at least 0.2 seconds
+as a take boundary. Adjacent padded regions are clamped to a shared point in
+that gap, so a take is never duplicated into both base clips.
+
 When `segmentation.word_split_enabled` is true, Whisper word timestamps add up
 to `word_split_max_boundaries` finer cuts inside an acoustic region. This
 separates adjacent lines and repeated takes whose pauses are shorter than the
 main silence threshold; alignment can still merge the pieces when they belong
-to one line.
+to one line. The boundary count is a soft cap: exceptionally long pieces add
+their strongest remaining word gaps until they are no longer than
+`word_split_max_segment_seconds`.
 
 ### 4. Transcribe the temporary segments
 
@@ -130,9 +140,12 @@ to one line.
 
 Every base WAV is decoded independently, including voiced segments for which
 the recording-level transcript was empty. Segment decoding always uses
-`condition_on_previous_text: false` and `vad_filter: false`, so context from a
-previous take cannot reorder a short phrase and Whisper VAD cannot discard
-clips such as "Yes?". The segment files already contain the configured
+`vad_filter: false`, but a nonempty result is discarded when both its RMS is
+below `silence_rejection_max_rms_dbfs` and Whisper's no-speech probability is
+above `silence_rejection_min_no_speech_probability`. This prevents silent
+clips from becoming candidates such as `Thank you.`. It also uses
+`condition_on_previous_text: false`, so context from a previous take cannot
+reorder a short phrase. The segment files already contain the configured
 pre/post padding from segmentation.
 
 Independent clips are decoded in batches for substantially better accelerator
@@ -255,7 +268,8 @@ may raise that recovery limit but can no longer lower it.
 `fragment_join_max_actions` is different: it is the number of recovery
 alternatives retained per line for exact-span verification, not a merge-size
 limit. `fragment_join_fallback_max_actions` separately bounds fallback joins;
-`intra_segment_trim_max_actions_per_line` bounds pause-based trims.
+`intra_segment_trim_max_actions_per_line` and
+`intra_segment_trim_max_actions_per_segment` bound pause-based trims.
 
 Repeated takes are blocked from `AUTO_OK` by three complementary checks:
 repeated transcript words reduce token precision, merged spans with voiced but
@@ -294,13 +308,14 @@ when a nonverbal line is selected.
 
 ### Alignment configuration
 
-New projects write a compact grouped configuration:
+New projects write a complete grouped configuration. Every effective alignment
+setting is serialized and available in the settings window:
 
 ```json
 {
   "alignment": {
     "span_search": {
-      "max_segments": 10,
+      "max_segments": 8,
       "max_gap_seconds": 2.5,
       "max_duration_seconds": 35.0,
       "minimum_score": 45.0
@@ -323,7 +338,7 @@ New projects write a compact grouped configuration:
       "enabled": true,
       "max_candidates_per_line": 10,
       "fallback_candidates_per_line": 2,
-      "max_segments": 10,
+      "max_segments": 8,
       "trim_oversized_segments": true,
       "trim_candidates_per_line": 2,
       "trim_minimum_gap_seconds": 0.4
@@ -338,9 +353,9 @@ New projects write a compact grouped configuration:
 
 Existing projects using the original flat alignment keys remain supported.
 When both forms specify the same option, the flat legacy value wins. Defaults
-and validation are centralized in `dialogue_pipeline/alignment_settings.py`;
-advanced recovery constants no longer need to be copied into every new
-`project.json`.
+and validation are centralized in `dialogue_pipeline/alignment_settings.py`.
+The first grouped-settings version's accidental 10-segment defaults migrate
+back to the historical 8-segment limits.
 
 ### 6. Finalize selected files
 

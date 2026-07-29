@@ -31,7 +31,7 @@ PROJECT_STRUCTURE_KEYS = {
     "audio_inventory",
     "sessions",
 }
-PROJECT_SETTINGS_VERSION = 2
+PROJECT_SETTINGS_VERSION = 3
 
 
 def _name_key(value: str) -> str:
@@ -237,6 +237,13 @@ def default_project_settings() -> dict[str, Any]:
             "word_split_min_region_seconds": 1.5,
             "word_split_max_boundaries": 2,
             "word_split_max_segment_seconds": 8.0,
+            "word_split_snap_enabled": True,
+            "word_split_snap_search_seconds": 0.20,
+            "word_split_snap_window_seconds": 0.02,
+            "word_split_snap_max_rms_dbfs": -42.0,
+            "voice_boundary_detection_enabled": True,
+            "voice_boundary_vad_threshold": 0.50,
+            "voice_boundary_breath_vad_threshold": 0.70,
         },
         "alignment": default_alignment_config(),
         "export": {
@@ -294,7 +301,7 @@ def migrate_project_config(project: dict[str, Any]) -> dict[str, Any]:
 
     migrated = copy.deepcopy(project)
     version = int(migrated.get("settings_version", 1))
-    if version < PROJECT_SETTINGS_VERSION:
+    if version < 2:
         segmentation = migrated.get("segmentation")
         if isinstance(segmentation, dict):
             # Upgrade only values written by the previous defaults; explicit
@@ -305,11 +312,49 @@ def migrate_project_config(project: dict[str, Any]) -> dict[str, Any]:
                 segmentation["silence_detection_min_seconds"] = 0.20
             if segmentation.get("split_gap_seconds") == 0.35:
                 segmentation["split_gap_seconds"] = 0.20
+    if version < 3:
+        segmentation = migrated.get("segmentation")
+        if not isinstance(segmentation, dict):
+            segmentation = {}
+            migrated["segmentation"] = segmentation
+        configured_alignment = migrated.get("alignment")
+        audio_boundaries = {}
+        if isinstance(configured_alignment, dict):
+            recovery = configured_alignment.get("recovery")
+            if isinstance(recovery, dict):
+                candidate = recovery.get("audio_boundaries")
+                if isinstance(candidate, dict):
+                    audio_boundaries = candidate
+        segmentation.setdefault("voice_boundary_detection_enabled", True)
+        segmentation.setdefault(
+            "word_split_snap_enabled",
+            bool(audio_boundaries.get("snap_word_gaps", True)),
+        )
+        segmentation.setdefault(
+            "word_split_snap_search_seconds",
+            float(audio_boundaries.get("snap_search_seconds", 0.20)),
+        )
+        segmentation.setdefault(
+            "word_split_snap_window_seconds",
+            float(audio_boundaries.get("snap_window_seconds", 0.02)),
+        )
+        segmentation.setdefault(
+            "word_split_snap_max_rms_dbfs",
+            float(audio_boundaries.get("snap_maximum_rms_dbfs", -42.0)),
+        )
+        segmentation.setdefault(
+            "voice_boundary_vad_threshold",
+            float(audio_boundaries.get("vad_threshold", 0.50)),
+        )
+        segmentation.setdefault(
+            "voice_boundary_breath_vad_threshold",
+            float(audio_boundaries.get("breath_vad_threshold", 0.70)),
+        )
     configured = migrated.get("alignment")
     if configured is not None:
         values = dict(AlignmentSettings.from_value(configured))
         is_grouped_v1 = bool(
-            version < PROJECT_SETTINGS_VERSION
+            version < 2
             and isinstance(configured, dict)
             and "span_search" in configured
         )

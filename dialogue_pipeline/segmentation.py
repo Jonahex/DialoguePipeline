@@ -9,7 +9,9 @@ from .audio import (
     acoustic_regions,
     cut_pcm_wav,
     detect_silences,
+    pcm_voice_bounds,
     prepare_pcm_segmentation_source,
+    quietest_pcm_boundary,
     seconds_to_sample,
     transcript_for_region,
 )
@@ -30,6 +32,8 @@ def split_regions_on_word_gaps(
     *,
     duration_seconds: float,
     settings: dict[str, Any],
+    audio_path: Path | None = None,
+    sample_rate: int | None = None,
 ) -> list[dict[str, Any]]:
     if not bool(settings.get("word_split_enabled", True)):
         return regions
@@ -71,7 +75,40 @@ def split_regions_on_word_gaps(
             right_start = float(right.get("start", speech_end))
             gap = right_start - left_end
             if gap >= minimum_gap:
-                gap_candidates.append((gap, (left_end + right_start) / 2.0))
+                boundary = (left_end + right_start) / 2.0
+                if (
+                    audio_path is not None
+                    and sample_rate is not None
+                    and bool(settings.get("word_split_snap_enabled", True))
+                ):
+                    boundary = quietest_pcm_boundary(
+                        audio_path,
+                        proposed_sample=round(boundary * sample_rate),
+                        minimum_sample=round(left_end * sample_rate),
+                        maximum_sample=round(right_start * sample_rate),
+                        search_seconds=min(
+                            float(
+                                settings.get(
+                                    "word_split_snap_search_seconds",
+                                    0.20,
+                                )
+                            ),
+                            gap / 2.0,
+                        ),
+                        window_seconds=float(
+                            settings.get(
+                                "word_split_snap_window_seconds",
+                                0.02,
+                            )
+                        ),
+                        maximum_rms_dbfs=float(
+                            settings.get(
+                                "word_split_snap_max_rms_dbfs",
+                                -42.0,
+                            )
+                        ),
+                    ) / sample_rate
+                gap_candidates.append((gap, boundary))
         ranked_gaps = sorted(gap_candidates, reverse=True)
         selected = {
             boundary for _, boundary in ranked_gaps[:maximum_boundaries]
@@ -163,6 +200,48 @@ def segment_project(
     output_sample_rate = int(export_settings.get("sample_rate", 48000))
     output_channels = int(export_settings.get("channels", 1))
     output_bits = int(export_settings.get("bits_per_sample", 16))
+    voice_boundary_settings = {
+        "enabled": bool(
+            settings.get("voice_boundary_detection_enabled", True)
+        ),
+        "vad_threshold": float(
+            settings.get("voice_boundary_vad_threshold", 0.50)
+        ),
+        "breath_vad_threshold": float(
+            settings.get("voice_boundary_breath_vad_threshold", 0.70)
+        ),
+    }
+    for key, default in (
+        ("word_split_snap_search_seconds", 0.20),
+        ("word_split_snap_window_seconds", 0.02),
+    ):
+        if float(settings.get(key, default)) < 0.0:
+            raise ValueError(f"segmentation.{key} cannot be negative")
+    snap_maximum_rms = float(
+        settings.get("word_split_snap_max_rms_dbfs", -42.0)
+    )
+    if not -120.0 <= snap_maximum_rms <= 0.0:
+        raise ValueError(
+            "segmentation.word_split_snap_max_rms_dbfs must be between "
+            "-120 and 0"
+        )
+    if not 0.0 <= voice_boundary_settings["vad_threshold"] <= 1.0:
+        raise ValueError(
+            "segmentation.voice_boundary_vad_threshold must be between 0 and 1"
+        )
+    if not 0.0 <= voice_boundary_settings["breath_vad_threshold"] <= 1.0:
+        raise ValueError(
+            "segmentation.voice_boundary_breath_vad_threshold must be "
+            "between 0 and 1"
+        )
+    if (
+        voice_boundary_settings["breath_vad_threshold"]
+        < voice_boundary_settings["vad_threshold"]
+    ):
+        raise ValueError(
+            "segmentation.voice_boundary_breath_vad_threshold must be at "
+            "least segmentation.voice_boundary_vad_threshold"
+        )
     inventory = inventory_by_path(project_dir, project)
     transcript_dir = project_dir / "transcripts"
     segment_root = project_dir / "segments"
@@ -202,6 +281,7 @@ def segment_project(
                 "audio_sha256": inventory_item["sha256"],
                 "transcription_cache_key": transcription.get("cache_key"),
                 "settings": settings,
+                "voice_boundary_detection": voice_boundary_settings,
                 "export": export_settings,
             }
         )
@@ -278,6 +358,8 @@ def segment_project(
             transcription,
             duration_seconds=duration_seconds,
             settings=settings,
+            audio_path=working_audio,
+            sample_rate=sample_rate,
         )
         regions = prevent_region_overlaps(regions)
         session_dir = segment_root / session["id"]
@@ -302,6 +384,41 @@ def segment_project(
                 end_sample=end_sample,
                 fade_ms=float(settings.get("fade_ms", 5.0)),
             )
+            voice_bounds = None
+            if voice_boundary_settings["enabled"]:
+                speech_bounds = pcm_voice_bounds(
+                    working_audio,
+                    start_sample=start_sample,
+                    end_sample=end_sample,
+                    threshold=voice_boundary_settings["vad_threshold"],
+                )
+                breath_bounds = pcm_voice_bounds(
+                    working_audio,
+                    start_sample=start_sample,
+                    end_sample=end_sample,
+                    threshold=voice_boundary_settings[
+                        "breath_vad_threshold"
+                    ],
+                )
+                voice_bounds = {
+                    "source": "silero_vad",
+                    "speech": (
+                        {
+                            "start_sample": speech_bounds[0],
+                            "end_sample": speech_bounds[1],
+                        }
+                        if speech_bounds is not None
+                        else None
+                    ),
+                    "strict_speech": (
+                        {
+                            "start_sample": breath_bounds[0],
+                            "end_sample": breath_bounds[1],
+                        }
+                        if breath_bounds is not None
+                        else None
+                    ),
+                }
             transcript, words, probability = transcript_for_region(
                 transcription,
                 start_sample / sample_rate,
@@ -325,6 +442,7 @@ def segment_project(
                     "words": words,
                     "asr_probability": probability,
                     "split_source": region.get("split_source", "acoustic"),
+                    "voice_bounds": voice_bounds,
                     "metrics": metrics,
                 }
             )
@@ -349,6 +467,7 @@ def segment_project(
                 "median_split_gap_seconds": (
                     statistics.median(gap_durations) if gap_durations else None
                 ),
+                "voice_boundary_detection": voice_boundary_settings,
                 "segments": segment_records,
                 "derived_segments": [],
             }

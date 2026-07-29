@@ -16,6 +16,7 @@ from dialogue_pipeline.alignment import (
     _boundary_noise_cleanup_actions,
     _boundary_voice_trim_actions,
     _candidate_reliability,
+    _complete_subspan_recovery_actions,
     _edge_vocalization_extension_actions,
     _exact_line_scores,
     _expand_alignment_actions,
@@ -209,10 +210,51 @@ def test_word_gap_boundary_snaps_after_release_burst(tmp_path: Path) -> None:
         },
         minimum_gap=0.10,
         maximum_boundaries=1,
-        settings={},
+        segmentation_settings={},
         project_dir=tmp_path,
     )
     assert boundaries[0][1] == pytest.approx(snapped / sample_rate)
+
+    regions = split_regions_on_word_gaps(
+        [
+            {
+                "speech_start": 0.0,
+                "speech_end": 0.5,
+                "start": 0.0,
+                "end": 0.5,
+            }
+        ],
+        {
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 0.5,
+                    "text": "not I",
+                    "words": [
+                        {"word": " not", "start": 0.0, "end": 0.12},
+                        {"word": " I", "start": 0.42, "end": 0.50},
+                    ],
+                }
+            ]
+        },
+        duration_seconds=0.5,
+        settings={
+            "word_split_enabled": True,
+            "word_split_gap_seconds": 0.10,
+            "word_split_min_region_seconds": 0.10,
+            "word_split_max_boundaries": 1,
+            "word_split_max_segment_seconds": 8.0,
+            "minimum_segment_seconds": 0.05,
+            "pre_padding_seconds": 0.0,
+            "post_padding_seconds": 0.0,
+            "word_split_snap_enabled": True,
+        },
+        audio_path=audio_path,
+        sample_rate=sample_rate,
+    )
+    assert len(regions) == 2
+    assert regions[0]["speech_end"] == pytest.approx(snapped / sample_rate)
+    assert regions[1]["speech_start"] == pytest.approx(snapped / sample_rate)
 
 
 def test_boundary_voice_trim_creates_clean_candidate_and_marks_original(
@@ -348,6 +390,112 @@ def test_boundary_voice_trim_uses_strict_tail_vad_after_final_word(
         0.12 * sample_rate
     )
     assert action["boundary_voice_trailing_seconds"] == pytest.approx(1.0)
+
+
+def test_boundary_voice_trim_reuses_segmentation_voice_bounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+
+    def unexpected_live_vad(*_args, **_kwargs):
+        raise AssertionError("alignment should reuse segmentation VAD metadata")
+
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_bounds",
+        unexpected_live_vad,
+    )
+    line_text = "A bet's a bet. Here's your gold."
+    lines = [{"line_id": "target", "line": line_text}]
+    action = {
+        "type": "assigned",
+        "start_index": 0,
+        "count": 2,
+        "line_index": 0,
+        "match_score": 100.0,
+        "transcript": line_text,
+        "duration_plausibility": 100.0,
+    }
+    cleaned = _boundary_voice_trim_actions(
+        [action],
+        project_dir=tmp_path,
+        session_entry={
+            "sample_rate": sample_rate,
+            "working_audio": "source.wav",
+            "audio": "source.wav",
+            "voice_boundary_detection": {
+                "enabled": True,
+                "vad_threshold": 0.5,
+                "breath_vad_threshold": 0.7,
+            },
+        },
+        lines=lines,
+        base_segments=[
+            {
+                "start_sample": 0,
+                "end_sample": sample_rate * 5,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+                "voice_bounds": {
+                    "source": "silero_vad",
+                    "speech": {
+                        "start_sample": sample_rate,
+                        "end_sample": round(sample_rate * 4.8),
+                    },
+                    "strict_speech": {
+                        "start_sample": sample_rate,
+                        "end_sample": round(sample_rate * 4.5),
+                    },
+                },
+            },
+            {
+                "start_sample": sample_rate * 5,
+                "end_sample": sample_rate * 10,
+                "start_seconds": 5.0,
+                "end_seconds": 10.0,
+                "segment_asr": {
+                    "primary": {
+                        "words": [
+                            {
+                                "word": " gold.",
+                                "start": 2.5,
+                                "end": 3.8,
+                            },
+                        ]
+                    }
+                },
+                "voice_bounds": {
+                    "source": "silero_vad",
+                    "speech": {
+                        "start_sample": round(sample_rate * 5.2),
+                        "end_sample": round(sample_rate * 9.8),
+                    },
+                    "strict_speech": {
+                        "start_sample": round(sample_rate * 5.2),
+                        "end_sample": sample_rate * 9,
+                    },
+                },
+            },
+        ],
+        settings={},
+        evaluator=TranscriptEvaluator(lines, {}),
+        segmentation_settings={
+            "voice_boundary_detection_enabled": True,
+            "voice_boundary_vad_threshold": 0.5,
+            "voice_boundary_breath_vad_threshold": 0.7,
+        },
+    )
+
+    assert len(cleaned) == 1
+    assert cleaned[0]["trim_start_sample"] == sample_rate - round(
+        0.08 * sample_rate
+    )
+    assert cleaned[0]["trim_end_sample"] == sample_rate * 9 + round(
+        0.12 * sample_rate
+    )
 
 
 def test_shared_model_cache_resolution(tmp_path: Path, monkeypatch) -> None:
@@ -1067,7 +1215,7 @@ def test_grouped_v1_defaults_migrate_back_to_historical_limits() -> None:
     migrated = migrate_project_config(project)
     settings = AlignmentSettings.from_value(migrated["alignment"])
 
-    assert migrated["settings_version"] == 2
+    assert migrated["settings_version"] == 3
     assert settings["max_merge_segments"] == 8
     assert settings["fragment_join_max_segments"] == 8
     assert len(settings) == len(ALIGNMENT_DEFAULTS)
@@ -1075,7 +1223,51 @@ def test_grouped_v1_defaults_migrate_back_to_historical_limits() -> None:
         "silence_noise_db": -40.0,
         "silence_detection_min_seconds": 0.20,
         "split_gap_seconds": 0.20,
+        "word_split_snap_enabled": True,
+        "word_split_snap_search_seconds": 0.20,
+        "word_split_snap_window_seconds": 0.02,
+        "word_split_snap_max_rms_dbfs": -42.0,
+        "voice_boundary_detection_enabled": True,
+        "voice_boundary_vad_threshold": 0.50,
+        "voice_boundary_breath_vad_threshold": 0.70,
     }
+
+
+def test_v2_alignment_vad_thresholds_migrate_to_segmentation() -> None:
+    project = {
+        "schema_version": 1,
+        "settings_version": 2,
+        "segmentation": {},
+        "alignment": {
+            "recovery": {
+                "audio_boundaries": {
+                    "snap_word_gaps": False,
+                    "snap_search_seconds": 0.15,
+                    "vad_threshold": 0.55,
+                    "breath_vad_threshold": 0.75,
+                }
+            }
+        },
+    }
+
+    migrated = migrate_project_config(project)
+
+    assert migrated["settings_version"] == 3
+    assert (
+        migrated["segmentation"]["voice_boundary_vad_threshold"] == 0.55
+    )
+    assert migrated["segmentation"]["word_split_snap_enabled"] is False
+    assert (
+        migrated["segmentation"]["word_split_snap_search_seconds"] == 0.15
+    )
+    assert (
+        migrated["segmentation"]["voice_boundary_breath_vad_threshold"]
+        == 0.75
+    )
+    assert (
+        "vad_threshold"
+        not in migrated["alignment"]["recovery"]["audio_boundaries"]
+    )
 
 
 def test_generic_and_bandit_recordings_infer_narrow_sheet_mappings(
@@ -1860,9 +2052,9 @@ def test_fragment_join_can_trim_shared_take_boundary_segment() -> None:
             "Yet. It's not over.",
             [
                 {"word": " Yet", "start": 0.0, "end": 0.3},
-                {"word": " It's", "start": 0.64, "end": 0.94},
-                {"word": " not", "start": 0.94, "end": 1.24},
-                {"word": " over", "start": 1.24, "end": 1.64},
+                {"word": " It's", "start": 0.44, "end": 0.74},
+                {"word": " not", "start": 0.74, "end": 1.04},
+                {"word": " over", "start": 1.04, "end": 1.44},
             ],
             2.0,
         ),
@@ -1998,6 +2190,72 @@ def test_boundary_noise_cleanup_recovers_clean_single_base_span() -> None:
     assert cleaned[0]["count"] == 1
     assert cleaned[0]["match_score"] == 100.0
     assert cleaned[0]["boundary_noise_cleanup"] is True
+
+
+def test_complete_subspan_recovery_restores_exact_base_hidden_by_merge() -> None:
+    line_text = "Is there anything else you wish to know?"
+    lines = [
+        {"line_id": "target", "line": line_text},
+        {"line_id": "next", "line": "Yes."},
+    ]
+    segments = [
+        {
+            "segment_id": "session__s00001",
+            "start_sample": 0,
+            "end_sample": 96000,
+            "start_seconds": 0.0,
+            "end_seconds": 2.0,
+            "transcript": line_text,
+            "asr_probability": 0.99,
+        },
+        {
+            "segment_id": "session__s00002",
+            "start_sample": 100800,
+            "end_sample": 120000,
+            "start_seconds": 2.1,
+            "end_seconds": 2.5,
+            "transcript": "",
+            "asr_probability": 0.0,
+        },
+        {
+            "segment_id": "session__s00003",
+            "start_sample": 124800,
+            "end_sample": 153600,
+            "start_seconds": 2.6,
+            "end_seconds": 3.2,
+            "transcript": "Yes.",
+            "asr_probability": 0.99,
+        },
+    ]
+    evaluator = TranscriptEvaluator(lines, {})
+    source_action = {
+        "type": "assigned",
+        "start_index": 0,
+        "count": 3,
+        "line_index": 0,
+        "match_score": text_similarity(line_text, f"{line_text} Yes."),
+        "transcript": f"{line_text} Yes.",
+        "duration_plausibility": 80.0,
+        "order_hint": 0.0,
+        "top_matches": [],
+    }
+
+    recovered = _complete_subspan_recovery_actions(
+        [source_action],
+        lines=lines,
+        settings={},
+        evaluator=evaluator,
+        span_catalog=SpanCatalog(segments, {}),
+    )
+
+    clean = next(
+        action
+        for action in recovered
+        if action["start_index"] == 0 and action["count"] == 1
+    )
+    assert clean["transcript"] == line_text
+    assert clean["match_score"] == 100.0
+    assert clean["complete_subspan_recovery"] is True
 
 
 def test_edge_cue_recovery_attaches_adjacent_vocalization_segment() -> None:
@@ -3127,6 +3385,39 @@ def test_boundary_clause_consensus_requires_recording_support() -> None:
     )
 
     assert rescued is None
+
+
+def test_ellipsis_hesitation_can_use_constituent_asr_without_recording_support() -> None:
+    line_text = (
+        "I... err... I misspoke. I simply refer to the good fortune "
+        "of the Duilius household, in all aspects of life."
+    )
+    lines = [{"line_id": "target", "line": line_text}]
+    evaluator = TranscriptEvaluator(lines, {})
+    preliminary = (
+        "I, um... I misspoke. I simply refer to the good fortune "
+        "of the Duilius household, in all aspects of life."
+    )
+    exact = (
+        "I misspoke. I simply refer to the good fortune "
+        "of the Duilius household, in all aspects of life."
+    )
+
+    fidelity = evaluator.evaluate(0, preliminary)
+    assert fidelity.sentence["clause_count"] == 2
+    assert fidelity.sentence["missing_clause_count"] == 0
+    assert fidelity.sentence["clauses_in_order"] is True
+
+    rescued = _boundary_clause_consensus_transcript(
+        line_index=0,
+        exact_transcript=exact,
+        preliminary_transcript=preliminary,
+        recording_transcript="",
+        evaluator=evaluator,
+        settings={},
+    )
+
+    assert rescued == preliminary
 
 
 def test_word_timestamp_gaps_split_a_region_into_take_candidates() -> None:
@@ -4862,7 +5153,27 @@ def test_finalize_can_optionally_reuse_one_segment(tmp_path: Path) -> None:
     assert result["allow_segment_reuse"] is True
 
 
-def test_segmentation_and_alignment_integration(tmp_path: Path) -> None:
+def test_segmentation_and_alignment_integration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.segmentation as segmentation_module
+
+    def fake_voice_bounds(
+        _path: Path,
+        *,
+        start_sample: int,
+        end_sample: int,
+        threshold: float,
+    ) -> tuple[int, int]:
+        inset = 2400 if threshold < 0.7 else 3600
+        return start_sample + inset, end_sample - inset
+
+    monkeypatch.setattr(
+        segmentation_module,
+        "pcm_voice_bounds",
+        fake_voice_bounds,
+    )
     source = tmp_path / "source.wav"
     _write_pattern(source)
     source_hash = sha256_file(source)
@@ -5037,6 +5348,18 @@ def test_segmentation_and_alignment_integration(tmp_path: Path) -> None:
     )
     manifest_path = segment_project(project_dir=tmp_path, project=project)
     assert manifest_path.is_file()
+    manifest = read_json(manifest_path)
+    manifest_session = manifest["sessions"][0]
+    assert manifest_session["voice_boundary_detection"] == {
+        "enabled": True,
+        "vad_threshold": 0.5,
+        "breath_vad_threshold": 0.7,
+    }
+    assert all(
+        segment["voice_bounds"]["speech"] is not None
+        and segment["voice_bounds"]["strict_speech"] is not None
+        for segment in manifest_session["segments"]
+    )
     stale_unmatched = tmp_path / "B_unmatched_segments.tsv"
     stale_unmatched.write_text("stale", encoding="utf-8")
     outputs = align_project(

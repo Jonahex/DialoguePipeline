@@ -132,7 +132,29 @@ separates adjacent lines and repeated takes whose pauses are shorter than the
 main silence threshold; alignment can still merge the pieces when they belong
 to one line. The boundary count is a soft cap: exceptionally long pieces add
 their strongest remaining word gaps until they are no longer than
-`word_split_max_segment_seconds`.
+`word_split_max_segment_seconds`. Each ASR midpoint is snapped to the quietest
+nearby PCM window inside its word gap before the base clips are written.
+
+Segmentation also analyzes every padded base segment with normal and strict
+Silero VAD thresholds and stores the absolute results in
+`segments_manifest.json` as `voice_bounds`. It does not destructively shorten
+the base WAV: alignment later decides whether an edge sound belongs to the
+script and composes the stored bounds across merged candidates. The defaults
+are:
+
+```json
+{
+  "segmentation": {
+    "word_split_snap_enabled": true,
+    "word_split_snap_search_seconds": 0.2,
+    "word_split_snap_window_seconds": 0.02,
+    "word_split_snap_max_rms_dbfs": -42.0,
+    "voice_boundary_detection_enabled": true,
+    "voice_boundary_vad_threshold": 0.5,
+    "voice_boundary_breath_vad_threshold": 0.7
+  }
+}
+```
 
 ### 4. Transcribe the temporary segments
 
@@ -225,7 +247,8 @@ the line receive `EXTRA_LINE_START` or `EXTRA_LINE_END`. By default,
 opening or closing comparison window prevents automatic acceptance. Common equivalent spoken
 forms are canonicalized before scoring, including contractions such as
 `could've`/`could have`, `I've`/`I have`, and colloquialisms such as
-`c'mon`/`come on`. A merged span containing substantial, non-quiet audio with
+`c'mon`/`come on`. Hesitation variants such as `err`, `erm`, `uh`, and `um`
+are also equivalent. A merged span containing substantial, non-quiet audio with
 no transcript is kept for review with reason `MERGED_UNTRANSCRIBED_AUDIO`
 rather than accepted automatically. Quiet padding rejected by ASR is ignored,
 and an exact-span transcript whose first or last word is far from the audio
@@ -237,7 +260,9 @@ selection score so technical quality, ASR confidence, and clause completeness
 can favor a cleaner take over one with a trivially higher text score.
 
 Multi-sentence lines also use clause-level completeness. Every clause separated
-by `.`, `?`, or `!` must reach `reliable_min_clause_score`, otherwise the
+by a sentence-ending `.`, `?`, or `!` must reach
+`reliable_min_clause_score`. Ellipses around an explicit hesitation such as
+`I... err... I misspoke` are treated as pauses inside one clause. Otherwise the
 candidate stays in review with reason `MISSING_SENTENCE`; clauses in the wrong
 order receive `SENTENCE_ORDER_MISMATCH`. When a line is split, the fragment
 joiner searches contiguous base-segment windows, including windows that merely
@@ -267,10 +292,16 @@ better line.
 When one oversized base segment contains multiple performances, including a
 base segment already covered by a merged primary action, alignment can recover
 line-sized trimmed candidates from the independent base-ASR word timestamps.
+It also checks proper subspans of a selected merged action and restores any
+constituent span that independently contains the complete script line. This
+prevents the interval resolver from hiding a clean base candidate merely
+because a longer overlapping merge won the primary path.
 Fragment joins can also trim the first or last base segment at the same
 pause-based boundaries, allowing a line to cross a shared take-boundary
-segment. Edge joins use a 0.3-second pause by default, while trims wholly
-inside one base retain the more conservative 0.4-second default. When two
+segment. Edge joins use a 0.3-second pause by default and a bounded 0.1-second
+fallback for otherwise text-complete joins; trims wholly inside one base retain
+the more conservative 0.4-second default. All such candidates are independently
+transcribed before they can become `AUTO_OK`. When two
 complete copies of the same line are adjacent but Whisper stretches a boundary
 word across the pause, the repetition itself supplies a split boundary and
 both halves are independently transcribed again before `AUTO_OK`. The
@@ -307,14 +338,16 @@ the script includes the sound at that edge. Alignment retains the original
 merged span for review, rejects it from `AUTO_OK` when exact-span ASR omits the
 sound, and creates a clean candidate without that boundary segment. This
 handles imprecise segmentation without blindly dropping a whole textual base
-segment. When the extra breath or room noise is inside the outer edge of a
-textual segment, Silero VAD creates an additional candidate trimmed to the
-detected voice bounds with short pre/post padding. Scripted edge-performance
-cues suppress the corresponding trim. The untrimmed candidate remains
-available for review and cannot become `AUTO_OK` while its cleaned alternative
-exists. A stricter second VAD pass detects trailing breaths that the normal
-speech threshold accepts as voice; the final ASR word timestamp is a hard
-lower bound, so this pass cannot cut recognized dialogue.
+segment. For extra breath or room noise inside a textual segment, alignment
+uses the voice bounds computed during segmentation and creates an additional
+candidate with short pre/post padding. It composes those bounds across merged
+base segments; only a newly created intra-segment boundary or a legacy
+manifest without stored bounds requires live analysis. Scripted
+edge-performance cues suppress the corresponding trim. The
+untrimmed candidate remains available for review and cannot become `AUTO_OK`
+while its cleaned alternative exists. The strict bounds detect trailing
+breaths that the normal speech threshold accepts as voice; the final ASR word
+timestamp is a hard lower bound, so this pass cannot cut recognized dialogue.
 
 Pause-based cuts inside a base segment use ASR word gaps to locate candidate
 boundaries. The midpoint is only the initial estimate: alignment snaps it to
@@ -322,10 +355,11 @@ the quietest nearby PCM window inside the word gap. This avoids splitting a
 word-ending release consonant that extends beyond Whisper's timestamp.
 
 Exact merged-span ASR normally remains authoritative. One narrow exception is
-a short opening or closing clause rejected by exact ASR when both the
-constituent base transcription and the recording-level transcription
-independently support that scripted boundary while the rest of the exact span
-is complete. Such candidates use
+an opening or closing hesitation that merged ASR drops while the complete,
+ordered constituent transcription retains it. Other short boundary clauses
+still require both the constituent base transcription and the recording-level
+transcription to support the scripted boundary while the rest of the exact
+span is complete. Such candidates use
 `constituent_recording_boundary_consensus` and record
 `boundary_clause_consensus: true` in `alignment.json`.
 
@@ -397,19 +431,15 @@ setting is serialized and available in the settings window:
       "trim_candidates_per_line": 2,
       "trim_minimum_gap_seconds": 0.4,
       "edge_trim_minimum_gap_seconds": 0.3,
+      "edge_trim_fallback_minimum_gap_seconds": 0.1,
+      "recover_complete_subspans": true,
       "clean_paralinguistic_boundaries": true,
       "boundary_cleanup_minimum_score": 85.0,
       "audio_boundaries": {
-        "snap_word_gaps": true,
-        "snap_search_seconds": 0.2,
-        "snap_window_seconds": 0.02,
-        "snap_maximum_rms_dbfs": -42.0,
         "trim_non_speech_edges": true,
         "minimum_edge_seconds": 0.3,
         "pre_padding_seconds": 0.08,
-        "post_padding_seconds": 0.12,
-        "vad_threshold": 0.5,
-        "breath_vad_threshold": 0.7
+        "post_padding_seconds": 0.12
       },
       "edge_cues": {
         "extend_adjacent_segments": true,

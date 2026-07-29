@@ -120,6 +120,10 @@ _PARALINGUISTIC_TOKENS = frozenset(
     }
 )
 
+_HESITATION_TOKENS = frozenset(
+    {"er", "err", "erm", "uh", "uhh", "um", "umm"}
+)
+
 
 def _script_edge_performance_cues(value: str) -> tuple[bool, bool]:
     """Return whether a spoken line starts or ends with a direction cue."""
@@ -156,7 +160,11 @@ def _text_features(
         value,
         remove_parenthetical_cues=remove_parenthetical_cues,
     )
-    tokens = tuple(normalized.split())
+    tokens = tuple(
+        "hesitation" if token in _HESITATION_TOKENS else token
+        for token in normalized.split()
+    )
+    normalized = " ".join(tokens)
     return TextFeatures(
         normalized=normalized,
         tokens=tokens,
@@ -436,7 +444,7 @@ def _transcript_fidelity_features(
 
 
 def script_clauses(value: str) -> list[str]:
-    return [
+    clauses = [
         clause
         for clause in (
             part.strip()
@@ -444,6 +452,39 @@ def script_clauses(value: str) -> list[str]:
         )
         if normalize_text(clause)
     ]
+    hesitation_indexes = [
+        index
+        for index, clause in enumerate(clauses)
+        if _text_features(clause).tokens == ("hesitation",)
+    ]
+    if not hesitation_indexes:
+        return clauses
+
+    # Ellipses normally separate script clauses, but actors also use them to
+    # spell out a hesitation: "I... err... I misspoke." Treat that whole
+    # performed phrase as one clause while preserving ordinary ellipsis
+    # boundaries such as "Maybe over here... No, nothing."
+    ranges = [
+        (
+            max(0, index - 1),
+            min(len(clauses) - 1, index + 1),
+        )
+        for index in hesitation_indexes
+    ]
+    merged_ranges: list[list[int]] = []
+    for start, end in ranges:
+        if merged_ranges and start <= merged_ranges[-1][1]:
+            merged_ranges[-1][1] = max(merged_ranges[-1][1], end)
+        else:
+            merged_ranges.append([start, end])
+    result = []
+    clause_index = 0
+    for start, end in merged_ranges:
+        result.extend(clauses[clause_index:start])
+        result.append(" ".join(clauses[start : end + 1]))
+        clause_index = end + 1
+    result.extend(clauses[clause_index:])
+    return result
 
 
 def sentence_fidelity(
@@ -1682,6 +1723,82 @@ def _boundary_noise_cleanup_actions(
     return recovered
 
 
+def _complete_subspan_recovery_actions(
+    actions: list[dict[str, Any]],
+    *,
+    lines: list[dict[str, Any]],
+    settings: Mapping[str, Any] | AlignmentSettings,
+    evaluator: TranscriptEvaluator,
+    span_catalog: SpanCatalog,
+) -> list[dict[str, Any]]:
+    """Recover a complete textual subspan hidden by a selected merged span."""
+
+    settings = AlignmentSettings.from_value(settings)
+    if not bool(settings.get("complete_subspan_recovery_enabled", True)):
+        return []
+    minimum_match = float(
+        settings.get("boundary_noise_cleanup_min_match_score", 85.0)
+    )
+    occupied = {
+        (
+            int(action["line_index"]),
+            int(action["start_index"]),
+            int(action["count"]),
+        )
+        for action in actions
+    }
+    recovered = []
+    for source_action in actions:
+        check_processing_cancelled()
+        source_start = int(source_action["start_index"])
+        source_count = int(source_action["count"])
+        if source_count <= 1:
+            continue
+        line_index = int(source_action["line_index"])
+        if is_vocalization_script(str(lines[line_index]["line"])):
+            continue
+        source_end = source_start + source_count
+        for new_start in range(source_start, source_end):
+            for new_end in range(new_start + 1, source_end + 1):
+                new_count = new_end - new_start
+                if new_start == source_start and new_count == source_count:
+                    continue
+                key = (line_index, new_start, new_count)
+                if key in occupied:
+                    continue
+                action = _action_for_rebounded_span(
+                    source_action,
+                    start_index=new_start,
+                    count=new_count,
+                    lines=lines,
+                    settings=settings,
+                    evaluator=evaluator,
+                    span_catalog=span_catalog,
+                    metadata={"complete_subspan_recovery": True},
+                )
+                if action is None:
+                    continue
+                evaluation = evaluator.evaluate(
+                    line_index,
+                    str(action["transcript"]),
+                )
+                fidelity = evaluation.fidelity
+                sentence = evaluation.sentence
+                if (
+                    evaluation.match_score < minimum_match
+                    or float(fidelity["token_coverage"]) < 0.95
+                    or float(fidelity["token_precision"]) < 0.95
+                    or int(fidelity["leading_extra_token_count"]) > 0
+                    or int(fidelity["trailing_extra_token_count"]) > 0
+                    or int(sentence["missing_clause_count"]) > 0
+                    or not bool(sentence["clauses_in_order"])
+                ):
+                    continue
+                occupied.add(key)
+                recovered.append(action)
+    return recovered
+
+
 def _edge_vocalization_extension_actions(
     actions: list[dict[str, Any]],
     *,
@@ -1808,10 +1925,10 @@ def _word_gap_boundaries(
     *,
     minimum_gap: float,
     maximum_boundaries: int,
-    settings: Mapping[str, Any] | AlignmentSettings | None = None,
+    segmentation_settings: Mapping[str, Any] | None = None,
     project_dir: Path | None = None,
 ) -> list[tuple[int, float]]:
-    settings = AlignmentSettings.from_value(settings)
+    segmentation_settings = dict(segmentation_settings or {})
     primary_asr = ((segment.get("segment_asr") or {}).get("primary") or {})
     words = [
         word
@@ -1833,7 +1950,10 @@ def _word_gap_boundaries(
                 and sample_rate is not None
                 and segment.get("file")
                 and bool(
-                    settings.get("word_gap_boundary_snap_enabled", True)
+                    segmentation_settings.get(
+                        "word_split_snap_enabled",
+                        True,
+                    )
                 )
             ):
                 proposed_sample = round(boundary * sample_rate)
@@ -1844,22 +1964,22 @@ def _word_gap_boundaries(
                     maximum_sample=round(right_start * sample_rate),
                     search_seconds=min(
                         float(
-                            settings.get(
-                                "word_gap_boundary_snap_search_seconds",
+                            segmentation_settings.get(
+                                "word_split_snap_search_seconds",
                                 0.20,
                             )
                         ),
                         gap / 2.0,
                     ),
                     window_seconds=float(
-                        settings.get(
-                            "word_gap_boundary_snap_window_seconds",
+                        segmentation_settings.get(
+                            "word_split_snap_window_seconds",
                             0.02,
                         )
                     ),
                     maximum_rms_dbfs=float(
-                        settings.get(
-                            "word_gap_boundary_snap_max_rms_dbfs",
+                        segmentation_settings.get(
+                            "word_split_snap_max_rms_dbfs",
                             -42.0,
                         )
                     ),
@@ -1886,6 +2006,7 @@ def _trimmed_edge_span_previews(
     settings: Mapping[str, Any] | AlignmentSettings,
     span_catalog: SpanCatalog,
     project_dir: Path | None = None,
+    segmentation_settings: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Preview joins whose first or last base segment is split at a word gap."""
 
@@ -1902,8 +2023,14 @@ def _trimmed_edge_span_previews(
         return []
 
     settings = AlignmentSettings.from_value(settings)
-    minimum_gap = float(
-        settings.get("edge_trim_min_gap_seconds", 0.30)
+    minimum_gap = min(
+        float(settings.get("edge_trim_min_gap_seconds", 0.30)),
+        float(
+            settings.get(
+                "edge_trim_fallback_min_gap_seconds",
+                0.10,
+            )
+        ),
     )
     maximum_boundaries = max(
         1,
@@ -1937,14 +2064,14 @@ def _trimmed_edge_span_previews(
         first,
         minimum_gap=minimum_gap,
         maximum_boundaries=maximum_boundaries,
-        settings=settings,
+        segmentation_settings=segmentation_settings,
         project_dir=project_dir,
     )
     last_boundaries = _word_gap_boundaries(
         last,
         minimum_gap=minimum_gap,
         maximum_boundaries=maximum_boundaries,
-        settings=settings,
+        segmentation_settings=segmentation_settings,
         project_dir=project_dir,
     )
     full_start_sample = int(first["start_sample"])
@@ -2062,6 +2189,7 @@ def _multisentence_fragment_join_actions(
     evaluator: TranscriptEvaluator | None = None,
     span_catalog: SpanCatalog | None = None,
     project_dir: Path | None = None,
+    segmentation_settings: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     settings = AlignmentSettings.from_value(settings)
     evaluator = evaluator or TranscriptEvaluator(lines, settings)
@@ -2408,6 +2536,7 @@ def _multisentence_fragment_join_actions(
                     settings=settings,
                     span_catalog=span_catalog,
                     project_dir=project_dir,
+                    segmentation_settings=segmentation_settings,
                 )
                 previews = (
                     edge_previews
@@ -2834,6 +2963,7 @@ def _intra_segment_trim_actions(
     settings: Mapping[str, Any] | AlignmentSettings,
     evaluator: TranscriptEvaluator,
     project_dir: Path | None = None,
+    segmentation_settings: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Recover line-sized candidates inside an oversized base segment.
 
@@ -2844,6 +2974,7 @@ def _intra_segment_trim_actions(
     """
 
     settings = AlignmentSettings.from_value(settings)
+    segmentation_settings = dict(segmentation_settings or {})
     if not bool(settings.get("intra_segment_trim_enabled", True)):
         return []
 
@@ -2914,7 +3045,10 @@ def _intra_segment_trim_actions(
                 project_dir is not None
                 and segment.get("file")
                 and bool(
-                    settings.get("word_gap_boundary_snap_enabled", True)
+                    segmentation_settings.get(
+                        "word_split_snap_enabled",
+                        True,
+                    )
                 )
             ):
                 snapped_sample = quietest_pcm_boundary(
@@ -2924,22 +3058,22 @@ def _intra_segment_trim_actions(
                     maximum_sample=round(right_start * sample_rate),
                     search_seconds=min(
                         float(
-                            settings.get(
-                                "word_gap_boundary_snap_search_seconds",
+                            segmentation_settings.get(
+                                "word_split_snap_search_seconds",
                                 0.20,
                             )
                         ),
                         gap / 2.0,
                     ),
                     window_seconds=float(
-                        settings.get(
-                            "word_gap_boundary_snap_window_seconds",
+                        segmentation_settings.get(
+                            "word_split_snap_window_seconds",
                             0.02,
                         )
                     ),
                     maximum_rms_dbfs=float(
-                        settings.get(
-                            "word_gap_boundary_snap_max_rms_dbfs",
+                        segmentation_settings.get(
+                            "word_split_snap_max_rms_dbfs",
                             -42.0,
                         )
                     ),
@@ -3176,21 +3310,23 @@ def _action_word_sample_bounds(
     end_index = start_index + int(source_action["count"])
     word_bounds = []
     for segment in base_segments[start_index:end_index]:
-        words = (
+        primary_words = (
             ((segment.get("segment_asr") or {}).get("primary") or {}).get(
                 "words"
             )
-            or segment.get("words")
             or []
         )
+        words = primary_words or segment.get("words") or []
+        words_are_local = bool(primary_words) or str(
+            segment.get("transcript_source") or ""
+        ) not in {"", "session_asr_fallback"}
         segment_start = int(segment["start_sample"])
         for word in words:
             if word.get("start") is None or word.get("end") is None:
                 continue
-            word_start = segment_start + round(
-                float(word["start"]) * sample_rate
-            )
-            word_end = segment_start + round(float(word["end"]) * sample_rate)
+            offset = segment_start if words_are_local else 0
+            word_start = offset + round(float(word["start"]) * sample_rate)
+            word_end = offset + round(float(word["end"]) * sample_rate)
             if word_end <= raw_start or word_start >= raw_end:
                 continue
             word_bounds.append(
@@ -3207,6 +3343,48 @@ def _action_word_sample_bounds(
     )
 
 
+def _stored_action_voice_bounds(
+    *,
+    source_action: Mapping[str, Any],
+    base_segments: list[dict[str, Any]],
+    raw_start: int,
+    raw_end: int,
+    key: str,
+) -> tuple[bool, tuple[int, int] | None]:
+    """Compose segmentation-time VAD bounds for an untrimmed base span."""
+
+    start_index = int(source_action["start_index"])
+    end_index = start_index + int(source_action["count"])
+    if (
+        raw_start != int(base_segments[start_index]["start_sample"])
+        or raw_end != int(base_segments[end_index - 1]["end_sample"])
+    ):
+        return False, None
+
+    bounds = []
+    for segment in base_segments[start_index:end_index]:
+        metadata = segment.get("voice_bounds")
+        if not isinstance(metadata, Mapping) or key not in metadata:
+            return False, None
+        stored = metadata.get(key)
+        if stored is None:
+            continue
+        if not isinstance(stored, Mapping):
+            return False, None
+        bounds.append(
+            (
+                max(raw_start, int(stored["start_sample"])),
+                min(raw_end, int(stored["end_sample"])),
+            )
+        )
+    if not bounds:
+        return True, None
+    return True, (
+        min(start for start, _ in bounds),
+        max(end for _, end in bounds),
+    )
+
+
 def _boundary_voice_trim_actions(
     actions: list[dict[str, Any]],
     *,
@@ -3216,11 +3394,17 @@ def _boundary_voice_trim_actions(
     base_segments: list[dict[str, Any]],
     settings: Mapping[str, Any] | AlignmentSettings,
     evaluator: TranscriptEvaluator,
+    segmentation_settings: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Create clean alternatives when VAD finds non-speech at span edges."""
 
     settings = AlignmentSettings.from_value(settings)
+    segmentation_settings = dict(segmentation_settings or {})
     if not bool(settings.get("boundary_voice_trim_enabled", True)):
+        return []
+    if not bool(
+        segmentation_settings.get("voice_boundary_detection_enabled", True)
+    ):
         return []
     minimum_match = float(
         settings.get("boundary_noise_cleanup_min_match_score", 85.0)
@@ -3248,10 +3432,13 @@ def _boundary_voice_trim_actions(
         * sample_rate
     )
     threshold = float(
-        settings.get("boundary_voice_trim_vad_threshold", 0.50)
+        segmentation_settings.get("voice_boundary_vad_threshold", 0.50)
     )
     breath_threshold = float(
-        settings.get("boundary_voice_trim_breath_vad_threshold", 0.70)
+        segmentation_settings.get(
+            "voice_boundary_breath_vad_threshold",
+            0.70,
+        )
     )
     audio_path = resolve_project_path(
         project_dir,
@@ -3259,6 +3446,19 @@ def _boundary_voice_trim_actions(
     )
     voice_cache: dict[tuple[int, int], tuple[int, int] | None] = {}
     breath_voice_cache: dict[tuple[int, int], tuple[int, int] | None] = {}
+    stored_detection = session_entry.get("voice_boundary_detection")
+    stored_detection_current = bool(
+        isinstance(stored_detection, Mapping)
+        and bool(stored_detection.get("enabled", True))
+        and math.isclose(
+            float(stored_detection.get("vad_threshold", -1.0)),
+            threshold,
+        )
+        and math.isclose(
+            float(stored_detection.get("breath_vad_threshold", -1.0)),
+            breath_threshold,
+        )
+    )
     occupied = {
         (
             int(action["line_index"]),
@@ -3311,14 +3511,24 @@ def _boundary_voice_trim_actions(
         if raw_end <= raw_start:
             continue
         raw_key = (raw_start, raw_end)
-        if raw_key not in voice_cache:
-            voice_cache[raw_key] = pcm_voice_bounds(
-                audio_path,
-                start_sample=raw_start,
-                end_sample=raw_end,
-                threshold=threshold,
+        stored_available, voice_bounds = (False, None)
+        if stored_detection_current:
+            stored_available, voice_bounds = _stored_action_voice_bounds(
+                source_action=source_action,
+                base_segments=base_segments,
+                raw_start=raw_start,
+                raw_end=raw_end,
+                key="speech",
             )
-        voice_bounds = voice_cache[raw_key]
+        if not stored_available:
+            if raw_key not in voice_cache:
+                voice_cache[raw_key] = pcm_voice_bounds(
+                    audio_path,
+                    start_sample=raw_start,
+                    end_sample=raw_end,
+                    threshold=threshold,
+                )
+            voice_bounds = voice_cache[raw_key]
         if voice_bounds is None:
             continue
 
@@ -3338,14 +3548,27 @@ def _boundary_voice_trim_actions(
             and word_bounds is not None
             and breath_threshold > threshold
         ):
-            if raw_key not in breath_voice_cache:
-                breath_voice_cache[raw_key] = pcm_voice_bounds(
-                    audio_path,
-                    start_sample=raw_start,
-                    end_sample=raw_end,
-                    threshold=breath_threshold,
+            stored_breath_available, breath_voice_bounds = (False, None)
+            if stored_detection_current:
+                (
+                    stored_breath_available,
+                    breath_voice_bounds,
+                ) = _stored_action_voice_bounds(
+                    source_action=source_action,
+                    base_segments=base_segments,
+                    raw_start=raw_start,
+                    raw_end=raw_end,
+                    key="strict_speech",
                 )
-            breath_voice_bounds = breath_voice_cache[raw_key]
+            if not stored_breath_available:
+                if raw_key not in breath_voice_cache:
+                    breath_voice_cache[raw_key] = pcm_voice_bounds(
+                        audio_path,
+                        start_sample=raw_start,
+                        end_sample=raw_end,
+                        threshold=breath_threshold,
+                    )
+                breath_voice_bounds = breath_voice_cache[raw_key]
             if breath_voice_bounds is not None:
                 guarded_breath_end = max(
                     int(breath_voice_bounds[1]),
@@ -3667,7 +3890,6 @@ def _boundary_clause_consensus_transcript(
     if (
         exact.match_score < minimum_exact_score
         or preliminary.match_score < minimum_support_score
-        or recording.match_score < minimum_support_score
         or int(exact.sentence["clause_count"]) < 2
         or not bool(preliminary.sentence["clauses_in_order"])
         or int(preliminary.sentence["missing_clause_count"]) > 0
@@ -3675,7 +3897,6 @@ def _boundary_clause_consensus_transcript(
         or float(preliminary.fidelity["token_precision"]) < 0.95
         or int(preliminary.fidelity["leading_extra_token_count"]) > 0
         or int(preliminary.fidelity["trailing_extra_token_count"]) > 0
-        or not bool(recording.sentence["clauses_in_order"])
     ):
         return None
     missing = _missing_clause_indexes(exact.sentence, settings=settings)
@@ -3683,11 +3904,32 @@ def _boundary_clause_consensus_transcript(
     if (
         len(missing) != 1
         or missing[0] not in {0, clause_count - 1}
-        or int(exact.sentence["clause_word_counts"][missing[0]])
-        > maximum_clause_words
     ):
         return None
     boundary_index = missing[0]
+    expected_clauses = script_clauses(
+        str(evaluator.lines[line_index]["line"])
+    )
+    hesitation_boundary = (
+        boundary_index < len(expected_clauses)
+        and "hesitation"
+        in _text_features(expected_clauses[boundary_index]).tokens
+    )
+    if (
+        not hesitation_boundary
+        and int(exact.sentence["clause_word_counts"][boundary_index])
+        > maximum_clause_words
+    ):
+        return None
+    if hesitation_boundary:
+        # Merged Whisper decoding commonly drops a performed hesitation even
+        # when the independently decoded edge segment transcribes it.
+        return preliminary_transcript
+    if (
+        recording.match_score < minimum_support_score
+        or not bool(recording.sentence["clauses_in_order"])
+    ):
+        return None
     exact_clause_score = float(
         exact.sentence["clause_scores"][boundary_index]
     )
@@ -4121,6 +4363,13 @@ def align_project(
             evaluator=evaluator,
             span_catalog=span_catalog,
         )
+        complete_subspan_actions = _complete_subspan_recovery_actions(
+            primary_actions,
+            lines=session_lines,
+            settings=settings,
+            evaluator=evaluator,
+            span_catalog=span_catalog,
+        )
         edge_vocalization_extension_actions = (
             _edge_vocalization_extension_actions(
                 primary_actions,
@@ -4141,6 +4390,7 @@ def align_project(
             evaluator=evaluator,
             span_catalog=span_catalog,
             project_dir=project_dir,
+            segmentation_settings=project.get("segmentation"),
         )
         check_processing_cancelled()
         intra_segment_trim_actions = _intra_segment_trim_actions(
@@ -4151,11 +4401,13 @@ def align_project(
             settings=settings,
             evaluator=evaluator,
             project_dir=project_dir,
+            segmentation_settings=project.get("segmentation"),
         )
         check_processing_cancelled()
         candidate_actions = [
             *primary_actions,
             *boundary_noise_cleanup_actions,
+            *complete_subspan_actions,
             *edge_vocalization_extension_actions,
             *fragment_join_actions,
             *intra_segment_trim_actions,
@@ -4168,6 +4420,7 @@ def align_project(
             base_segments=base_segments,
             settings=settings,
             evaluator=evaluator,
+            segmentation_settings=project.get("segmentation"),
         )
         candidate_actions = sorted(
             [*candidate_actions, *boundary_voice_trim_actions],
@@ -4603,6 +4856,9 @@ def align_project(
                 ),
                 "boundary_noise_cleanup": bool(
                     action.get("boundary_noise_cleanup", False)
+                ),
+                "complete_subspan_recovery": bool(
+                    action.get("complete_subspan_recovery", False)
                 ),
                 "boundary_voice_trim": bool(
                     action.get("boundary_voice_trim", False)

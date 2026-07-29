@@ -458,29 +458,48 @@ def materialize_trimmed_segment(
     session_entry: dict[str, Any],
     base_segments: list[dict[str, Any]],
     base_index: int,
+    count: int = 1,
     start_sample: int,
     end_sample: int,
     transcript: str,
     asr_probability: float | None,
 ) -> dict[str, Any]:
-    """Materialize a word-timestamp-bounded portion of one base segment."""
+    """Materialize sample-bounded audio across contiguous base segments."""
 
-    base = base_segments[base_index]
-    base_start = int(base["start_sample"])
-    base_end = int(base["end_sample"])
+    selected = base_segments[base_index : base_index + count]
+    if len(selected) != count or count < 1:
+        raise ValueError(
+            f"Invalid bounded segment range: {base_index} + {count}"
+        )
+    base_start = int(selected[0]["start_sample"])
+    base_end = int(selected[-1]["end_sample"])
     start_sample = max(base_start, min(int(start_sample), base_end))
     end_sample = max(start_sample, min(int(end_sample), base_end))
     if start_sample == base_start and end_sample == base_end:
-        return base
+        return materialize_derived_segment(
+            project_dir=project_dir,
+            project=project,
+            session_entry=session_entry,
+            base_segments=base_segments,
+            start_index=base_index,
+            count=count,
+        )
     if end_sample <= start_sample:
         raise ValueError(
             f"Invalid trimmed segment bounds: {start_sample}..{end_sample}"
         )
 
-    segment_id = (
-        f"{session_entry['session_id']}__t{base_index + 1:05d}_"
-        f"{start_sample:010d}_{end_sample:010d}"
-    )
+    if count == 1:
+        segment_id = (
+            f"{session_entry['session_id']}__t{base_index + 1:05d}_"
+            f"{start_sample:010d}_{end_sample:010d}"
+        )
+    else:
+        end_index = base_index + count - 1
+        segment_id = (
+            f"{session_entry['session_id']}__b{base_index + 1:05d}_"
+            f"{end_index + 1:05d}_{start_sample:010d}_{end_sample:010d}"
+        )
     existing = next(
         (
             segment
@@ -512,13 +531,18 @@ def materialize_trimmed_segment(
         ),
     )
     sample_rate = int(session_entry["sample_rate"])
+    probabilities = [
+        float(segment["asr_probability"])
+        for segment in selected
+        if segment.get("asr_probability") is not None
+    ]
     derived = {
         "segment_id": segment_id,
-        "kind": "trimmed",
+        "kind": "trimmed" if count == 1 else "bounded",
         "session_id": session_entry["session_id"],
         "source_audio": session_entry["audio"],
         "source_sha256": session_entry["source_sha256"],
-        "base_indices": [base_index],
+        "base_indices": list(range(base_index, base_index + count)),
         "start_sample": start_sample,
         "end_sample": end_sample,
         "start_seconds": start_sample / sample_rate,
@@ -526,8 +550,20 @@ def materialize_trimmed_segment(
         "file": output_path.relative_to(project_dir).as_posix(),
         "transcript": transcript,
         "word_count": len(normalize_spoken_text(transcript).split()),
-        "asr_probability": asr_probability,
-        "transcript_source": "segment_asr_word_trim",
+        "asr_probability": (
+            asr_probability
+            if asr_probability is not None
+            else (
+                sum(probabilities) / len(probabilities)
+                if probabilities
+                else None
+            )
+        ),
+        "transcript_source": (
+            "segment_asr_word_trim"
+            if count == 1
+            else "segment_asr_trimmed_edge_span"
+        ),
         "metrics": metrics,
     }
     session_entry.setdefault("derived_segments", []).append(derived)

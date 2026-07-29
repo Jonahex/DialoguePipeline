@@ -225,10 +225,13 @@ the line receive `EXTRA_LINE_START` or `EXTRA_LINE_END`. By default,
 opening or closing comparison window prevents automatic acceptance. Common equivalent spoken
 forms are canonicalized before scoring, including contractions such as
 `could've`/`could have`, `I've`/`I have`, and colloquialisms such as
-`c'mon`/`come on`. A merged span containing substantial,
-non-quiet audio with no transcript is kept for review with reason
-`MERGED_UNTRANSCRIBED_AUDIO` rather than accepted automatically. A take with
-clipped samples also stays in review with `TECHNICAL_CLIPPING` by default.
+`c'mon`/`come on`. A merged span containing substantial, non-quiet audio with
+no transcript is kept for review with reason `MERGED_UNTRANSCRIBED_AUDIO`
+rather than accepted automatically. Quiet padding rejected by ASR is ignored,
+and an exact-span transcript whose first or last word is far from the audio
+edge is rejected only when the constituent transcripts also show that a
+repeated take was collapsed. A take with clipped samples also stays in review
+with `TECHNICAL_CLIPPING` by default.
 Within the reliable candidate cluster, automatic selection uses the combined
 selection score so technical quality, ASR confidence, and clause completeness
 can favor a cleaner take over one with a trivially higher text score.
@@ -261,12 +264,14 @@ the joined span remains available for playback with
 If exact-span ASR shows that such a span belongs to a different script line than
 the preliminary fragment text suggested, the candidate is reassigned to that
 better line.
-When one oversized base segment contains multiple performances, alignment can
-also recover line-sized trimmed candidates from the independent base-ASR word
-timestamps. Cuts are considered only at pauses of at least 0.4 seconds, must
-produce materially more complete and precise text, and are independently
-transcribed again before `AUTO_OK`. The untrimmed base candidate remains
-available for comparison.
+When one oversized base segment contains multiple performances, including a
+base segment already covered by a merged primary action, alignment can recover
+line-sized trimmed candidates from the independent base-ASR word timestamps.
+Fragment joins can also trim the first or last base segment at the same
+pause-based boundaries, allowing a line to cross a shared take-boundary
+segment. Cuts are considered only at pauses of at least 0.4 seconds and are
+independently transcribed again before `AUTO_OK`. The untrimmed candidates
+remain available for comparison.
 Inline performance cues such as `(laugh)` and `(hiccup)` are not treated as
 spoken words during matching. Original fragments remain available.
 

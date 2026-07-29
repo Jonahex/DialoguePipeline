@@ -734,6 +734,22 @@ class SpanCatalog:
         self._previews[key] = previews
         return previews
 
+    def transcription_preview_for_bounds(
+        self,
+        *,
+        start_seconds: float,
+        end_seconds: float,
+    ) -> dict[str, Any] | None:
+        if not self.transcription:
+            return None
+        return _transcription_preview_for_bounds(
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+            transcription=self.transcription,
+            settings=dict(self.settings),
+            word_index=self.word_index,
+        )
+
 
 def _span_preview(
     segments: list[dict[str, Any]], start_index: int, count: int
@@ -773,14 +789,35 @@ def _span_preview_with_transcription(
     if not transcription:
         return span
 
+    timestamp_span = _transcription_preview_for_bounds(
+        start_seconds=float(span["start_seconds"]),
+        end_seconds=float(span["end_seconds"]),
+        transcription=transcription,
+        settings=settings,
+        word_index=word_index,
+    )
+    if timestamp_span is None:
+        return span
+    span.update(timestamp_span)
+    return span
+
+
+def _transcription_preview_for_bounds(
+    *,
+    start_seconds: float,
+    end_seconds: float,
+    transcription: dict[str, Any],
+    settings: Mapping[str, Any],
+    word_index: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Build a recording-ASR preview for arbitrary sample-accurate bounds."""
+
     minimum_overlap_seconds = float(
         settings.get("span_word_min_overlap_seconds", 0.20)
     )
     minimum_overlap_fraction = float(
         settings.get("span_word_min_overlap_fraction", 0.20)
     )
-    start_seconds = float(span["start_seconds"])
-    end_seconds = float(span["end_seconds"])
     words = []
     seen = set()
     index = word_index or _transcription_word_index(transcription)
@@ -816,10 +853,10 @@ def _span_preview_with_transcription(
         seen.add(key)
         words.append((word_start, word_end, word))
     if not words:
-        return span
+        return None
 
     words.sort(key=lambda item: (item[0], item[1]))
-    span["transcript"] = "".join(
+    transcript = "".join(
         str(word.get("word") or "") for _, _, word in words
     ).strip()
     probabilities = [
@@ -827,11 +864,17 @@ def _span_preview_with_transcription(
         for _, _, word in words
         if word.get("probability") is not None
     ]
-    span["asr_probability"] = (
-        sum(probabilities) / len(probabilities) if probabilities else None
-    )
-    span["transcript_source"] = "session_word_span"
-    return span
+    return {
+        "transcript": transcript,
+        "start_seconds": start_seconds,
+        "end_seconds": end_seconds,
+        "asr_probability": (
+            sum(probabilities) / len(probabilities)
+            if probabilities
+            else None
+        ),
+        "transcript_source": "session_word_span",
+    }
 
 
 def _transcription_word_index(
@@ -1227,6 +1270,226 @@ def _apply_duplicate_line_policy(
                 ]
 
 
+def _segment_sample_rate(segment: Mapping[str, Any]) -> int | None:
+    if (
+        segment.get("start_sample") is None
+        or segment.get("end_sample") is None
+    ):
+        return None
+    duration = (
+        float(segment.get("end_seconds", 0.0))
+        - float(segment.get("start_seconds", 0.0))
+    )
+    if duration <= 0.0:
+        return None
+    sample_count = int(segment["end_sample"]) - int(segment["start_sample"])
+    if sample_count <= 0:
+        return None
+    return max(1, round(sample_count / duration))
+
+
+def _word_gap_boundaries(
+    segment: Mapping[str, Any],
+    *,
+    minimum_gap: float,
+    maximum_boundaries: int,
+) -> list[tuple[int, float]]:
+    primary_asr = ((segment.get("segment_asr") or {}).get("primary") or {})
+    words = [
+        word
+        for word in primary_asr.get("words") or []
+        if str(word.get("word") or "").strip()
+        and word.get("start") is not None
+        and word.get("end") is not None
+    ]
+    boundaries: list[tuple[int, float, float]] = []
+    for word_index, (left, right) in enumerate(zip(words, words[1:])):
+        left_end = float(left["end"])
+        right_start = float(right["start"])
+        gap = right_start - left_end
+        if gap >= minimum_gap:
+            boundaries.append(
+                (
+                    word_index,
+                    (left_end + right_start) / 2.0,
+                    gap,
+                )
+            )
+    boundaries.sort(key=lambda item: item[2], reverse=True)
+    selected = boundaries[:maximum_boundaries]
+    selected.sort(key=lambda item: item[0])
+    return [(word_index, offset) for word_index, offset, _ in selected]
+
+
+def _trimmed_edge_span_previews(
+    *,
+    start_index: int,
+    count: int,
+    base_segments: list[dict[str, Any]],
+    settings: Mapping[str, Any] | AlignmentSettings,
+    span_catalog: SpanCatalog,
+) -> list[dict[str, Any]]:
+    """Preview joins whose first or last base segment is split at a word gap."""
+
+    if count < 2:
+        return []
+    selected = base_segments[start_index : start_index + count]
+    if len(selected) != count:
+        return []
+    first = selected[0]
+    last = selected[-1]
+    first_rate = _segment_sample_rate(first)
+    last_rate = _segment_sample_rate(last)
+    if first_rate is None or last_rate is None:
+        return []
+
+    settings = AlignmentSettings.from_value(settings)
+    minimum_gap = float(
+        settings.get("intra_segment_trim_min_gap_seconds", 0.40)
+    )
+    maximum_boundaries = max(
+        1,
+        int(settings.get("intra_segment_trim_max_actions_per_segment", 3)),
+    )
+    first_words = [
+        word
+        for word in (
+            ((first.get("segment_asr") or {}).get("primary") or {}).get(
+                "words"
+            )
+            or []
+        )
+        if str(word.get("word") or "").strip()
+        and word.get("start") is not None
+        and word.get("end") is not None
+    ]
+    last_words = [
+        word
+        for word in (
+            ((last.get("segment_asr") or {}).get("primary") or {}).get(
+                "words"
+            )
+            or []
+        )
+        if str(word.get("word") or "").strip()
+        and word.get("start") is not None
+        and word.get("end") is not None
+    ]
+    first_boundaries = _word_gap_boundaries(
+        first,
+        minimum_gap=minimum_gap,
+        maximum_boundaries=maximum_boundaries,
+    )
+    last_boundaries = _word_gap_boundaries(
+        last,
+        minimum_gap=minimum_gap,
+        maximum_boundaries=maximum_boundaries,
+    )
+    full_start_sample = int(first["start_sample"])
+    full_end_sample = int(last["end_sample"])
+    previews = []
+    seen: set[tuple[int, int, str]] = set()
+
+    def append_preview(
+        *,
+        transcript: str,
+        start_sample: int,
+        end_sample: int,
+    ) -> None:
+        transcript = transcript.strip()
+        if not transcript or end_sample <= start_sample:
+            return
+        key = (
+            start_sample,
+            end_sample,
+            normalize_text(transcript),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        start_seconds = start_sample / first_rate
+        end_seconds = end_sample / last_rate
+        preview = {
+            "start_index": start_index,
+            "count": count,
+            "transcript": transcript,
+            "start_seconds": start_seconds,
+            "end_seconds": end_seconds,
+            "trim_start_sample": start_sample,
+            "trim_end_sample": end_sample,
+            "transcript_source": "segment_asr_trimmed_edge_span",
+        }
+        previews.append(preview)
+        timestamp_preview = span_catalog.transcription_preview_for_bounds(
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+        )
+        if timestamp_preview:
+            timestamp_key = (
+                start_sample,
+                end_sample,
+                normalize_text(str(timestamp_preview["transcript"])),
+            )
+            if timestamp_key not in seen:
+                seen.add(timestamp_key)
+                previews.append(
+                    {
+                        **preview,
+                        **timestamp_preview,
+                        "trim_start_sample": start_sample,
+                        "trim_end_sample": end_sample,
+                        "transcript_source": (
+                            "session_word_trimmed_edge_span"
+                        ),
+                    }
+                )
+
+    trailing_full_text = " ".join(
+        str(segment.get("transcript") or "").strip()
+        for segment in selected[1:]
+        if str(segment.get("transcript") or "").strip()
+    )
+    for word_index, offset in first_boundaries:
+        suffix_text = " ".join(
+            str(word.get("word") or "").strip()
+            for word in first_words[word_index + 1 :]
+            if str(word.get("word") or "").strip()
+        )
+        append_preview(
+            transcript=" ".join(
+                part for part in (suffix_text, trailing_full_text) if part
+            ),
+            start_sample=max(
+                full_start_sample,
+                full_start_sample + round(offset * first_rate),
+            ),
+            end_sample=full_end_sample,
+        )
+
+    leading_full_text = " ".join(
+        str(segment.get("transcript") or "").strip()
+        for segment in selected[:-1]
+        if str(segment.get("transcript") or "").strip()
+    )
+    for word_index, offset in last_boundaries:
+        prefix_text = " ".join(
+            str(word.get("word") or "").strip()
+            for word in last_words[: word_index + 1]
+            if str(word.get("word") or "").strip()
+        )
+        append_preview(
+            transcript=" ".join(
+                part for part in (leading_full_text, prefix_text) if part
+            ),
+            start_sample=full_start_sample,
+            end_sample=min(
+                full_end_sample,
+                int(last["start_sample"]) + round(offset * last_rate),
+            ),
+        )
+    return previews
+
+
 def _multisentence_fragment_join_actions(
     actions: list[dict[str, Any]],
     *,
@@ -1558,8 +1821,9 @@ def _multisentence_fragment_join_actions(
                 ):
                     continue
                 key = (line_index, start_index, count)
-                if key in existing or key in evaluated:
+                if key in evaluated:
                     continue
+                span_already_exists = key in existing
                 evaluated.add(key)
                 if not span_catalog.is_valid(start_index, count):
                     continue
@@ -1574,9 +1838,23 @@ def _multisentence_fragment_join_actions(
                 ):
                     continue
 
-                previews = span_catalog.transcript_previews(
-                    start_index,
-                    count,
+                edge_previews = _trimmed_edge_span_previews(
+                    start_index=start_index,
+                    count=count,
+                    base_segments=base_segments,
+                    settings=settings,
+                    span_catalog=span_catalog,
+                )
+                previews = (
+                    edge_previews
+                    if span_already_exists
+                    else [
+                        *span_catalog.transcript_previews(
+                            start_index,
+                            count,
+                        ),
+                        *edge_previews,
+                    ]
                 )
                 scored_previews = [
                     score_preview(line_index, preview)
@@ -1797,6 +2075,29 @@ def _multisentence_fragment_join_actions(
                         "fragment_join_fallback": fallback_preview,
                         "fragment_source_count": count,
                         "fragment_join_provisional": not strict_preview,
+                        "intra_segment_trim": bool(
+                            span.get("trim_start_sample") is not None
+                            or span.get("trim_end_sample") is not None
+                        ),
+                        "trimmed_edge_join": bool(
+                            span.get("trim_start_sample") is not None
+                            or span.get("trim_end_sample") is not None
+                        ),
+                        **(
+                            {
+                                "trim_start_sample": int(
+                                    span["trim_start_sample"]
+                                ),
+                                "trim_end_sample": int(
+                                    span["trim_end_sample"]
+                                ),
+                            }
+                            if (
+                                span.get("trim_start_sample") is not None
+                                and span.get("trim_end_sample") is not None
+                            )
+                            else {}
+                        ),
                         "forced_review_reason": (
                             "UNCERTAIN_BOUNDARY_AUDIO"
                             if boundary_audio_rescue and not strict_preview
@@ -1919,11 +2220,18 @@ def _intra_segment_trim_actions(
 
     proposals: list[dict[str, Any]] = []
     seen: set[tuple[int, int, int, int]] = set()
-    for source_action in actions:
+    source_actions_by_base = [
+        (source_action, base_index)
+        for source_action in actions
+        for base_index in range(
+            int(source_action["start_index"]),
+            int(source_action["start_index"])
+            + int(source_action["count"]),
+        )
+        if 0 <= base_index < len(base_segments)
+    ]
+    for source_action, base_index in source_actions_by_base:
         check_processing_cancelled()
-        if int(source_action["count"]) != 1:
-            continue
-        base_index = int(source_action["start_index"])
         segment = base_segments[base_index]
         segment_asr = segment.get("segment_asr") or {}
         primary_asr = segment_asr.get("primary") or {}
@@ -2539,6 +2847,32 @@ def _candidate_reliability(
     return True, ""
 
 
+def _preliminary_transcript_shows_collapsed_repetition(
+    preliminary: str,
+    exact: str,
+) -> bool:
+    preliminary_tokens = _text_features(preliminary).tokens
+    exact_tokens = _text_features(exact).tokens
+    if not preliminary_tokens or not exact_tokens:
+        return False
+    preliminary_counts = Counter(preliminary_tokens)
+    exact_counts = Counter(exact_tokens)
+    matched_words = sum(
+        min(count, preliminary_counts.get(token, 0))
+        for token, count in exact_counts.items()
+    )
+    extra_words = len(preliminary_tokens) - matched_words
+    repeated_exact_words = sum(
+        max(0, preliminary_counts.get(token, 0) - count)
+        for token, count in exact_counts.items()
+    )
+    minimum_repeated_words = max(1, math.ceil(len(exact_tokens) * 0.5))
+    return bool(
+        extra_words >= minimum_repeated_words
+        and repeated_exact_words >= minimum_repeated_words
+    )
+
+
 def _has_unsafe_untranscribed_merge(
     *,
     action: dict[str, Any],
@@ -2560,11 +2894,13 @@ def _has_unsafe_untranscribed_merge(
         settings.get("untranscribed_merge_min_rms_dbfs", -45.0)
     )
     for base_segment in base_segments[start_index : start_index + count]:
-        if bool(
+        silence_rejected = bool(
             ((base_segment.get("segment_asr") or {}).get("silence_rejected"))
+        )
+        if (
+            str(base_segment.get("transcript") or "").strip()
+            and not silence_rejected
         ):
-            return True
-        if str(base_segment.get("transcript") or "").strip():
             continue
         duration = float(
             (base_segment.get("metrics") or {}).get("duration_seconds")
@@ -2579,7 +2915,13 @@ def _has_unsafe_untranscribed_merge(
             and (rms is None or float(rms) >= minimum_rms)
         ):
             return True
-    if segment is not None:
+    if (
+        segment is not None
+        and _preliminary_transcript_shows_collapsed_repetition(
+            str(action.get("transcript") or ""),
+            str(segment.get("transcript") or ""),
+        )
+    ):
         words = [
             word
             for word in segment.get("words") or []
@@ -2742,18 +3084,18 @@ def align_project(
             span_key = _action_span_key(action)
             segment = materialized_by_span.get(span_key)
             if segment is None:
-                if bool(action.get("intra_segment_trim")):
-                    base = base_segments[span_key[0]]
+                if span_key[2:] != (-1, -1):
                     segment = materialize_trimmed_segment(
                         project_dir=project_dir,
                         project=project,
                         session_entry=session_entry,
                         base_segments=base_segments,
                         base_index=span_key[0],
+                        count=span_key[1],
                         start_sample=span_key[2],
                         end_sample=span_key[3],
                         transcript=str(action.get("transcript") or ""),
-                        asr_probability=base.get("asr_probability"),
+                        asr_probability=None,
                     )
                 else:
                     segment = materialize_derived_segment(
@@ -3095,6 +3437,9 @@ def align_project(
                 ),
                 "intra_segment_trim": bool(
                     action.get("intra_segment_trim", False)
+                ),
+                "trimmed_edge_join": bool(
+                    action.get("trimmed_edge_join", False)
                 ),
             }
             if (

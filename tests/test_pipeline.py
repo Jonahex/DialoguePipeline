@@ -52,6 +52,7 @@ from dialogue_pipeline.review import (
     save_line_review,
 )
 from dialogue_pipeline.segmentation import (
+    materialize_trimmed_segment,
     prevent_region_overlaps,
     segment_project,
     split_regions_on_word_gaps,
@@ -108,6 +109,52 @@ def _write_pattern(path: Path) -> None:
         writer.setsampwidth(2)
         writer.setframerate(sample_rate)
         writer.writeframes(total.tobytes())
+
+
+def test_materialize_trimmed_segment_supports_multi_base_bounds(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.wav"
+    _write_tone(source, duration_seconds=3.0)
+    base_segments = [
+        {
+            "start_sample": 0,
+            "end_sample": 72000,
+            "asr_probability": 0.9,
+        },
+        {
+            "start_sample": 72000,
+            "end_sample": 144000,
+            "asr_probability": 0.8,
+        },
+    ]
+    session_entry = {
+        "session_id": "session",
+        "audio": "source.wav",
+        "source_sha256": "source-hash",
+        "sample_rate": 48000,
+        "derived_segments": [],
+    }
+
+    bounded = materialize_trimmed_segment(
+        project_dir=tmp_path,
+        project={"segmentation": {"fade_ms": 0.0}},
+        session_entry=session_entry,
+        base_segments=base_segments,
+        base_index=0,
+        count=2,
+        start_sample=24000,
+        end_sample=120000,
+        transcript="Complete take",
+        asr_probability=None,
+    )
+
+    assert bounded["kind"] == "bounded"
+    assert bounded["base_indices"] == [0, 1]
+    assert bounded["start_sample"] == 24000
+    assert bounded["end_sample"] == 120000
+    assert bounded["metrics"]["duration_seconds"] == pytest.approx(2.0)
+    assert (tmp_path / bounded["file"]).is_file()
 
 
 def test_shared_model_cache_resolution(tmp_path: Path, monkeypatch) -> None:
@@ -1408,6 +1455,223 @@ def test_oversized_base_segment_can_recover_pause_bounded_trim() -> None:
     )
 
 
+def test_trim_recovery_scans_bases_inside_a_merged_primary_action() -> None:
+    line_text = (
+        "Nothing too substantial. A friendly game of cards or dice."
+    )
+    target_words = [
+        "Nothing",
+        "too",
+        "substantial",
+        "A",
+        "friendly",
+        "game",
+        "of",
+        "cards",
+        "or",
+        "dice",
+    ]
+    words = [
+        {
+            "word": f" {word}",
+            "start": index * 0.2,
+            "end": index * 0.2 + 0.18,
+        }
+        for index, word in enumerate(target_words)
+    ]
+    words.extend(
+        [
+            {"word": " Nothing", "start": 3.0, "end": 3.4},
+            {"word": " too", "start": 3.4, "end": 3.7},
+            {"word": " substantial", "start": 3.7, "end": 4.2},
+        ]
+    )
+    full_transcript = " ".join(
+        str(word["word"]).strip() for word in words
+    )
+    segments = [
+        {
+            "segment_id": "session__s00001",
+            "start_sample": 0,
+            "end_sample": 48000,
+            "start_seconds": 0.0,
+            "end_seconds": 1.0,
+            "transcript": "Background",
+            "asr_probability": 0.2,
+            "segment_asr": {"primary": {"words": []}},
+        },
+        {
+            "segment_id": "session__s00002",
+            "start_sample": 48000,
+            "end_sample": 288000,
+            "start_seconds": 1.0,
+            "end_seconds": 6.0,
+            "transcript": full_transcript,
+            "asr_probability": 0.95,
+            "segment_asr": {
+                "primary": {
+                    "transcript": full_transcript,
+                    "words": words,
+                }
+            },
+        },
+    ]
+    action = {
+        "start_index": 0,
+        "count": 2,
+        "line_index": 0,
+        "match_score": text_similarity(line_text, full_transcript),
+        "transcript": full_transcript,
+        "duration_plausibility": 60.0,
+        "order_hint": 0.0,
+        "top_matches": [],
+    }
+
+    trimmed = _intra_segment_trim_actions(
+        [action],
+        lines=[{"line_id": "target", "line": line_text}],
+        base_segments=segments,
+        sample_rate=48000,
+        settings={},
+        evaluator=TranscriptEvaluator(
+            [{"line_id": "target", "line": line_text}],
+            {},
+        ),
+    )
+
+    recovered = next(
+        item for item in trimmed if item["start_index"] == 1
+    )
+    assert recovered["count"] == 1
+    assert recovered["trim_end_sample"] < segments[1]["end_sample"]
+    assert recovered["match_score"] == 100.0
+    assert "Nothing too substantial Nothing" not in recovered["transcript"]
+
+
+def test_fragment_join_can_trim_shared_take_boundary_segment() -> None:
+    line_text = "It's... not over... yet..."
+    lines = [{"line_id": "target", "line": line_text}]
+
+    def segment(
+        index: int,
+        transcript: str,
+        words: list[dict[str, Any]],
+        duration: float,
+    ) -> dict[str, Any]:
+        start_seconds = sum(
+            (1.0, 1.0, 2.0, 1.0)[:index]
+        )
+        start_sample = round(start_seconds * 48000)
+        return {
+            "segment_id": f"session__s{index + 1:05d}",
+            "start_sample": start_sample,
+            "end_sample": start_sample + round(duration * 48000),
+            "start_seconds": start_seconds,
+            "end_seconds": start_seconds + duration,
+            "transcript": transcript,
+            "asr_probability": 0.95,
+            "segment_asr": {
+                "primary": {
+                    "transcript": transcript,
+                    "words": words,
+                }
+            },
+        }
+
+    segments = [
+        segment(
+            0,
+            "It's",
+            [{"word": " It's", "start": 0.0, "end": 0.7}],
+            1.0,
+        ),
+        segment(
+            1,
+            "not over",
+            [
+                {"word": " not", "start": 0.0, "end": 0.4},
+                {"word": " over", "start": 0.4, "end": 0.9},
+            ],
+            1.0,
+        ),
+        segment(
+            2,
+            "Yet. It's not over.",
+            [
+                {"word": " Yet", "start": 0.0, "end": 0.3},
+                {"word": " It's", "start": 0.9, "end": 1.2},
+                {"word": " not", "start": 1.2, "end": 1.5},
+                {"word": " over", "start": 1.5, "end": 1.9},
+            ],
+            2.0,
+        ),
+        segment(
+            3,
+            "Yet",
+            [{"word": " Yet", "start": 0.0, "end": 0.5}],
+            1.0,
+        ),
+    ]
+    actions = [
+        {
+            "start_index": 0,
+            "count": 2,
+            "line_index": 0,
+            "match_score": text_similarity(line_text, "It's not over"),
+            "transcript": "It's not over",
+            "duration_plausibility": 80.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        },
+        *[
+            {
+                "start_index": index,
+                "count": 1,
+                "line_index": 0,
+                "match_score": text_similarity(
+                    line_text,
+                    segments[index]["transcript"],
+                ),
+                "transcript": segments[index]["transcript"],
+                "duration_plausibility": 80.0,
+                "order_hint": 0.0,
+                "top_matches": [],
+            }
+            for index in (2, 3)
+        ],
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "max_merge_segments": 3,
+            "max_merge_gap_seconds": 1.0,
+            "max_span_seconds": 10.0,
+        },
+    )
+
+    first_take = next(
+        action
+        for action in joined
+        if action["start_index"] == 0
+        and action["count"] == 3
+        and action.get("trimmed_edge_join")
+    )
+    second_take = next(
+        action
+        for action in joined
+        if action["start_index"] == 2
+        and action["count"] == 2
+        and action.get("trimmed_edge_join")
+    )
+    assert first_take["trim_end_sample"] < segments[2]["end_sample"]
+    assert second_take["trim_start_sample"] > segments[2]["start_sample"]
+    assert first_take["match_score"] == 100.0
+    assert second_take["match_score"] == 100.0
+
+
 def test_secondary_near_complete_match_can_seed_fragment_join() -> None:
     lines = [
         {"line_id": "short", "line": "You should leave."},
@@ -2240,9 +2504,13 @@ def test_untranscribed_audio_in_merge_prevents_auto_acceptance() -> None:
     ) == (False, "MERGED_UNTRANSCRIBED_AUDIO")
 
 
-def test_exact_asr_boundary_gap_rejects_complete_fallback_join() -> None:
+def test_quiet_boundary_padding_does_not_reject_complete_merge() -> None:
     unsafe = _has_unsafe_untranscribed_merge(
-        action={"start_index": 0, "count": 2},
+        action={
+            "start_index": 0,
+            "count": 2,
+            "transcript": "Hello there.",
+        },
         base_segments=[
             {
                 "transcript": "Thank you.",
@@ -2258,9 +2526,43 @@ def test_exact_asr_boundary_gap_rejects_complete_fallback_join() -> None:
             "start_seconds": 0.0,
             "end_seconds": 2.7,
             "metrics": {"duration_seconds": 2.7},
+            "transcript": "Hello there.",
             "words": [
                 {"word": "Hello", "start": 1.2, "end": 1.6},
                 {"word": "there", "start": 1.6, "end": 2.2},
+            ],
+        },
+        settings={},
+    )
+
+    assert unsafe is False
+
+
+def test_exact_asr_boundary_gap_rejects_collapsed_repeated_take() -> None:
+    unsafe = _has_unsafe_untranscribed_merge(
+        action={
+            "start_index": 0,
+            "count": 2,
+            "transcript": "Hello there. Hello there.",
+        },
+        base_segments=[
+            {
+                "transcript": "Hello there.",
+                "metrics": {"duration_seconds": 1.2, "rms_dbfs": -20.0},
+            },
+            {
+                "transcript": "Hello there.",
+                "metrics": {"duration_seconds": 1.5, "rms_dbfs": -20.0},
+            },
+        ],
+        segment={
+            "start_seconds": 0.0,
+            "end_seconds": 2.7,
+            "metrics": {"duration_seconds": 2.7},
+            "transcript": "Hello there.",
+            "words": [
+                {"word": "Hello", "start": 0.1, "end": 0.5},
+                {"word": "there", "start": 0.5, "end": 1.0},
             ],
         },
         settings={},

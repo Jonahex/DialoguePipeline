@@ -6,9 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from .alignment_settings import (
-    AlignmentSettings,
+    complete_alignment_config,
     default_alignment_config,
-    grouped_alignment_config,
 )
 from .audio import probe_audio
 from .cancellation import check_processing_cancelled
@@ -297,7 +296,7 @@ def apply_project_settings(
 
 
 def migrate_project_config(project: dict[str, Any]) -> dict[str, Any]:
-    """Return a lossless current settings representation for any project."""
+    """Return a complete current representation for a grouped-settings project."""
 
     migrated = copy.deepcopy(project)
     version = int(migrated.get("settings_version", 1))
@@ -352,7 +351,6 @@ def migrate_project_config(project: dict[str, Any]) -> dict[str, Any]:
         )
     configured = migrated.get("alignment")
     if configured is not None:
-        values = dict(AlignmentSettings.from_value(configured))
         is_grouped_v1 = bool(
             version < 2
             and isinstance(configured, dict)
@@ -362,13 +360,13 @@ def migrate_project_config(project: dict[str, Any]) -> dict[str, Any]:
             span_search = configured.get("span_search") or {}
             recovery = configured.get("recovery") or {}
             # Version 1 accidentally changed both historical defaults from
-            # eight to ten. Preserve explicit legacy-flat overrides, while
-            # restoring values written by the incomplete grouped defaults.
+            # eight to ten. Restore values written by those incomplete
+            # grouped defaults.
             if span_search.get("max_segments") == 10:
-                values["max_merge_segments"] = 8
+                span_search["max_segments"] = 8
             if recovery.get("max_segments") == 10:
-                values["fragment_join_max_segments"] = 8
-        migrated["alignment"] = grouped_alignment_config(values)
+                recovery["max_segments"] = 8
+        migrated["alignment"] = complete_alignment_config(configured)
     migrated["settings_version"] = PROJECT_SETTINGS_VERSION
     return migrated
 

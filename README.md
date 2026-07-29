@@ -44,8 +44,8 @@ cache-aware pipeline runs again. New destinations use the same settings dialog
 after the UI asks for the lines workbook and recorded WAV directory, then run
 inventory, transcription, segmentation, segment transcription, and alignment
 in the background while showing the pipeline log.
-Legacy flat alignment settings are migrated losslessly into the complete
-grouped representation. A forced CLI metadata refresh writes
+Alignment settings must use the grouped schema documented below. A forced CLI
+metadata refresh writes
 `project.before-force.json` and carries the existing settings and reviewed
 session mappings forward.
 The processing screen includes `Cancel`. Cancellation stops further work at the
@@ -462,9 +462,9 @@ setting is serialized and available in the settings window:
 }
 ```
 
-Existing projects using the original flat alignment keys remain supported.
-When both forms specify the same option, the flat legacy value wins. Defaults
-and validation are centralized in `dialogue_pipeline/alignment_settings.py`.
+Flat alignment keys are rejected with a configuration error; only the grouped
+schema is accepted. Defaults and validation are centralized in
+`dialogue_pipeline/alignment_settings.py`.
 The first grouped-settings version's accidental 10-segment defaults migrate
 back to the historical 8-segment limits.
 

@@ -5,11 +5,9 @@ from dataclasses import dataclass
 from typing import Any
 
 
-# This is the single source of truth for alignment defaults. Existing projects
-# may continue to use the original flat keys; newly created projects serialize
-# every value in the grouped configuration returned by
-# default_alignment_config().
-ALIGNMENT_DEFAULTS: dict[str, Any] = {
+# Private compact keys keep the alignment hot paths readable. Project
+# configuration is accepted and serialized exclusively through _GROUPED_KEYS.
+_INTERNAL_DEFAULTS: dict[str, Any] = {
     "max_merge_segments": 8,
     "max_merge_gap_seconds": 2.5,
     "max_span_seconds": 35.0,
@@ -302,23 +300,23 @@ _GROUPED_KEYS: dict[tuple[str, ...], str] = {
 def default_alignment_config() -> dict[str, Any]:
     """Return every alignment default in the grouped project representation."""
 
-    return _grouped_alignment_values(ALIGNMENT_DEFAULTS)
+    return _grouped_alignment_values(_INTERNAL_DEFAULTS)
 
 
 def _grouped_alignment_values(values: Mapping[str, Any]) -> dict[str, Any]:
     grouped: dict[str, Any] = {}
-    for path, legacy_key in _GROUPED_KEYS.items():
+    for path, internal_key in _GROUPED_KEYS.items():
         current = grouped
         for component in path[:-1]:
             current = current.setdefault(component, {})
-        current[path[-1]] = values[legacy_key]
+        current[path[-1]] = values[internal_key]
     return grouped
 
 
-def grouped_alignment_config(
+def complete_alignment_config(
     configured: Mapping[str, Any] | "AlignmentSettings" | None,
 ) -> dict[str, Any]:
-    """Migrate grouped or flat settings without dropping implicit values."""
+    """Return a complete validated grouped alignment configuration."""
 
     settings = AlignmentSettings.from_value(configured)
     return _grouped_alignment_values(settings)
@@ -326,7 +324,7 @@ def grouped_alignment_config(
 
 @dataclass(frozen=True)
 class AlignmentSettings(Mapping[str, Any]):
-    """Validated flat view over grouped or legacy alignment configuration."""
+    """Validated compact view over grouped alignment configuration."""
 
     _values: dict[str, Any]
 
@@ -338,21 +336,23 @@ class AlignmentSettings(Mapping[str, Any]):
         if isinstance(configured, cls):
             return configured
         raw = dict(configured or {})
-        values = dict(ALIGNMENT_DEFAULTS)
+        flat_keys = sorted(set(raw).intersection(_INTERNAL_DEFAULTS))
+        if flat_keys:
+            joined = ", ".join(flat_keys)
+            raise ValueError(
+                "Flat alignment settings are no longer supported: "
+                f"{joined}. Use the grouped alignment schema."
+            )
+        values = dict(_INTERNAL_DEFAULTS)
 
-        for path, legacy_key in _GROUPED_KEYS.items():
+        for path, internal_key in _GROUPED_KEYS.items():
             current: Any = raw
             for component in path:
                 if not isinstance(current, Mapping) or component not in current:
                     break
                 current = current[component]
             else:
-                values[legacy_key] = current
-
-        # Flat legacy values deliberately win when both forms are present.
-        for key in ALIGNMENT_DEFAULTS:
-            if key in raw:
-                values[key] = raw[key]
+                values[internal_key] = current
 
         cls._validate(values)
         return cls(values)

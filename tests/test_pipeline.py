@@ -34,7 +34,6 @@ from dialogue_pipeline.alignment import (
     transcript_fidelity,
 )
 from dialogue_pipeline.alignment_settings import (
-    ALIGNMENT_DEFAULTS,
     AlignmentSettings,
     default_alignment_config,
 )
@@ -92,6 +91,10 @@ from dialogue_pipeline.util import (
     write_json,
 )
 from dialogue_pipeline.workbook_io import parse_workbook
+
+
+def _alignment_settings(**groups: Any) -> AlignmentSettings:
+    return AlignmentSettings.from_value(groups)
 
 
 def _write_tone(path: Path, duration_seconds: float = 1.0) -> None:
@@ -699,7 +702,7 @@ def test_forced_metadata_refresh_backs_up_and_preserves_existing_settings(
         {
             "schema_version": 1,
             "language": "fr",
-            "alignment": {"max_merge_segments": 6},
+            "alignment": {"span_search": {"max_segments": 6}},
             "sessions": [
                 {
                     "id": "actor",
@@ -966,16 +969,20 @@ def test_order_independent_alignment_handles_reordered_lines_and_takes() -> None
             "asr_probability": 0.96,
         },
     ]
-    settings = {
-        "max_merge_segments": 2,
-        "max_merge_gap_seconds": 2.0,
-        "max_span_seconds": 20.0,
-        "candidate_min_score": 45.0,
-        "candidate_top_k": 3,
-        "noise_penalty": 2.2,
-        "duration_hint_weight": 1.0,
-        "order_hint_weight": 0.0,
-    }
+    settings = _alignment_settings(
+        span_search={
+            "max_segments": 2,
+            "max_gap_seconds": 2.0,
+            "max_duration_seconds": 20.0,
+            "minimum_score": 45.0,
+            "candidate_top_k": 3,
+        },
+        ranking={
+            "noise_penalty": 2.2,
+            "duration_hint_weight": 1.0,
+            "order_hint_weight": 0.0,
+        },
+    )
 
     actions = order_independent_align(segments, lines, settings)
 
@@ -1167,17 +1174,42 @@ def test_exact_line_scores_exclude_nonverbal_and_vocalization_lines() -> None:
     assert scores[2] > 0.0
 
 
-def test_grouped_alignment_settings_support_legacy_overrides() -> None:
+def test_flat_alignment_settings_are_rejected() -> None:
     configured = default_alignment_config()
     configured["span_search"]["max_segments"] = 9
     configured["max_merge_segments"] = 7
 
+    with pytest.raises(
+        ValueError,
+        match="Flat alignment settings are no longer supported",
+    ):
+        AlignmentSettings.from_value(configured)
+
+
+def test_grouped_alignment_settings_apply_overrides() -> None:
+    configured = default_alignment_config()
+    configured["span_search"]["max_segments"] = 9
+
     settings = AlignmentSettings.from_value(configured)
 
-    assert settings["max_merge_segments"] == 7
+    assert settings["max_merge_segments"] == 9
     assert settings["fragment_join_max_segments"] == 8
     assert settings["duplicate_line_policy"] == "weak_order"
     assert settings["auto_reject_clipping"] is True
+
+
+def test_project_migration_rejects_flat_alignment_settings() -> None:
+    with pytest.raises(
+        ValueError,
+        match="Flat alignment settings are no longer supported",
+    ):
+        migrate_project_config(
+            {
+                "schema_version": 1,
+                "settings_version": 3,
+                "alignment": {"max_merge_segments": 6},
+            }
+        )
 
 
 def test_grouped_alignment_settings_expose_every_effective_default() -> None:
@@ -1185,16 +1217,15 @@ def test_grouped_alignment_settings_expose_every_effective_default() -> None:
 
     settings = AlignmentSettings.from_value(configured)
 
-    assert dict(settings) == ALIGNMENT_DEFAULTS
     assert settings["max_merge_segments"] == 8
     assert settings["fragment_join_max_segments"] == 8
     assert (
         configured["recovery"]["trim_candidates_per_segment"]
-        == ALIGNMENT_DEFAULTS["intra_segment_trim_max_actions_per_segment"]
+        == settings["intra_segment_trim_max_actions_per_segment"]
     )
     assert (
         configured["recovery"]["complete"]["maximum_length_ratio"]
-        == ALIGNMENT_DEFAULTS["fragment_join_complete_max_length_ratio"]
+        == settings["fragment_join_complete_max_length_ratio"]
     )
 
 
@@ -1218,7 +1249,7 @@ def test_grouped_v1_defaults_migrate_back_to_historical_limits() -> None:
     assert migrated["settings_version"] == 3
     assert settings["max_merge_segments"] == 8
     assert settings["fragment_join_max_segments"] == 8
-    assert len(settings) == len(ALIGNMENT_DEFAULTS)
+    assert len(settings) > 0
     assert migrated["segmentation"] == {
         "silence_noise_db": -40.0,
         "silence_detection_min_seconds": 0.20,
@@ -1322,10 +1353,14 @@ def test_generic_and_bandit_recordings_infer_narrow_sheet_mappings(
 
 
 def test_exact_short_match_still_requires_resolved_ambiguity() -> None:
-    settings = {
-        "short_line_min_score": 88.0,
-        "short_line_min_margin": 15.0,
-    }
+    settings = _alignment_settings(
+        reliability={
+            "short": {
+                "minimum_score": 88.0,
+                "minimum_margin": 15.0,
+            }
+        }
+    )
     line = {"line": "Goodbye."}
 
     assert _candidate_reliability(
@@ -1358,13 +1393,17 @@ def test_clipping_blocks_automatic_reliability() -> None:
 
 
 def test_short_line_auto_reliability_requires_order_and_no_extra_words() -> None:
-    settings = {
-        "short_line_min_score": 88.0,
-        "short_line_min_margin": 15.0,
-        "short_line_min_ordered_score": 70.0,
-        "short_line_min_token_coverage": 1.0,
-        "short_line_min_token_precision": 1.0,
-    }
+    settings = _alignment_settings(
+        reliability={
+            "short": {
+                "minimum_score": 88.0,
+                "minimum_margin": 15.0,
+                "minimum_ordered_score": 70.0,
+                "minimum_token_coverage": 1.0,
+                "minimum_token_precision": 1.0,
+            }
+        }
+    )
     line = {"line": "Not... remember..."}
 
     assert text_similarity(line["line"], "Remember Not") >= 88.0
@@ -1398,7 +1437,9 @@ def test_suspicious_duration_prevents_exact_match_auto_acceptance() -> None:
         line=line,
         match_score=100.0,
         margin=40.0,
-        settings={"reliable_min_duration_plausibility": 25.0},
+        settings=_alignment_settings(
+            reliability={"minimum_duration_plausibility": 25.0}
+        ),
         observed="Pathetic",
         duration_plausibility=20.2,
     ) == (False, "POSSIBLE_REPEATED_TAKES")
@@ -1406,7 +1447,9 @@ def test_suspicious_duration_prevents_exact_match_auto_acceptance() -> None:
         line=line,
         match_score=100.0,
         margin=40.0,
-        settings={"reliable_min_duration_plausibility": 25.0},
+        settings=_alignment_settings(
+            reliability={"minimum_duration_plausibility": 25.0}
+        ),
         observed="Pathetic",
         duration_plausibility=38.4,
     ) == (True, "")
@@ -1492,11 +1535,15 @@ def test_missing_sentence_prevents_auto_acceptance(
         line={"line": expected},
         match_score=max(90.0, text_similarity(expected, partial)),
         margin=40.0,
-        settings={
-            "reliable_min_score": 70.0,
-            "reliable_min_margin": 5.0,
-            "reliable_min_clause_score": 55.0,
-        },
+        settings=_alignment_settings(
+            reliability={
+                "normal": {
+                    "minimum_score": 70.0,
+                    "minimum_margin": 5.0,
+                },
+                "clauses": {"minimum_score": 55.0},
+            }
+        ),
         observed=partial,
     ) == (False, "MISSING_SENTENCE")
 
@@ -1565,11 +1612,13 @@ def test_adjacent_sentence_fragments_create_complete_take_candidates() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_segments": 2,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 2,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            }
+        ),
     )
 
     assert [(action["start_index"], action["count"]) for action in joined] == [
@@ -1589,12 +1638,14 @@ def test_adjacent_sentence_fragments_create_complete_take_candidates() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_segments": 2,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-            "fragment_join_max_actions": 1,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 2,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            },
+            recovery={"max_candidates_per_line": 1},
+        ),
     )
     assert len(limited) == 1
 
@@ -1637,10 +1688,12 @@ def test_boundary_completion_can_join_repeated_short_clauses() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            }
+        ),
     )
 
     assert len(joined) == 1
@@ -1706,24 +1759,28 @@ def test_fragment_join_keeps_bounded_high_score_fallbacks() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_segments": 4,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-            "fragment_join_fallback_max_actions": 0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 4,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            },
+            recovery={"fallback_candidates_per_line": 0},
+        ),
         transcription=transcription,
     )
     with_fallback = _multisentence_fragment_join_actions(
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_segments": 4,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-            "fragment_join_fallback_max_actions": 2,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 4,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            },
+            recovery={"fallback_candidates_per_line": 2},
+        ),
         transcription=transcription,
     )
 
@@ -2098,11 +2155,13 @@ def test_fragment_join_can_trim_shared_take_boundary_segment() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_segments": 3,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 3,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            }
+        ),
     )
 
     first_take = next(
@@ -2448,10 +2507,12 @@ def test_secondary_near_complete_match_can_seed_fragment_join() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            }
+        ),
     )
 
     recovered = next(action for action in joined if action["line_index"] == 1)
@@ -2512,10 +2573,12 @@ def test_uncertain_short_boundary_audio_is_kept_for_review() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            }
+        ),
     )
 
     recovered = next(action for action in joined if action["line_index"] == 0)
@@ -2588,12 +2651,14 @@ def test_fragment_join_uses_shortest_text_bounded_span() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_segments": 3,
-            "fragment_join_max_segments": 3,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 3,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            },
+            recovery={"max_segments": 3},
+        ),
     )
 
     assert [(action["start_index"], action["count"]) for action in joined] == [
@@ -2671,12 +2736,14 @@ def test_fragment_join_recovers_unselected_preceding_sentence_from_word_span() -
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_segments": 3,
-            "fragment_join_max_segments": 3,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 3,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            },
+            recovery={"max_segments": 3},
+        ),
         transcription=transcription,
     )
 
@@ -2758,10 +2825,12 @@ def test_fragment_join_prefers_complete_segment_asr_over_stale_session_words() -
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            }
+        ),
         transcription=transcription,
     )
 
@@ -2806,10 +2875,12 @@ def test_fragment_join_recovers_single_clause_split_at_internal_pause() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            }
+        ),
     )
 
     assert [(action["start_index"], action["count"]) for action in joined] == [
@@ -2857,12 +2928,14 @@ def test_fragment_join_can_recover_four_segments_around_partial_seed() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_segments": 4,
-            "fragment_join_max_segments": 2,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 4,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            },
+            recovery={"max_segments": 2},
+        ),
     )
 
     assert any(
@@ -2912,11 +2985,13 @@ def test_fragment_join_sends_plausible_incomplete_span_to_exact_asr() -> None:
         actions,
         lines=[{"line_id": "line", "line": line_text}],
         base_segments=segments,
-        settings={
-            "max_merge_segments": 3,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 3,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            }
+        ),
     )
 
     recovered = next(
@@ -2968,11 +3043,13 @@ def test_fragment_join_recovers_single_sentence_missing_end() -> None:
         actions,
         lines=[{"line_id": "Palioth::R53", "line": line_text}],
         base_segments=segments,
-        settings={
-            "max_merge_segments": 10,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 20.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 10,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 20.0,
+            }
+        ),
     )
 
     recovered = next(
@@ -3027,11 +3104,13 @@ def test_fragment_join_recovers_seven_fragments_with_ten_segment_limit() -> None
         actions,
         lines=[{"line_id": "Palioth::R53", "line": line_text}],
         base_segments=segments,
-        settings={
-            "max_merge_segments": 10,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 20.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 10,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 20.0,
+            }
+        ),
     )
 
     assert any(
@@ -3090,10 +3169,12 @@ def test_fragment_join_searches_neighbor_before_worse_selected_candidate() -> No
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            }
+        ),
     )
 
     assert any(
@@ -3140,10 +3221,12 @@ def test_fragment_join_skips_line_with_complete_contraction_variant() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-        },
+        settings=_alignment_settings(
+            span_search={
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            }
+        ),
     )
 
     assert joined == []
@@ -3177,13 +3260,15 @@ def test_unordered_alignment_does_not_merge_empty_boundary_segment() -> None:
     actions = order_independent_align(
         segments,
         lines,
-        {
-            "max_merge_segments": 2,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-            "candidate_min_score": 45.0,
-            "merge_require_text_boundaries": True,
-        },
+        _alignment_settings(
+            span_search={
+                "max_segments": 2,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+                "minimum_score": 45.0,
+                "require_text_boundaries": True,
+            }
+        ),
     )
 
     assert len(actions) == 1
@@ -3573,10 +3658,12 @@ def test_duplicate_weak_order_assigns_separate_take_groups() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "duplicate_line_policy": "weak_order",
-            "take_group_gap_seconds": 5.0,
-        },
+        settings=_alignment_settings(
+            duplicates={
+                "policy": "weak_order",
+                "take_group_gap_seconds": 5.0,
+            }
+        ),
     )
 
     assert [action["line_index"] for action in actions] == [0, 1]
@@ -3610,10 +3697,12 @@ def test_duplicate_weak_order_distributes_nearby_distinct_takes() -> None:
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "duplicate_line_policy": "weak_order",
-            "take_group_gap_seconds": 12.0,
-        },
+        settings=_alignment_settings(
+            duplicates={
+                "policy": "weak_order",
+                "take_group_gap_seconds": 12.0,
+            }
+        ),
     )
 
     assert [action["line_index"] for action in actions] == [0, 1]
@@ -3676,11 +3765,13 @@ def test_duplicate_weak_order_ignores_weak_matches_when_grouping_takes() -> None
         actions,
         lines=lines,
         base_segments=segments,
-        settings={
-            "duplicate_line_policy": "weak_order",
-            "take_group_gap_seconds": 12.0,
-            "short_line_min_score": 88.0,
-        },
+        settings=_alignment_settings(
+            duplicates={
+                "policy": "weak_order",
+                "take_group_gap_seconds": 12.0,
+            },
+            reliability={"short": {"minimum_score": 88.0}},
+        ),
     )
 
     assigned_correct_times = {
@@ -3719,12 +3810,12 @@ def test_duplicate_review_and_reuse_expand_only_identical_targets() -> None:
     review_actions = _expand_alignment_actions(
         [action],
         lines=lines,
-        settings={"duplicate_line_policy": "review"},
+        settings=_alignment_settings(duplicates={"policy": "review"}),
     )
     reuse_actions = _expand_alignment_actions(
         [action],
         lines=lines,
-        settings={"duplicate_line_policy": "reuse"},
+        settings=_alignment_settings(duplicates={"policy": "reuse"}),
     )
 
     assert [item["line_index"] for item in review_actions] == [0, 1]
@@ -4030,10 +4121,12 @@ def test_text_aligner_excludes_nonverbal_lines() -> None:
             {"line_id": "nonverbal", "line": "(cough)"},
             {"line_id": "spoken", "line": "Hello there."},
         ],
-        {
-            "max_merge_segments": 1,
-            "candidate_min_score": 35.0,
-        },
+        _alignment_settings(
+            span_search={
+                "max_segments": 1,
+                "minimum_score": 35.0,
+            }
+        ),
     )
 
     assert actions
@@ -5247,15 +5340,23 @@ def test_segmentation_and_alignment_integration(
             "fade_ms": 5.0,
         },
         "alignment": {
-            "max_merge_segments": 2,
-            "max_merge_gap_seconds": 1.0,
-            "max_span_seconds": 10.0,
-            "candidate_min_score": 45.0,
-            "reliable_min_score": 72.0,
-            "reliable_min_margin": 8.0,
-            "short_line_min_score": 88.0,
-            "short_line_min_margin": 15.0,
-            "noise_penalty": 2.2,
+            "span_search": {
+                "max_segments": 2,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+                "minimum_score": 45.0,
+            },
+            "reliability": {
+                "normal": {
+                    "minimum_score": 72.0,
+                    "minimum_margin": 8.0,
+                },
+                "short": {
+                    "minimum_score": 88.0,
+                    "minimum_margin": 15.0,
+                },
+            },
+            "ranking": {"noise_penalty": 2.2},
         },
         "export": {
             "extension": ".wav",

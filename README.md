@@ -96,7 +96,9 @@ conservative batch from currently free GPU memory after the model is loaded.
 Set a positive integer for an explicit override, and optionally lower
 `transcription.batch_size_max` from its default of `32` to cap automatic
 sizing. CPU execution and unavailable GPU telemetry fall back to batch size
-`1`.
+`1`. The batch is made from the recording's Whisper/VAD chunks; configured
+recordings are still processed one at a time because each has different
+hotwords and cache output.
 Use `--device cpu` when the CUDA 12/cuDNN 9 runtime is unavailable. For a quick
 experiment, override the model:
 
@@ -153,6 +155,12 @@ utilization. Configure the number of clips per inference batch with
 `segment_transcription.batch_size`; the default is `"auto"` and uses the same
 free-GPU-memory calculation. A positive integer is a fixed override, while
 `segment_transcription.batch_size_max` caps automatic sizing (default `32`).
+The value is a maximum, so a final partial batch is smaller. Prompted fallback
+clips are batched when they share the same script prompt; clips with different
+prompts require separate inference calls. A clip longer than Whisper's
+30-second batched window is decoded through the full-audio path instead of
+being truncated. `segments_manifest.json` records the primary and prompted
+inference-batch counts for the latest run.
 
 Unprompted clip ASR is the canonical evidence. When it is empty, low-confidence,
 or has poor ordered similarity, a second script-prompted decode may be stored
@@ -403,3 +411,9 @@ independent segment transcription, and alignment:
 ```
 
 All expensive stages are cached using source and settings hashes.
+Consequently, changing only a batch size and rerunning without the stage's
+force option tests cache reuse rather than inference speed. Larger batches are
+also not guaranteed to be faster: feature extraction remains per clip,
+autoregressive decoding time depends on the longest item in a batch, and very
+large batches can reduce throughput on some GPUs. Compare several fixed sizes
+on the same uncached inputs when tuning for a particular machine.

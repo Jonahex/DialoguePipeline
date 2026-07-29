@@ -662,112 +662,165 @@ def _decode_clips_batched(
         waveforms.append(
             decode_audio(str(audio_path), sampling_rate=sampling_rate)
         )
+
+    # BatchedInferencePipeline treats every provided clip timestamp as one
+    # model window and silently keeps only its first 30 seconds. Candidate
+    # spans are allowed to be longer than that, so send those uncommon clips
+    # through WhisperModel's full-audio windowing path instead.
+    chunk_length = min(
+        30.0,
+        float(
+            getattr(
+                runtime["model"].feature_extractor,
+                "chunk_length",
+                30.0,
+            )
+        ),
+    )
+    maximum_batched_samples = int(chunk_length * sampling_rate)
+    long_clip_indexes = [
+        index
+        for index, waveform in enumerate(waveforms)
+        if int(waveform.shape[0]) > maximum_batched_samples
+    ]
+    long_clip_index_set = set(long_clip_indexes)
+    short_clip_indexes = [
+        index
+        for index in range(len(audio_paths))
+        if index not in long_clip_index_set
+    ]
+    results: list[dict[str, Any] | None] = [None] * len(audio_paths)
+    if long_clip_indexes:
+        print(
+            f"[segment ASR] {len(long_clip_indexes)} clip(s) exceed "
+            f"{chunk_length:g} seconds; decoding them individually to "
+            "avoid batched truncation.",
+            flush=True,
+        )
+
+    short_waveforms = [waveforms[index] for index in short_clip_indexes]
     offsets: list[tuple[int, int]] = []
     cursor = 0
-    for waveform in waveforms:
+    for waveform in short_waveforms:
         start = cursor
         cursor += int(waveform.shape[0])
         offsets.append((start, cursor))
-    combined = (
-        np.concatenate(waveforms)
-        if waveforms
-        else np.empty((0,), dtype=np.float32)
-    )
-    clip_timestamps = [
-        {
-            "start": start / sampling_rate,
-            "end": end / sampling_rate,
+    if short_waveforms:
+        combined = np.concatenate(short_waveforms)
+        # Faster-Whisper converts these seconds back to samples with int().
+        # A half-sample offset prevents floating-point roundoff from moving a
+        # boundary one sample earlier during that conversion.
+        clip_timestamps = [
+            {
+                "start": (start + 0.5) / sampling_rate,
+                "end": (end + 0.5) / sampling_rate,
+            }
+            for start, end in offsets
+        ]
+        kwargs: dict[str, Any] = {
+            "language": project.get("language", "en"),
+            "beam_size": int(profile.get("beam_size", 5)),
+            "batch_size": min(
+                len(short_waveforms),
+                _resolve_profile_batch_size(profile=profile, runtime=runtime),
+            ),
+            "word_timestamps": True,
+            "without_timestamps": False,
+            "condition_on_previous_text": False,
+            "vad_filter": False,
+            "clip_timestamps": clip_timestamps,
         }
-        for start, end in offsets
-    ]
-    kwargs: dict[str, Any] = {
-        "language": project.get("language", "en"),
-        "beam_size": int(profile.get("beam_size", 5)),
-        "batch_size": min(
-            len(audio_paths),
-            _resolve_profile_batch_size(profile=profile, runtime=runtime),
-        ),
-        "word_timestamps": True,
-        "without_timestamps": False,
-        "condition_on_previous_text": False,
-        "vad_filter": False,
-        "clip_timestamps": clip_timestamps,
-    }
-    if prompt:
-        kwargs["initial_prompt"] = prompt
-        kwargs["hotwords"] = prompt
+        if prompt:
+            kwargs["initial_prompt"] = prompt
+            kwargs["hotwords"] = prompt
 
-    def run_decode() -> tuple[list[Any], Any]:
-        segments_iter, info = runtime["batched_model"].transcribe(
-            combined,
-            **kwargs,
-        )
-        decoded = []
-        for segment in segments_iter:
-            check_processing_cancelled()
-            decoded.append(segment)
-        return decoded, info
+        def run_decode() -> tuple[list[Any], Any]:
+            segments_iter, info = runtime["batched_model"].transcribe(
+                combined,
+                **kwargs,
+            )
+            decoded = []
+            for segment in segments_iter:
+                check_processing_cancelled()
+                decoded.append(segment)
+            return decoded, info
 
-    try:
-        decoded, info = run_decode()
-    except Exception as error:
-        if (
-            runtime.get("device") != "cuda"
-            or str(profile.get("device", "auto")) != "auto"
-        ):
-            raise
-        print(
-            f"[segment ASR] CUDA batched inference failed ({error}); "
-            "continuing on CPU INT8.",
-            flush=True,
-        )
-        _fall_back_clip_runtime_to_cpu(
+        try:
+            decoded, info = run_decode()
+        except Exception as error:
+            if (
+                runtime.get("device") != "cuda"
+                or str(profile.get("device", "auto")) != "auto"
+            ):
+                raise
+            print(
+                f"[segment ASR] CUDA batched inference failed ({error}); "
+                "continuing on CPU INT8.",
+                flush=True,
+            )
+            _fall_back_clip_runtime_to_cpu(
+                profile=profile,
+                runtime=runtime,
+            )
+            kwargs["batch_size"] = min(
+                len(short_waveforms),
+                _resolve_profile_batch_size(profile=profile, runtime=runtime),
+            )
+            decoded, info = run_decode()
+
+        decoded_by_clip: list[list[Any]] = [
+            [] for _ in short_clip_indexes
+        ]
+        offset_seconds = [
+            (start / sampling_rate, end / sampling_rate)
+            for start, end in offsets
+        ]
+        for decoded_segment in decoded:
+            start = float(getattr(decoded_segment, "start", 0.0) or 0.0)
+            end = float(getattr(decoded_segment, "end", start) or start)
+            midpoint = (start + end) / 2.0
+            clip_index = next(
+                (
+                    index
+                    for index, (clip_start, clip_end) in enumerate(
+                        offset_seconds
+                    )
+                    if (
+                        clip_start <= midpoint < clip_end
+                        or (
+                            index == len(offset_seconds) - 1
+                            and midpoint == clip_end
+                        )
+                    )
+                ),
+                None,
+            )
+            if clip_index is not None:
+                decoded_by_clip[clip_index].append(decoded_segment)
+
+        for local_index, original_index in enumerate(short_clip_indexes):
+            results[original_index] = _decoded_segments_payload(
+                decoded_by_clip[local_index],
+                info=info,
+                project=project,
+                runtime=runtime,
+                prompted=bool(prompt),
+                time_offset=offset_seconds[local_index][0],
+            )
+
+    for index in long_clip_indexes:
+        check_processing_cancelled()
+        results[index] = _decode_clip(
+            audio_path=audio_paths[index],
+            project=project,
             profile=profile,
             runtime=runtime,
+            prompt=prompt,
         )
-        kwargs["batch_size"] = min(
-            len(audio_paths),
-            _resolve_profile_batch_size(profile=profile, runtime=runtime),
-        )
-        decoded, info = run_decode()
 
-    decoded_by_clip: list[list[Any]] = [[] for _ in audio_paths]
-    offset_seconds = [
-        (start / sampling_rate, end / sampling_rate)
-        for start, end in offsets
-    ]
-    for decoded_segment in decoded:
-        start = float(getattr(decoded_segment, "start", 0.0) or 0.0)
-        end = float(getattr(decoded_segment, "end", start) or start)
-        midpoint = (start + end) / 2.0
-        clip_index = next(
-            (
-                index
-                for index, (clip_start, clip_end) in enumerate(offset_seconds)
-                if (
-                    clip_start <= midpoint < clip_end
-                    or (
-                        index == len(offset_seconds) - 1
-                        and midpoint == clip_end
-                    )
-                )
-            ),
-            None,
-        )
-        if clip_index is not None:
-            decoded_by_clip[clip_index].append(decoded_segment)
-
-    return [
-        _decoded_segments_payload(
-            clip_decoded,
-            info=info,
-            project=project,
-            runtime=runtime,
-            prompted=bool(prompt),
-            time_offset=offset_seconds[index][0],
-        )
-        for index, clip_decoded in enumerate(decoded_by_clip)
-    ]
+    if any(result is None for result in results):
+        raise RuntimeError("Missing transcript for a decoded clip.")
+    return [result for result in results if result is not None]
 
 
 def transcribe_clip_cached(
@@ -1165,6 +1218,8 @@ def transcribe_segments_project(
     processed = 0
     cached = 0
     prompted_count = 0
+    primary_batch_count = 0
+    prompted_batch_count = 0
     silence_rejected_count = 0
     for session_entry in manifest.get("sessions", []):
         check_processing_cancelled()
@@ -1254,6 +1309,7 @@ def transcribe_segments_project(
             for batch_start in range(0, len(pending_entries), batch_size):
                 check_processing_cancelled()
                 batch = pending_entries[batch_start : batch_start + batch_size]
+                primary_batch_count += 1
                 decoded_batch = _decode_clips_batched(
                     audio_paths=[entry["audio_path"] for entry in batch],
                     project=project,
@@ -1271,10 +1327,10 @@ def transcribe_segments_project(
                     write_json(entry["cache_path"], primary)
                     entry["primary"] = primary
 
-        for index, entry in enumerate(primary_entries, start=1):
+        prompted_groups: dict[str, list[dict[str, Any]]] = {}
+        for entry in primary_entries:
             check_processing_cancelled()
             segment = entry["segment"]
-            audio_path = entry["audio_path"]
             cache_identity = entry["cache_identity"]
             primary = entry["primary"]
             if primary is None:
@@ -1308,7 +1364,8 @@ def transcribe_segments_project(
                     or ordered_score < trigger_ordered
                 )
             )
-            prompted = None
+            entry["silence_rejected"] = silence_rejected
+            entry["prompted"] = None
             if needs_prompt:
                 candidates = _prompt_candidates(
                     lines,
@@ -1321,33 +1378,108 @@ def transcribe_segments_project(
                 ]
                 if prompt:
                     prompted_count += 1
-                    prompted = transcribe_clip_cached(
-                        project_dir=project_dir,
+                    prompted_cache_identity = {
+                        **cache_identity,
+                        "kind": "base_segment_prompted_fallback",
+                        "candidate_line_ids": [
+                            line["line_id"] for line in candidates
+                        ],
+                    }
+                    prompted_decoding_identity = _clip_decoding_identity(
                         project=project,
-                        audio_path=audio_path,
-                        cache_path=(
-                            cache_root
-                            / f"{segment['segment_id']}__prompted.json"
-                        ),
-                        cache_identity={
-                            **cache_identity,
-                            "kind": "base_segment_prompted_fallback",
-                            "candidate_line_ids": [
-                                line["line_id"] for line in candidates
-                            ],
-                        },
+                        profile=profile,
+                        prompt=prompt,
+                    )
+                    prompted_cache_key = _clip_cache_key(
+                        cache_identity=prompted_cache_identity,
+                        decoding_identity=prompted_decoding_identity,
+                    )
+                    prompted_cache_path = (
+                        cache_root
+                        / f"{segment['segment_id']}__prompted.json"
+                    )
+                    prompted = _cached_clip_payload(
+                        cache_path=prompted_cache_path,
+                        cache_key=prompted_cache_key,
+                        cache_identity=prompted_cache_identity,
+                        decoding_identity=prompted_decoding_identity,
+                        force=force,
+                    )
+                    entry["prompted"] = prompted
+                    if prompted is None:
+                        entry["prompted_cache_path"] = prompted_cache_path
+                        entry["prompted_cache_identity"] = (
+                            prompted_cache_identity
+                        )
+                        entry["prompted_decoding_identity"] = (
+                            prompted_decoding_identity
+                        )
+                        entry["prompted_cache_key"] = prompted_cache_key
+                        prompted_groups.setdefault(prompt, []).append(entry)
+
+        if prompted_groups:
+            _ensure_clip_model(
+                project_dir=project_dir,
+                project=project,
+                profile=profile,
+                runtime=runtime,
+            )
+            batch_size = _resolve_profile_batch_size(
+                profile=profile,
+                runtime=runtime,
+            )
+            pending_prompted_count = sum(
+                len(entries) for entries in prompted_groups.values()
+            )
+            print(
+                f"[segment ASR] {session['id']}: "
+                f"{pending_prompted_count} prompted fallback(s) in "
+                f"{len(prompted_groups)} prompt group(s) "
+                f"(batch size {batch_size})",
+                flush=True,
+            )
+            for prompt, entries in prompted_groups.items():
+                for batch_start in range(0, len(entries), batch_size):
+                    check_processing_cancelled()
+                    batch = entries[batch_start : batch_start + batch_size]
+                    prompted_batch_count += 1
+                    decoded_batch = _decode_clips_batched(
+                        audio_paths=[
+                            entry["audio_path"] for entry in batch
+                        ],
+                        project=project,
                         profile=profile,
                         runtime=runtime,
                         prompt=prompt,
-                        force=force,
                     )
+                    for entry, decoded in zip(batch, decoded_batch):
+                        check_processing_cancelled()
+                        prompted = _clip_payload(
+                            cache_key=entry["prompted_cache_key"],
+                            cache_identity=entry[
+                                "prompted_cache_identity"
+                            ],
+                            decoding_identity=entry[
+                                "prompted_decoding_identity"
+                            ],
+                            decoded=decoded,
+                        )
+                        write_json(
+                            entry["prompted_cache_path"],
+                            prompted,
+                        )
+                        entry["prompted"] = prompted
+
+        for index, entry in enumerate(primary_entries, start=1):
+            check_processing_cancelled()
+            segment = entry["segment"]
             _apply_segment_asr_result(
                 segment,
-                primary=primary,
-                prompted=prompted,
-                silence_rejected=silence_rejected,
+                primary=entry["primary"],
+                prompted=entry["prompted"],
+                silence_rejected=entry["silence_rejected"],
             )
-            if silence_rejected:
+            if entry["silence_rejected"]:
                 silence_rejected_count += 1
             processed += 1
             if index % 25 == 0 or index == len(base_segments):
@@ -1367,7 +1499,9 @@ def transcribe_segments_project(
         "batch_size_source": runtime.get("batch_size_source"),
         "processed_segment_count": processed,
         "manifest_cache_hits": cached,
+        "primary_inference_batch_count": primary_batch_count,
         "prompted_fallback_count": prompted_count,
+        "prompted_inference_batch_count": prompted_batch_count,
         "silence_rejected_count": silence_rejected_count,
     }
     if segment_filter and processed == 0:

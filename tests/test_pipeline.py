@@ -58,6 +58,7 @@ from dialogue_pipeline.segmentation import (
 )
 from dialogue_pipeline.transcription import (
     _automatic_batch_size,
+    _decode_clips_batched,
     _likely_silence_hallucination,
     transcribe_candidate_span,
     transcribe_candidate_spans,
@@ -3018,7 +3019,7 @@ def test_segment_asr_batches_independent_clips_with_configured_size(
             batch_sizes.append(kwargs["batch_size"])
             decoded = []
             for index, clip in enumerate(clips):
-                start = clip["start"]
+                start = int(clip["start"] * 16000) / 16000
                 decoded.append(
                     SimpleNamespace(
                         start=start + 0.05,
@@ -3058,6 +3059,189 @@ def test_segment_asr_batches_independent_clips_with_configured_size(
     assert segments[1]["segment_asr"]["primary"]["words"][0]["start"] == pytest.approx(
         0.05
     )
+
+
+def test_segment_asr_batches_prompted_fallbacks_that_share_a_prompt(
+    tmp_path: Path,
+) -> None:
+    segment_records = []
+    for index in range(3):
+        segment_file = tmp_path / f"prompt_segment_{index}.wav"
+        _write_tone(segment_file, duration_seconds=0.5)
+        segment_records.append(
+            {
+                "segment_id": f"session__s{index + 1:05d}",
+                "kind": "base",
+                "file": segment_file.name,
+                "source_sha256": "source-hash",
+                "start_sample": index * 24000,
+                "end_sample": (index + 1) * 24000,
+                "start_seconds": index * 0.5,
+                "end_seconds": (index + 1) * 0.5,
+                "transcript": "",
+                "words": [],
+                "word_count": 0,
+                "asr_probability": None,
+                "metrics": {"duration_seconds": 0.5},
+            }
+        )
+    line = {
+        "line_id": "Actor::R2",
+        "sheet": "Actor",
+        "sheet_index": 0,
+        "excel_row": 2,
+        "line": "Hello.",
+    }
+    write_json(tmp_path / "source_lines.json", {"lines": [line]})
+    write_json(
+        tmp_path / "segments_manifest.json",
+        {
+            "sessions": [
+                {
+                    "session_id": "session",
+                    "segments": segment_records,
+                    "derived_segments": [],
+                }
+            ]
+        },
+    )
+    project = {
+        "source_lines": "source_lines.json",
+        "language": "en",
+        "transcription": {
+            "model": "large-v3",
+            "device": "cpu",
+            "compute_type": "int8",
+        },
+        "segment_transcription": {
+            "enabled": True,
+            "batch_size": 3,
+            "prompt_fallback_enabled": True,
+        },
+        "sessions": [
+            {
+                "id": "session",
+                "enabled": True,
+                "sheets": ["Actor"],
+                "excel_rows": [],
+                "line_ids": [],
+            }
+        ],
+    }
+    calls = []
+
+    class FakeBatchedModel:
+        def transcribe(self, _audio, **kwargs):
+            calls.append(kwargs)
+            decoded = []
+            for clip in kwargs["clip_timestamps"]:
+                start = int(clip["start"] * 16000) / 16000
+                prompted = bool(kwargs.get("initial_prompt"))
+                decoded.append(
+                    SimpleNamespace(
+                        start=start,
+                        end=start + 0.4,
+                        text="Hello" if prompted else "",
+                        avg_logprob=-0.1 if prompted else -1.0,
+                        no_speech_prob=0.01 if prompted else 0.8,
+                        words=(
+                            [
+                                SimpleNamespace(
+                                    start=start + 0.05,
+                                    end=start + 0.25,
+                                    word=" Hello",
+                                    probability=0.95,
+                                )
+                            ]
+                            if prompted
+                            else []
+                        ),
+                    )
+                )
+            return iter(decoded), SimpleNamespace(language="en")
+
+    runtime = {
+        "model": SimpleNamespace(
+            feature_extractor=SimpleNamespace(
+                sampling_rate=16000,
+                chunk_length=30,
+            )
+        ),
+        "batched_model": FakeBatchedModel(),
+    }
+    transcribe_segments_project(
+        project_dir=tmp_path,
+        project=project,
+        runtime=runtime,
+    )
+
+    manifest = read_json(tmp_path / "segments_manifest.json")
+    assert [call["batch_size"] for call in calls] == [3, 3]
+    assert "initial_prompt" not in calls[0]
+    assert calls[1]["initial_prompt"] == "Hello."
+    assert manifest["segment_transcription"]["primary_inference_batch_count"] == 1
+    assert manifest["segment_transcription"]["prompted_fallback_count"] == 3
+    assert manifest["segment_transcription"]["prompted_inference_batch_count"] == 1
+    assert all(
+        segment["transcript_source"] == "segment_asr_prompted"
+        for segment in manifest["sessions"][0]["segments"]
+    )
+
+
+def test_long_clip_avoids_batched_pipeline_truncation(tmp_path: Path) -> None:
+    audio_path = tmp_path / "long.wav"
+    _write_tone(audio_path, duration_seconds=30.1)
+    direct_calls = []
+    batched_calls = []
+    decoded_segment = SimpleNamespace(
+        start=0.0,
+        end=30.1,
+        text="Complete long clip",
+        avg_logprob=-0.1,
+        no_speech_prob=0.01,
+        words=[],
+    )
+
+    class FakeModel:
+        feature_extractor = SimpleNamespace(
+            sampling_rate=16000,
+            chunk_length=30,
+        )
+
+        def transcribe(self, audio, **kwargs):
+            direct_calls.append((audio, kwargs))
+            return iter([decoded_segment]), SimpleNamespace(language="en")
+
+    class FakeBatchedModel:
+        def transcribe(self, audio, **kwargs):
+            batched_calls.append((audio, kwargs))
+            raise AssertionError("Long clips must not use batched clip timestamps")
+
+    profile = {
+        "model": "large-v3",
+        "device": "cpu",
+        "compute_type": "int8",
+        "beam_size": 5,
+        "batch_size": 8,
+        "batch_size_max": 32,
+    }
+    result = _decode_clips_batched(
+        audio_paths=[audio_path],
+        project={"language": "en"},
+        profile=profile,
+        runtime={
+            "model": FakeModel(),
+            "batched_model": FakeBatchedModel(),
+            "device": "cpu",
+            "compute_type": "int8",
+            "model_name": "large-v3",
+        },
+    )
+
+    assert not batched_calls
+    assert len(direct_calls) == 1
+    assert result[0]["transcript"] == "Complete long clip"
+    assert result[0]["segments"][0]["end"] == pytest.approx(30.1)
 
 
 def test_automatic_batch_size_uses_free_gpu_memory_conservatively() -> None:
@@ -3452,7 +3636,7 @@ def test_candidate_span_asr_batches_unique_uncached_spans(
             batch_sizes.append(kwargs["batch_size"])
             decoded = []
             for index, clip in enumerate(clips):
-                start = clip["start"]
+                start = int(clip["start"] * 16000) / 16000
                 decoded.append(
                     SimpleNamespace(
                         start=start + 0.05,

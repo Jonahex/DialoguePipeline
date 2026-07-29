@@ -14,6 +14,7 @@ from dialogue_pipeline.alignment import (
     _apply_duplicate_line_policy,
     _boundary_clause_consensus_transcript,
     _boundary_noise_cleanup_actions,
+    _boundary_voice_trim_actions,
     _candidate_reliability,
     _edge_vocalization_extension_actions,
     _exact_line_scores,
@@ -22,6 +23,7 @@ from dialogue_pipeline.alignment import (
     _intra_segment_trim_actions,
     _multisentence_fragment_join_actions,
     _reroute_actions_to_exact_asr_primary_matches,
+    _word_gap_boundaries,
     SpanCatalog,
     TranscriptEvaluator,
     align_project,
@@ -35,7 +37,11 @@ from dialogue_pipeline.alignment_settings import (
     AlignmentSettings,
     default_alignment_config,
 )
-from dialogue_pipeline.audio import cut_pcm_wav, prepare_pcm_segmentation_source
+from dialogue_pipeline.audio import (
+    cut_pcm_wav,
+    prepare_pcm_segmentation_source,
+    quietest_pcm_boundary,
+)
 from dialogue_pipeline.cancellation import (
     ProcessingCancelled,
     cancellation_scope,
@@ -159,6 +165,189 @@ def test_materialize_trimmed_segment_supports_multi_base_bounds(
     assert bounded["end_sample"] == 120000
     assert bounded["metrics"]["duration_seconds"] == pytest.approx(2.0)
     assert (tmp_path / bounded["file"]).is_file()
+
+
+def test_word_gap_boundary_snaps_after_release_burst(tmp_path: Path) -> None:
+    sample_rate = 48000
+    audio_path = tmp_path / "boundary.wav"
+    samples = np.full(round(0.50 * sample_rate), 1000, dtype="<i2")
+    samples[round(0.15 * sample_rate) : round(0.24 * sample_rate)] = 200
+    samples[round(0.24 * sample_rate) : round(0.29 * sample_rate)] = 5000
+    samples[round(0.29 * sample_rate) : round(0.39 * sample_rate)] = 20
+    with wave.open(str(audio_path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(samples.tobytes())
+
+    proposed = round(0.27 * sample_rate)
+    snapped = quietest_pcm_boundary(
+        audio_path,
+        proposed_sample=proposed,
+        minimum_sample=round(0.12 * sample_rate),
+        maximum_sample=round(0.42 * sample_rate),
+    )
+    assert round(0.30 * sample_rate) <= snapped <= round(
+        0.38 * sample_rate
+    )
+
+    boundaries = _word_gap_boundaries(
+        {
+            "file": audio_path.name,
+            "start_sample": 0,
+            "end_sample": samples.shape[0],
+            "start_seconds": 0.0,
+            "end_seconds": samples.shape[0] / sample_rate,
+            "segment_asr": {
+                "primary": {
+                    "words": [
+                        {"word": " not", "start": 0.0, "end": 0.12},
+                        {"word": " I", "start": 0.42, "end": 0.50},
+                    ]
+                }
+            },
+        },
+        minimum_gap=0.10,
+        maximum_boundaries=1,
+        settings={},
+        project_dir=tmp_path,
+    )
+    assert boundaries[0][1] == pytest.approx(snapped / sample_rate)
+
+
+def test_boundary_voice_trim_creates_clean_candidate_and_marks_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_bounds",
+        lambda *_args, **_kwargs: (sample_rate, sample_rate * 9),
+    )
+    line_text = "Never mind, a dumb joke. I meant nothing by it."
+    lines = [{"line_id": "target", "line": line_text}]
+    action = {
+        "type": "assigned",
+        "start_index": 0,
+        "count": 2,
+        "line_index": 0,
+        "match_score": 100.0,
+        "transcript": line_text,
+        "duration_plausibility": 80.0,
+        "order_hint": 0.0,
+        "top_matches": [],
+    }
+    base_segments = [
+        {
+            "start_sample": 0,
+            "end_sample": sample_rate * 5,
+            "start_seconds": 0.0,
+            "end_seconds": 5.0,
+        },
+        {
+            "start_sample": sample_rate * 5,
+            "end_sample": sample_rate * 10,
+            "start_seconds": 5.0,
+            "end_seconds": 10.0,
+        },
+    ]
+    cleaned = _boundary_voice_trim_actions(
+        [action],
+        project_dir=tmp_path,
+        session_entry={
+            "sample_rate": sample_rate,
+            "working_audio": "source.wav",
+            "audio": "source.wav",
+        },
+        lines=lines,
+        base_segments=base_segments,
+        settings={},
+        evaluator=TranscriptEvaluator(lines, {}),
+    )
+
+    assert action["unclean_boundary_audio"] is True
+    assert len(cleaned) == 1
+    assert cleaned[0]["boundary_voice_trim"] is True
+    assert cleaned[0]["unclean_boundary_audio"] is False
+    assert cleaned[0]["trim_start_sample"] == sample_rate - round(
+        0.08 * sample_rate
+    )
+    assert cleaned[0]["trim_end_sample"] == sample_rate * 9 + round(
+        0.12 * sample_rate
+    )
+
+
+def test_boundary_voice_trim_uses_strict_tail_vad_after_final_word(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    thresholds = []
+
+    def fake_voice_bounds(
+        _path: Path,
+        *,
+        start_sample: int,
+        end_sample: int,
+        threshold: float,
+    ) -> tuple[int, int]:
+        thresholds.append(threshold)
+        end_seconds = 9.8 if threshold < 0.7 else 9.0
+        return start_sample + sample_rate, round(
+            start_sample + end_seconds * sample_rate
+        )
+
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_bounds",
+        fake_voice_bounds,
+    )
+    line_text = "A bet's a bet. Here's your gold."
+    lines = [{"line_id": "target", "line": line_text}]
+    action = {
+        "type": "assigned",
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 100.0,
+        "transcript": line_text,
+        "duration_plausibility": 100.0,
+    }
+    cleaned = _boundary_voice_trim_actions(
+        [action],
+        project_dir=tmp_path,
+        session_entry={
+            "sample_rate": sample_rate,
+            "working_audio": "source.wav",
+            "audio": "source.wav",
+        },
+        lines=lines,
+        base_segments=[
+            {
+                "start_sample": 0,
+                "end_sample": sample_rate * 10,
+                "start_seconds": 0.0,
+                "end_seconds": 10.0,
+                "words": [
+                    {"word": " gold.", "start": 7.5, "end": 8.8},
+                ],
+            }
+        ],
+        settings={},
+        evaluator=TranscriptEvaluator(lines, {}),
+    )
+
+    assert thresholds == [0.5, 0.7]
+    assert len(cleaned) == 1
+    assert cleaned[0]["trim_end_sample"] == sample_rate * 9 + round(
+        0.12 * sample_rate
+    )
+    assert action["boundary_voice_trailing_seconds"] == pytest.approx(1.0)
 
 
 def test_shared_model_cache_resolution(tmp_path: Path, monkeypatch) -> None:

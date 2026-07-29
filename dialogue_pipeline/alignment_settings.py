@@ -64,8 +64,18 @@ ALIGNMENT_DEFAULTS: dict[str, Any] = {
     "intra_segment_trim_min_token_precision": 0.85,
     "intra_segment_trim_min_ordered_score": 70.0,
     "edge_trim_min_gap_seconds": 0.30,
+    "word_gap_boundary_snap_enabled": True,
+    "word_gap_boundary_snap_search_seconds": 0.20,
+    "word_gap_boundary_snap_window_seconds": 0.02,
+    "word_gap_boundary_snap_max_rms_dbfs": -42.0,
     "boundary_noise_cleanup_enabled": True,
     "boundary_noise_cleanup_min_match_score": 85.0,
+    "boundary_voice_trim_enabled": True,
+    "boundary_voice_trim_min_edge_seconds": 0.30,
+    "boundary_voice_trim_pre_padding_seconds": 0.08,
+    "boundary_voice_trim_post_padding_seconds": 0.12,
+    "boundary_voice_trim_vad_threshold": 0.50,
+    "boundary_voice_trim_breath_vad_threshold": 0.70,
     "edge_cue_extension_enabled": True,
     "edge_cue_extension_max_gap_seconds": 0.40,
     "edge_cue_extension_max_segment_seconds": 5.0,
@@ -233,11 +243,41 @@ _GROUPED_KEYS: dict[tuple[str, ...], str] = {
     ("recovery", "edge_trim_minimum_gap_seconds"): (
         "edge_trim_min_gap_seconds"
     ),
+    ("recovery", "audio_boundaries", "snap_word_gaps"): (
+        "word_gap_boundary_snap_enabled"
+    ),
+    ("recovery", "audio_boundaries", "snap_search_seconds"): (
+        "word_gap_boundary_snap_search_seconds"
+    ),
+    ("recovery", "audio_boundaries", "snap_window_seconds"): (
+        "word_gap_boundary_snap_window_seconds"
+    ),
+    ("recovery", "audio_boundaries", "snap_maximum_rms_dbfs"): (
+        "word_gap_boundary_snap_max_rms_dbfs"
+    ),
     ("recovery", "clean_paralinguistic_boundaries"): (
         "boundary_noise_cleanup_enabled"
     ),
     ("recovery", "boundary_cleanup_minimum_score"): (
         "boundary_noise_cleanup_min_match_score"
+    ),
+    ("recovery", "audio_boundaries", "trim_non_speech_edges"): (
+        "boundary_voice_trim_enabled"
+    ),
+    ("recovery", "audio_boundaries", "minimum_edge_seconds"): (
+        "boundary_voice_trim_min_edge_seconds"
+    ),
+    ("recovery", "audio_boundaries", "pre_padding_seconds"): (
+        "boundary_voice_trim_pre_padding_seconds"
+    ),
+    ("recovery", "audio_boundaries", "post_padding_seconds"): (
+        "boundary_voice_trim_post_padding_seconds"
+    ),
+    ("recovery", "audio_boundaries", "vad_threshold"): (
+        "boundary_voice_trim_vad_threshold"
+    ),
+    ("recovery", "audio_boundaries", "breath_vad_threshold"): (
+        "boundary_voice_trim_breath_vad_threshold"
     ),
     ("recovery", "edge_cues", "extend_adjacent_segments"): (
         "edge_cue_extension_enabled"
@@ -366,6 +406,11 @@ class AlignmentSettings(Mapping[str, Any]):
             "take_group_gap_seconds",
             "intra_segment_trim_min_gap_seconds",
             "edge_trim_min_gap_seconds",
+            "word_gap_boundary_snap_search_seconds",
+            "word_gap_boundary_snap_window_seconds",
+            "boundary_voice_trim_min_edge_seconds",
+            "boundary_voice_trim_pre_padding_seconds",
+            "boundary_voice_trim_post_padding_seconds",
             "edge_cue_extension_max_gap_seconds",
             "edge_cue_extension_max_segment_seconds",
             "untranscribed_merge_min_seconds",
@@ -400,6 +445,26 @@ class AlignmentSettings(Mapping[str, Any]):
         ):
             if not 0.0 <= float(values[key]) <= 1.0:
                 raise ValueError(f"alignment.{key} must be between 0 and 1")
+        for key in (
+            "boundary_voice_trim_vad_threshold",
+            "boundary_voice_trim_breath_vad_threshold",
+        ):
+            if not 0.0 <= float(values[key]) <= 1.0:
+                raise ValueError(f"alignment.{key} must be between 0 and 1")
+        if float(values["boundary_voice_trim_breath_vad_threshold"]) < float(
+            values["boundary_voice_trim_vad_threshold"]
+        ):
+            raise ValueError(
+                "alignment.boundary_voice_trim_breath_vad_threshold must be "
+                "at least alignment.boundary_voice_trim_vad_threshold"
+            )
+        if not -120.0 <= float(
+            values["word_gap_boundary_snap_max_rms_dbfs"]
+        ) <= 0.0:
+            raise ValueError(
+                "alignment.word_gap_boundary_snap_max_rms_dbfs must be "
+                "between -120 and 0"
+            )
 
     def __getitem__(self, key: str) -> Any:
         return self._values[key]

@@ -306,8 +306,20 @@ as `Pfft.`, laughter, sighs, coughs, or breathing are treated as noise unless
 the script includes the sound at that edge. Alignment retains the original
 merged span for review, rejects it from `AUTO_OK` when exact-span ASR omits the
 sound, and creates a clean candidate without that boundary segment. This
-handles imprecise segmentation without blindly trimming quiet padding or
-untranscribed performance from inside a base segment.
+handles imprecise segmentation without blindly dropping a whole textual base
+segment. When the extra breath or room noise is inside the outer edge of a
+textual segment, Silero VAD creates an additional candidate trimmed to the
+detected voice bounds with short pre/post padding. Scripted edge-performance
+cues suppress the corresponding trim. The untrimmed candidate remains
+available for review and cannot become `AUTO_OK` while its cleaned alternative
+exists. A stricter second VAD pass detects trailing breaths that the normal
+speech threshold accepts as voice; the final ASR word timestamp is a hard
+lower bound, so this pass cannot cut recognized dialogue.
+
+Pause-based cuts inside a base segment use ASR word gaps to locate candidate
+boundaries. The midpoint is only the initial estimate: alignment snaps it to
+the quietest nearby PCM window inside the word gap. This avoids splitting a
+word-ending release consonant that extends beyond Whisper's timestamp.
 
 Exact merged-span ASR normally remains authoritative. One narrow exception is
 a short opening or closing clause rejected by exact ASR when both the
@@ -387,6 +399,18 @@ setting is serialized and available in the settings window:
       "edge_trim_minimum_gap_seconds": 0.3,
       "clean_paralinguistic_boundaries": true,
       "boundary_cleanup_minimum_score": 85.0,
+      "audio_boundaries": {
+        "snap_word_gaps": true,
+        "snap_search_seconds": 0.2,
+        "snap_window_seconds": 0.02,
+        "snap_maximum_rms_dbfs": -42.0,
+        "trim_non_speech_edges": true,
+        "minimum_edge_seconds": 0.3,
+        "pre_padding_seconds": 0.08,
+        "post_padding_seconds": 0.12,
+        "vad_threshold": 0.5,
+        "breath_vad_threshold": 0.7
+      },
       "edge_cues": {
         "extend_adjacent_segments": true,
         "maximum_gap_seconds": 0.4,

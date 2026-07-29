@@ -92,6 +92,153 @@ def pcm_wav_shape(path: Path) -> dict[str, int] | None:
         return None
 
 
+def quietest_pcm_boundary(
+    path: Path,
+    *,
+    proposed_sample: int,
+    minimum_sample: int,
+    maximum_sample: int,
+    search_seconds: float = 0.20,
+    window_seconds: float = 0.02,
+    maximum_rms_dbfs: float = -42.0,
+) -> int:
+    """Snap a proposed PCM cut to the quietest nearby analysis window."""
+
+    try:
+        with wave.open(str(path), "rb") as reader:
+            if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
+                return int(proposed_sample)
+            sample_rate = int(reader.getframerate())
+            channels = int(reader.getnchannels())
+            frame_count = int(reader.getnframes())
+            lower = max(
+                0,
+                int(minimum_sample),
+                int(proposed_sample)
+                - round(max(0.0, float(search_seconds)) * sample_rate),
+            )
+            upper = min(
+                frame_count,
+                int(maximum_sample),
+                int(proposed_sample)
+                + round(max(0.0, float(search_seconds)) * sample_rate),
+            )
+            window_frames = max(
+                1,
+                round(max(0.001, float(window_seconds)) * sample_rate),
+            )
+            half_window = window_frames // 2
+            first_center = lower + half_window
+            last_center = upper - (window_frames - half_window)
+            if last_center < first_center:
+                return int(proposed_sample)
+            reader.setpos(lower)
+            raw = reader.readframes(upper - lower)
+    except (EOFError, OSError, wave.Error):
+        return int(proposed_sample)
+
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    samples /= 32768.0
+    hop_frames = max(1, round(0.005 * sample_rate))
+    candidates: list[tuple[float, int]] = []
+    for center in range(first_center, last_center + 1, hop_frames):
+        local_start = center - half_window - lower
+        local_end = local_start + window_frames
+        window = samples[local_start:local_end]
+        if window.shape[0] != window_frames:
+            continue
+        rms = float(np.sqrt(np.mean(np.square(window), dtype=np.float64)))
+        candidates.append((rms, center))
+    if not candidates:
+        return int(proposed_sample)
+
+    best_rms, best_sample = min(
+        candidates,
+        key=lambda item: (
+            item[0],
+            abs(item[1] - int(proposed_sample)),
+        ),
+    )
+    best_dbfs = 20.0 * math.log10(max(best_rms, 1e-12))
+    if best_dbfs > float(maximum_rms_dbfs):
+        return int(proposed_sample)
+    return int(best_sample)
+
+
+def pcm_voice_bounds(
+    path: Path,
+    *,
+    start_sample: int,
+    end_sample: int,
+    threshold: float = 0.5,
+) -> tuple[int, int] | None:
+    """Return absolute PCM bounds classified as speech by Silero VAD."""
+
+    try:
+        with wave.open(str(path), "rb") as reader:
+            if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
+                return None
+            sample_rate = int(reader.getframerate())
+            channels = int(reader.getnchannels())
+            frame_count = int(reader.getnframes())
+            start_sample = max(0, min(int(start_sample), frame_count))
+            end_sample = max(
+                start_sample,
+                min(int(end_sample), frame_count),
+            )
+            if end_sample <= start_sample:
+                return None
+            reader.setpos(start_sample)
+            raw = reader.readframes(end_sample - start_sample)
+    except (EOFError, OSError, wave.Error):
+        return None
+
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    samples /= 32768.0
+    vad_rate = 16000
+    if sample_rate != vad_rate:
+        target_count = max(
+            1,
+            round(samples.shape[0] * vad_rate / sample_rate),
+        )
+        source_positions = np.linspace(
+            0.0,
+            max(0.0, float(samples.shape[0] - 1)),
+            num=target_count,
+        )
+        samples = np.interp(
+            source_positions,
+            np.arange(samples.shape[0], dtype=np.float64),
+            samples,
+        ).astype(np.float32)
+
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    timestamps = get_speech_timestamps(
+        samples,
+        VadOptions(
+            threshold=float(threshold),
+            min_speech_duration_ms=80,
+            min_silence_duration_ms=100,
+            speech_pad_ms=0,
+        ),
+    )
+    if not timestamps:
+        return None
+    first = int(timestamps[0]["start"])
+    last = int(timestamps[-1]["end"])
+    voiced_start = start_sample + round(first * sample_rate / vad_rate)
+    voiced_end = start_sample + round(last * sample_rate / vad_rate)
+    return (
+        max(start_sample, min(voiced_start, end_sample)),
+        max(start_sample, min(voiced_end, end_sample)),
+    )
+
+
 def prepare_pcm_segmentation_source(
     source: Path,
     destination: Path,

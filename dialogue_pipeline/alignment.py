@@ -56,6 +56,95 @@ class TranscriptEvaluation:
     sentence: dict[str, Any]
 
 
+_PARALINGUISTIC_TOKENS = frozenset(
+    {
+        "ah",
+        "aha",
+        "ahh",
+        "argh",
+        "breath",
+        "breathing",
+        "cough",
+        "coughing",
+        "coughs",
+        "gasp",
+        "gasps",
+        "giggle",
+        "giggles",
+        "groan",
+        "groans",
+        "grunt",
+        "grunts",
+        "ha",
+        "hah",
+        "haha",
+        "heh",
+        "hehe",
+        "hiccup",
+        "hiccups",
+        "hm",
+        "hmm",
+        "hmmm",
+        "huh",
+        "laugh",
+        "laughing",
+        "laughs",
+        "laughter",
+        "moan",
+        "moans",
+        "mm",
+        "mmm",
+        "oh",
+        "ooh",
+        "pfft",
+        "sigh",
+        "sighing",
+        "sighs",
+        "sniff",
+        "sniffs",
+        "snort",
+        "snorts",
+        "sob",
+        "sobs",
+        "uh",
+        "ugh",
+        "um",
+        "wheeze",
+        "wheezes",
+        "whimper",
+        "whimpers",
+        "yawn",
+        "yawns",
+    }
+)
+
+
+def _script_edge_performance_cues(value: str) -> tuple[bool, bool]:
+    """Return whether a spoken line starts or ends with a direction cue."""
+
+    text = value or ""
+    return (
+        bool(re.match(r"^\s*\([^)]*\)", text)),
+        bool(re.search(r"\([^)]*\)\s*$", text)),
+    )
+
+
+def _is_paralinguistic_transcript(value: str) -> bool:
+    tokens = normalize_text(value).split()
+    if not tokens:
+        return False
+    return all(
+        token in _PARALINGUISTIC_TOKENS
+        or bool(
+            re.fullmatch(
+                r"(?:ha)+|h+a+h*|h+m+|m+h+|p+f+t+|u+h+|a+h+|o+h+",
+                token,
+            )
+        )
+        for token in tokens
+    )
+
+
 def _text_features(
     value: str,
     *,
@@ -1196,9 +1285,29 @@ def _apply_duplicate_line_policy(
         if not matching_actions:
             continue
 
+        expected_word_count = len(normalized.split())
+        anchor_minimum_score = float(
+            settings.get(
+                (
+                    "short_line_min_score"
+                    if expected_word_count <= 3
+                    else "reliable_min_score"
+                ),
+                88.0 if expected_word_count <= 3 else 72.0,
+            )
+        )
+        anchor_actions = [
+            action
+            for action in matching_actions
+            if float(action.get("match_score", 0.0))
+            >= anchor_minimum_score
+        ]
+        if not anchor_actions:
+            continue
+
         clusters: list[list[dict[str, Any]]] = []
         previous_end = None
-        for action in matching_actions:
+        for action in anchor_actions:
             start_index = int(action["start_index"])
             count = int(action["count"])
             start_seconds = float(base_segments[start_index]["start_seconds"])
@@ -1220,10 +1329,46 @@ def _apply_duplicate_line_policy(
             # all nearby takes form one cluster but there are still enough
             # distinct spans, weak order should distribute the spans instead
             # of leaving every later duplicate row missing.
-            if len(matching_actions) < len(indexes):
-                continue
             assignment_groups = [
-                [action] for action in matching_actions
+                [action] for action in anchor_actions
+            ]
+
+        assigned_anchor_rows: dict[int, int] = {}
+
+        def assign_action(
+            action: dict[str, Any],
+            duplicate_index: int,
+        ) -> None:
+            action["line_index"] = duplicate_index
+            action["duplicate_resolution"] = "weak_order"
+            action["duplicate_resolved"] = True
+            matches = list(action.get("top_matches") or [])
+            selected = next(
+                (
+                    match
+                    for match in matches
+                    if int(match["line_index"]) == duplicate_index
+                ),
+                None,
+            )
+            if selected is None:
+                selected = {
+                    "line_index": duplicate_index,
+                    "match_score": action["match_score"],
+                    "ranking_score": action["match_score"],
+                    "duration_plausibility": action.get(
+                        "duration_plausibility", 0.0
+                    ),
+                    "order_hint": action.get("order_hint", 0.0),
+                    "confidence_margin": 0.0,
+                }
+            action["top_matches"] = [
+                selected,
+                *[
+                    match
+                    for match in matches
+                    if int(match["line_index"]) != duplicate_index
+                ],
             ]
 
         for cluster_index, cluster in enumerate(assignment_groups):
@@ -1237,37 +1382,405 @@ def _apply_duplicate_line_policy(
                 )
                 duplicate_index = indexes[duplicate_position]
             for action in cluster:
-                action["line_index"] = duplicate_index
-                action["duplicate_resolution"] = "weak_order"
-                action["duplicate_resolved"] = True
-                matches = list(action.get("top_matches") or [])
-                selected = next(
-                    (
-                        match
-                        for match in matches
-                        if int(match["line_index"]) == duplicate_index
+                assign_action(action, duplicate_index)
+                assigned_anchor_rows[id(action)] = duplicate_index
+
+        weak_actions = [
+            action
+            for action in matching_actions
+            if id(action) not in assigned_anchor_rows
+        ]
+        for action in weak_actions:
+            action_start = float(
+                base_segments[int(action["start_index"])]["start_seconds"]
+            )
+            nearest_anchor = min(
+                anchor_actions,
+                key=lambda anchor: abs(
+                    float(
+                        base_segments[int(anchor["start_index"])][
+                            "start_seconds"
+                        ]
+                    )
+                    - action_start
+                ),
+            )
+            assign_action(
+                action,
+                assigned_anchor_rows[id(nearest_anchor)],
+            )
+
+
+def _segment_transcript(segment: Mapping[str, Any]) -> str:
+    primary_asr = ((segment.get("segment_asr") or {}).get("primary") or {})
+    return str(
+        primary_asr.get("transcript")
+        or segment.get("transcript")
+        or ""
+    ).strip()
+
+
+def _segment_duration(segment: Mapping[str, Any]) -> float:
+    return float(
+        (segment.get("metrics") or {}).get("duration_seconds")
+        or (
+            float(segment.get("end_seconds", 0.0))
+            - float(segment.get("start_seconds", 0.0))
+        )
+    )
+
+
+def _is_likely_edge_vocalization_segment(
+    segment: Mapping[str, Any],
+    *,
+    settings: Mapping[str, Any] | AlignmentSettings,
+) -> bool:
+    settings = AlignmentSettings.from_value(settings)
+    if _segment_duration(segment) > float(
+        settings.get("edge_cue_extension_max_segment_seconds", 5.0)
+    ):
+        return False
+    transcript = _segment_transcript(segment)
+    if transcript:
+        return _is_paralinguistic_transcript(transcript)
+    rms = (segment.get("metrics") or {}).get("rms_dbfs")
+    return bool(
+        rms is not None
+        and float(rms)
+        >= float(settings.get("untranscribed_merge_min_rms_dbfs", -45.0))
+    )
+
+
+def _boundary_segment_is_removable(
+    segment: Mapping[str, Any],
+    *,
+    line_text: str,
+) -> bool:
+    transcript = _segment_transcript(segment)
+    if not _is_paralinguistic_transcript(transcript):
+        return False
+    expected_tokens = set(_text_features(verbal_script_text(line_text)).tokens)
+    segment_tokens = set(_text_features(transcript).tokens)
+    return not expected_tokens.intersection(segment_tokens)
+
+
+def _action_for_rebounded_span(
+    source_action: Mapping[str, Any],
+    *,
+    start_index: int,
+    count: int,
+    lines: list[dict[str, Any]],
+    settings: Mapping[str, Any] | AlignmentSettings,
+    evaluator: TranscriptEvaluator,
+    span_catalog: SpanCatalog,
+    metadata: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if not span_catalog.is_valid(start_index, count):
+        return None
+    line_index = int(source_action["line_index"])
+    previews = [
+        preview
+        for preview in span_catalog.transcript_previews(start_index, count)
+        if str(preview.get("transcript") or "").strip()
+    ]
+    if not previews:
+        return None
+    preview = max(
+        previews,
+        key=lambda item: evaluator.match(
+            line_index,
+            str(item.get("transcript") or ""),
+        ),
+    )
+    transcript = str(preview["transcript"])
+    match_score = evaluator.match(line_index, transcript)
+    if match_score < float(
+        AlignmentSettings.from_value(settings).get(
+            "candidate_min_score",
+            45.0,
+        )
+    ):
+        return None
+    other_score = max(
+        (
+            evaluator.match(other_index, transcript)
+            for other_index, other_line in enumerate(lines)
+            if other_index != line_index
+            and not is_vocalization_script(other_line["line"])
+        ),
+        default=0.0,
+    )
+    duration_score = _duration_plausibility(
+        lines[line_index],
+        preview,
+        expected_word_count=evaluator.line_features[line_index].word_count,
+    )
+    action = dict(source_action)
+    for key in (
+        "trim_start_sample",
+        "trim_end_sample",
+        "trim_word_start",
+        "trim_word_end",
+        "intra_segment_trim",
+        "trimmed_edge_join",
+        "fragment_join",
+        "fragment_join_fallback",
+        "fragment_join_provisional",
+        "forced_review_reason",
+    ):
+        action.pop(key, None)
+    action.update(
+        {
+            "type": "assigned",
+            "start_index": start_index,
+            "count": count,
+            "line_index": line_index,
+            "match_score": match_score,
+            "confidence_margin": match_score - other_score,
+            "transcript": transcript,
+            "transcript_source": preview.get(
+                "transcript_source",
+                "base_segments",
+            ),
+            "duration_plausibility": duration_score,
+            "top_matches": [
+                {
+                    "line_index": line_index,
+                    "match_score": match_score,
+                    "ranking_score": match_score,
+                    "duration_plausibility": duration_score,
+                    "order_hint": float(
+                        source_action.get("order_hint", 0.0)
                     ),
-                    None,
+                    "confidence_margin": match_score - other_score,
+                }
+            ],
+            **dict(metadata),
+        }
+    )
+    return action
+
+
+def _boundary_noise_cleanup_actions(
+    actions: list[dict[str, Any]],
+    *,
+    lines: list[dict[str, Any]],
+    base_segments: list[dict[str, Any]],
+    settings: Mapping[str, Any] | AlignmentSettings,
+    evaluator: TranscriptEvaluator,
+    span_catalog: SpanCatalog,
+) -> list[dict[str, Any]]:
+    """Recover clean spans after a standalone boundary vocalization was merged."""
+
+    settings = AlignmentSettings.from_value(settings)
+    if not bool(settings.get("boundary_noise_cleanup_enabled", True)):
+        return []
+    occupied = {
+        (
+            int(action["line_index"]),
+            int(action["start_index"]),
+            int(action["count"]),
+        )
+        for action in actions
+    }
+    recovered = []
+    for source_action in actions:
+        line_index = int(source_action["line_index"])
+        line_text = str(lines[line_index]["line"])
+        source_evaluation = evaluator.evaluate(
+            line_index,
+            str(source_action.get("transcript") or ""),
+        )
+        leading_cue, trailing_cue = _script_edge_performance_cues(line_text)
+        queue = [
+            (
+                int(source_action["start_index"]),
+                int(source_action["count"]),
+            )
+        ]
+        visited = set(queue)
+        while queue:
+            start_index, count = queue.pop(0)
+            if count <= 1:
+                continue
+            proposals = []
+            if (
+                not leading_cue
+                and _boundary_segment_is_removable(
+                    base_segments[start_index],
+                    line_text=line_text,
                 )
-                if selected is None:
-                    selected = {
-                        "line_index": duplicate_index,
-                        "match_score": action["match_score"],
-                        "ranking_score": action["match_score"],
-                        "duration_plausibility": action.get(
-                            "duration_plausibility", 0.0
-                        ),
-                        "order_hint": action.get("order_hint", 0.0),
-                        "confidence_margin": 0.0,
-                    }
-                action["top_matches"] = [
-                    selected,
-                    *[
-                        match
-                        for match in matches
-                        if int(match["line_index"]) != duplicate_index
-                    ],
-                ]
+            ):
+                proposals.append((start_index + 1, count - 1))
+            end_index = start_index + count - 1
+            if (
+                not trailing_cue
+                and _boundary_segment_is_removable(
+                    base_segments[end_index],
+                    line_text=line_text,
+                )
+            ):
+                proposals.append((start_index, count - 1))
+            for new_start, new_count in proposals:
+                local_key = (new_start, new_count)
+                if local_key in visited:
+                    continue
+                visited.add(local_key)
+                queue.append(local_key)
+                key = (line_index, new_start, new_count)
+                if key in occupied:
+                    continue
+                action = _action_for_rebounded_span(
+                    source_action,
+                    start_index=new_start,
+                    count=new_count,
+                    lines=lines,
+                    settings=settings,
+                    evaluator=evaluator,
+                    span_catalog=span_catalog,
+                    metadata={"boundary_noise_cleanup": True},
+                )
+                if action is None:
+                    continue
+                cleaned_evaluation = evaluator.evaluate(
+                    line_index,
+                    str(action["transcript"]),
+                )
+                fidelity = cleaned_evaluation.fidelity
+                sentence = cleaned_evaluation.sentence
+                if (
+                    cleaned_evaluation.match_score
+                    < float(
+                        settings.get(
+                            "boundary_noise_cleanup_min_match_score",
+                            85.0,
+                        )
+                    )
+                    or float(fidelity["token_coverage"]) < 0.85
+                    or float(fidelity["token_precision"]) < 0.85
+                    or int(fidelity["leading_extra_token_count"]) > 0
+                    or int(fidelity["trailing_extra_token_count"]) > 0
+                    or int(sentence["missing_clause_count"]) > 0
+                    or not bool(sentence["clauses_in_order"])
+                ):
+                    continue
+                if (
+                    int(fidelity["extra_word_count"])
+                    >= int(
+                        source_evaluation.fidelity["extra_word_count"]
+                    )
+                    and float(fidelity["token_precision"])
+                    <= float(
+                        source_evaluation.fidelity["token_precision"]
+                    )
+                ):
+                    continue
+                occupied.add(key)
+                recovered.append(action)
+    return recovered
+
+
+def _edge_vocalization_extension_actions(
+    actions: list[dict[str, Any]],
+    *,
+    lines: list[dict[str, Any]],
+    base_segments: list[dict[str, Any]],
+    settings: Mapping[str, Any] | AlignmentSettings,
+    evaluator: TranscriptEvaluator,
+    span_catalog: SpanCatalog,
+) -> list[dict[str, Any]]:
+    """Attach a neighboring vocalization segment required by an edge cue."""
+
+    settings = AlignmentSettings.from_value(settings)
+    if not bool(settings.get("edge_cue_extension_enabled", True)):
+        return []
+    maximum_gap = float(
+        settings.get("edge_cue_extension_max_gap_seconds", 0.40)
+    )
+    occupied = {
+        (
+            int(action["line_index"]),
+            int(action["start_index"]),
+            int(action["count"]),
+        )
+        for action in actions
+    }
+    recovered = []
+    for source_action in actions:
+        line_index = int(source_action["line_index"])
+        line_text = str(lines[line_index]["line"])
+        leading_cue, trailing_cue = _script_edge_performance_cues(line_text)
+        if not leading_cue and not trailing_cue:
+            continue
+        fidelity = evaluator.evaluate(
+            line_index,
+            str(source_action.get("transcript") or ""),
+        ).fidelity
+        start_index = int(source_action["start_index"])
+        count = int(source_action["count"])
+        end_index = start_index + count - 1
+        new_start = start_index
+        new_end = end_index
+        if (
+            leading_cue
+            and int(fidelity["leading_extra_token_count"]) == 0
+            and start_index > 0
+        ):
+            neighbor = base_segments[start_index - 1]
+            gap = (
+                float(base_segments[start_index]["start_seconds"])
+                - float(neighbor["end_seconds"])
+            )
+            if (
+                gap <= maximum_gap
+                and _is_likely_edge_vocalization_segment(
+                    neighbor,
+                    settings=settings,
+                )
+            ):
+                new_start -= 1
+        if (
+            trailing_cue
+            and int(fidelity["trailing_extra_token_count"]) == 0
+            and end_index + 1 < len(base_segments)
+        ):
+            neighbor = base_segments[end_index + 1]
+            gap = (
+                float(neighbor["start_seconds"])
+                - float(base_segments[end_index]["end_seconds"])
+            )
+            if (
+                gap <= maximum_gap
+                and _is_likely_edge_vocalization_segment(
+                    neighbor,
+                    settings=settings,
+                )
+            ):
+                new_end += 1
+        if new_start == start_index and new_end == end_index:
+            continue
+        new_count = new_end - new_start + 1
+        key = (line_index, new_start, new_count)
+        if key in occupied:
+            continue
+        action = _action_for_rebounded_span(
+            source_action,
+            start_index=new_start,
+            count=new_count,
+            lines=lines,
+            settings=settings,
+            evaluator=evaluator,
+            span_catalog=span_catalog,
+            metadata={
+                "edge_vocalization_extension": True,
+                "forced_review_reason": "EDGE_VOCALIZATION_UNVERIFIED",
+            },
+        )
+        if action is None:
+            continue
+        occupied.add(key)
+        recovered.append(action)
+    return recovered
 
 
 def _segment_sample_rate(segment: Mapping[str, Any]) -> int | None:
@@ -1345,7 +1858,7 @@ def _trimmed_edge_span_previews(
 
     settings = AlignmentSettings.from_value(settings)
     minimum_gap = float(
-        settings.get("intra_segment_trim_min_gap_seconds", 0.40)
+        settings.get("edge_trim_min_gap_seconds", 0.30)
     )
     maximum_boundaries = max(
         1,
@@ -1856,6 +2369,33 @@ def _multisentence_fragment_join_actions(
                         *edge_previews,
                     ]
                 )
+                leading_cue, trailing_cue = (
+                    _script_edge_performance_cues(str(line["line"]))
+                )
+                if leading_cue:
+                    previews = [
+                        preview
+                        for preview in previews
+                        if int(
+                            preview.get(
+                                "trim_start_sample",
+                                base_segments[start_index]["start_sample"],
+                            )
+                        )
+                        <= int(base_segments[start_index]["start_sample"])
+                    ]
+                if trailing_cue:
+                    previews = [
+                        preview
+                        for preview in previews
+                        if int(
+                            preview.get(
+                                "trim_end_sample",
+                                base_segments[end_index]["end_sample"],
+                            )
+                        )
+                        >= int(base_segments[end_index]["end_sample"])
+                    ]
                 scored_previews = [
                     score_preview(line_index, preview)
                     for preview in previews
@@ -2171,6 +2711,69 @@ def _action_span_key(
     )
 
 
+def _repeated_line_boundary_offsets(
+    *,
+    line_index: int,
+    words: list[dict[str, Any]],
+    evaluator: TranscriptEvaluator,
+    minimum_match: float,
+) -> dict[int, float]:
+    """Find adjacent complete repetitions even when Whisper spans the pause."""
+
+    expected_word_count = evaluator.line_features[line_index].word_count
+    if expected_word_count < 2 or len(words) < expected_word_count * 2:
+        return {}
+    matching_windows = []
+    for first_word in range(len(words) - expected_word_count + 1):
+        last_word = first_word + expected_word_count - 1
+        window_text = " ".join(
+            str(word.get("word") or "").strip()
+            for word in words[first_word : last_word + 1]
+        )
+        evaluation = evaluator.evaluate(line_index, window_text)
+        if (
+            evaluation.match_score >= minimum_match
+            and float(evaluation.fidelity["token_coverage"]) >= 0.95
+            and float(evaluation.fidelity["token_precision"]) >= 0.95
+            and int(evaluation.fidelity["extra_word_count"]) == 0
+            and int(evaluation.sentence["missing_clause_count"]) == 0
+            and bool(evaluation.sentence["clauses_in_order"])
+        ):
+            matching_windows.append((first_word, last_word))
+    if len(matching_windows) < 2:
+        return {}
+
+    durations = sorted(
+        max(0.0, float(word["end"]) - float(word["start"]))
+        for word in words
+    )
+    typical_duration = durations[len(durations) // 2]
+    boundaries = {}
+    for left_window, right_window in zip(
+        matching_windows,
+        matching_windows[1:],
+    ):
+        left_first, left_last = left_window
+        right_first, _ = right_window
+        if right_first != left_last + 1:
+            continue
+        if left_first + expected_word_count - 1 != left_last:
+            continue
+        left_end = float(words[left_last]["end"])
+        right_start = float(words[right_first]["start"])
+        right_end = float(words[right_first]["end"])
+        right_duration = max(0.0, right_end - right_start)
+        if (
+            right_start - left_end < 0.10
+            and right_duration >= max(0.80, typical_duration * 2.5)
+        ):
+            boundary = (right_start + right_end) / 2.0
+        else:
+            boundary = (left_end + right_start) / 2.0
+        boundaries[left_last] = boundary
+    return boundaries
+
+
 def _intra_segment_trim_actions(
     actions: list[dict[str, Any]],
     *,
@@ -2245,9 +2848,7 @@ def _intra_segment_trim_actions(
         if len(words) < 2:
             continue
 
-        start_words = [0]
-        end_words = []
-        boundary_offsets: dict[int, float] = {}
+        gap_boundary_offsets: dict[int, float] = {}
         for word_index, (left, right) in enumerate(
             zip(words, words[1:])
         ):
@@ -2255,22 +2856,9 @@ def _intra_segment_trim_actions(
             right_start = float(right["start"])
             if right_start - left_end < minimum_gap:
                 continue
-            boundary_offsets[word_index] = (left_end + right_start) / 2.0
-            end_words.append(word_index)
-            start_words.append(word_index + 1)
-        if not boundary_offsets:
-            continue
-        end_words.append(len(words) - 1)
-        word_windows = [
-            (first_word, last_word)
-            for first_word in start_words
-            for last_word in end_words
-            if first_word <= last_word
-            and not (
-                first_word == 0
-                and last_word == len(words) - 1
-            )
-        ]
+            gap_boundary_offsets[word_index] = (
+                left_end + right_start
+            ) / 2.0
 
         line_indexes = [int(source_action["line_index"])]
         line_indexes.extend(
@@ -2283,6 +2871,36 @@ def _intra_segment_trim_actions(
             line = lines[line_index]
             if is_vocalization_script(line["line"]):
                 continue
+            leading_cue, trailing_cue = _script_edge_performance_cues(
+                str(line["line"])
+            )
+            boundary_offsets = dict(gap_boundary_offsets)
+            boundary_offsets.update(
+                _repeated_line_boundary_offsets(
+                    line_index=line_index,
+                    words=words,
+                    evaluator=evaluator,
+                    minimum_match=minimum_match,
+                )
+            )
+            if not boundary_offsets:
+                continue
+            ordered_boundaries = sorted(boundary_offsets)
+            end_words = [*ordered_boundaries, len(words) - 1]
+            start_words = [
+                0,
+                *(word_index + 1 for word_index in ordered_boundaries),
+            ]
+            word_windows = [
+                (first_word, last_word)
+                for first_word in start_words
+                for last_word in end_words
+                if first_word <= last_word
+                and not (
+                    first_word == 0
+                    and last_word == len(words) - 1
+                )
+            ]
             full = evaluator.evaluate(
                 line_index,
                 str(
@@ -2292,6 +2910,14 @@ def _intra_segment_trim_actions(
                 ),
             )
             for first_word, last_word in word_windows:
+                if (
+                    (leading_cue and first_word > 0)
+                    or (
+                        trailing_cue
+                        and last_word < len(words) - 1
+                    )
+                ):
+                    continue
                 trim_start_offset = (
                     boundary_offsets[first_word - 1]
                     if first_word
@@ -2650,6 +3276,111 @@ def _exact_line_scores(
     ]
 
 
+def _missing_clause_indexes(
+    sentence: Mapping[str, Any],
+    *,
+    settings: Mapping[str, Any] | AlignmentSettings,
+) -> list[int]:
+    settings = AlignmentSettings.from_value(settings)
+    minimum_score = float(settings.get("reliable_min_clause_score", 55.0))
+    short_max_words = int(
+        settings.get("reliable_short_clause_max_words", 4)
+    )
+    short_minimum_coverage = float(
+        settings.get("reliable_short_clause_min_token_coverage", 1.0)
+    )
+    return [
+        index
+        for index, (score, coverage, word_count_value) in enumerate(
+            zip(
+                sentence["clause_scores"],
+                sentence["clause_token_coverages"],
+                sentence["clause_word_counts"],
+            )
+        )
+        if float(score) < minimum_score
+        or (
+            int(word_count_value) <= short_max_words
+            and float(coverage) < short_minimum_coverage
+        )
+    ]
+
+
+def _boundary_clause_consensus_transcript(
+    *,
+    line_index: int,
+    exact_transcript: str,
+    preliminary_transcript: str,
+    recording_transcript: str,
+    evaluator: TranscriptEvaluator,
+    settings: Mapping[str, Any] | AlignmentSettings,
+) -> str | None:
+    """Prefer corroborated constituent ASR for one short edge clause."""
+
+    settings = AlignmentSettings.from_value(settings)
+    if not bool(settings.get("boundary_clause_consensus_enabled", True)):
+        return None
+    minimum_exact_score = float(
+        settings.get("boundary_clause_consensus_min_exact_score", 85.0)
+    )
+    minimum_support_score = float(
+        settings.get("boundary_clause_consensus_min_support_score", 95.0)
+    )
+    maximum_clause_words = int(
+        settings.get("boundary_clause_consensus_max_words", 3)
+    )
+    exact = evaluator.evaluate(line_index, exact_transcript)
+    preliminary = evaluator.evaluate(line_index, preliminary_transcript)
+    recording = evaluator.evaluate(line_index, recording_transcript)
+    if (
+        exact.match_score < minimum_exact_score
+        or preliminary.match_score < minimum_support_score
+        or recording.match_score < minimum_support_score
+        or int(exact.sentence["clause_count"]) < 2
+        or not bool(preliminary.sentence["clauses_in_order"])
+        or int(preliminary.sentence["missing_clause_count"]) > 0
+        or float(preliminary.fidelity["token_coverage"]) < 0.95
+        or float(preliminary.fidelity["token_precision"]) < 0.95
+        or int(preliminary.fidelity["leading_extra_token_count"]) > 0
+        or int(preliminary.fidelity["trailing_extra_token_count"]) > 0
+        or not bool(recording.sentence["clauses_in_order"])
+    ):
+        return None
+    missing = _missing_clause_indexes(exact.sentence, settings=settings)
+    clause_count = int(exact.sentence["clause_count"])
+    if (
+        len(missing) != 1
+        or missing[0] not in {0, clause_count - 1}
+        or int(exact.sentence["clause_word_counts"][missing[0]])
+        > maximum_clause_words
+    ):
+        return None
+    boundary_index = missing[0]
+    exact_clause_score = float(
+        exact.sentence["clause_scores"][boundary_index]
+    )
+    recording_clause_score = float(
+        recording.sentence["clause_scores"][boundary_index]
+    )
+    recording_clause_coverage = float(
+        recording.sentence["clause_token_coverages"][boundary_index]
+    )
+    if (
+        recording_clause_coverage < 0.50
+        or recording_clause_score < exact_clause_score + 20.0
+    ):
+        return None
+    recording_missing = set(
+        _missing_clause_indexes(recording.sentence, settings=settings)
+    )
+    if any(
+        index != boundary_index
+        for index in recording_missing
+    ):
+        return None
+    return preliminary_transcript
+
+
 def _candidate_reliability(
     *,
     line: dict[str, Any],
@@ -2844,6 +3575,11 @@ def _candidate_reliability(
         return False, incomplete_reason
     if float(fidelity["ordered_similarity"]) < minimum_ordered:
         return False, order_reason
+    if (
+        bool(settings.get("edge_cue_auto_review", True))
+        and any(_script_edge_performance_cues(str(line["line"])))
+    ):
+        return False, "EDGE_VOCALIZATION_UNVERIFIED"
     return True, ""
 
 
@@ -2915,6 +3651,23 @@ def _has_unsafe_untranscribed_merge(
             and (rms is None or float(rms) >= minimum_rms)
         ):
             return True
+    if segment is not None:
+        exact_tokens = set(
+            _text_features(str(segment.get("transcript") or "")).tokens
+        )
+        edge_segments = [
+            base_segments[start_index],
+            base_segments[start_index + count - 1],
+        ]
+        for edge_segment in edge_segments:
+            edge_transcript = _segment_transcript(edge_segment)
+            edge_tokens = set(_text_features(edge_transcript).tokens)
+            if (
+                _is_paralinguistic_transcript(edge_transcript)
+                and edge_tokens
+                and exact_tokens.isdisjoint(edge_tokens)
+            ):
+                return True
     if (
         segment is not None
         and _preliminary_transcript_shows_collapsed_repetition(
@@ -3028,6 +3781,25 @@ def align_project(
             span_catalog=span_catalog,
         )
         check_processing_cancelled()
+        boundary_noise_cleanup_actions = _boundary_noise_cleanup_actions(
+            primary_actions,
+            lines=session_lines,
+            base_segments=base_segments,
+            settings=settings,
+            evaluator=evaluator,
+            span_catalog=span_catalog,
+        )
+        edge_vocalization_extension_actions = (
+            _edge_vocalization_extension_actions(
+                primary_actions,
+                lines=session_lines,
+                base_segments=base_segments,
+                settings=settings,
+                evaluator=evaluator,
+                span_catalog=span_catalog,
+            )
+        )
+        check_processing_cancelled()
         fragment_join_actions = _multisentence_fragment_join_actions(
             primary_actions,
             lines=session_lines,
@@ -3050,6 +3822,8 @@ def align_project(
         candidate_actions = sorted(
             [
                 *primary_actions,
+                *boundary_noise_cleanup_actions,
+                *edge_vocalization_extension_actions,
                 *fragment_join_actions,
                 *intra_segment_trim_actions,
             ],
@@ -3173,6 +3947,8 @@ def align_project(
             match_score = float(action["match_score"])
             exact_span_asr_verified = False
             exact_span_asr_error = ""
+            candidate_scores: list[float] | None = None
+            boundary_clause_consensus = False
             transcript_source = segment.get(
                 "transcript_source",
                 action.get("transcript_source", "session_asr"),
@@ -3192,10 +3968,10 @@ def align_project(
                     ).strip()
                     if exact_text:
                         observed_transcript = exact_text
-                        exact_scores = exact_scores_by_segment[
+                        candidate_scores = exact_scores_by_segment[
                             str(segment["segment_id"])
                         ]
-                        match_score = exact_scores[
+                        match_score = candidate_scores[
                             int(action["line_index"])
                         ]
                         exact_span_asr_verified = True
@@ -3228,14 +4004,52 @@ def align_project(
                         flush=True,
                     )
 
+            if (
+                exact_span_asr_verified
+                and int(action["count"]) > 1
+                and action.get("transcript_source")
+                == "segment_asr_span"
+            ):
+                recording_preview = (
+                    span_catalog.transcription_preview_for_bounds(
+                        start_seconds=float(segment["start_seconds"]),
+                        end_seconds=float(segment["end_seconds"]),
+                    )
+                )
+                consensus_transcript = (
+                    _boundary_clause_consensus_transcript(
+                        line_index=int(action["line_index"]),
+                        exact_transcript=observed_transcript,
+                        preliminary_transcript=preliminary_transcript,
+                        recording_transcript=str(
+                            (recording_preview or {}).get("transcript")
+                            or ""
+                        ),
+                        evaluator=evaluator,
+                        settings=settings,
+                    )
+                )
+                if consensus_transcript is not None:
+                    observed_transcript = consensus_transcript
+                    candidate_scores = _exact_line_scores(
+                        session_lines,
+                        evaluator,
+                        observed_transcript,
+                    )
+                    match_score = candidate_scores[
+                        int(action["line_index"])
+                    ]
+                    transcript_source = (
+                        "constituent_recording_boundary_consensus"
+                    )
+                    boundary_clause_consensus = True
+
             if exact_span_asr_verified:
-                exact_scores = exact_scores_by_segment[
-                    str(segment["segment_id"])
-                ]
+                assert candidate_scores is not None
                 second_score = max(
                     (
                         score
-                        for other_index, score in enumerate(exact_scores)
+                        for other_index, score in enumerate(candidate_scores)
                         if other_index != int(action["line_index"])
                     ),
                     default=0.0,
@@ -3318,14 +4132,12 @@ def align_project(
                 action.get("is_primary_match", True)
             )
             if exact_span_asr_verified:
-                exact_scores = exact_scores_by_segment[
-                    str(segment["segment_id"])
-                ]
+                assert candidate_scores is not None
                 line_index = int(action["line_index"])
                 best_other_score = max(
                     (
                         score
-                        for other_index, score in enumerate(exact_scores)
+                        for other_index, score in enumerate(candidate_scores)
                         if (
                             other_index != line_index
                             and normalized_session_lines[other_index]
@@ -3424,6 +4236,7 @@ def align_project(
                 "transcript_source": transcript_source,
                 "exact_span_asr_verified": exact_span_asr_verified,
                 "exact_span_asr_error": exact_span_asr_error,
+                "boundary_clause_consensus": boundary_clause_consensus,
                 "unsafe_untranscribed_merge": unsafe_untranscribed_merge,
                 "fragment_join": bool(action.get("fragment_join", False)),
                 "fragment_source_count": int(
@@ -3440,6 +4253,12 @@ def align_project(
                 ),
                 "trimmed_edge_join": bool(
                     action.get("trimmed_edge_join", False)
+                ),
+                "boundary_noise_cleanup": bool(
+                    action.get("boundary_noise_cleanup", False)
+                ),
+                "edge_vocalization_extension": bool(
+                    action.get("edge_vocalization_extension", False)
                 ),
             }
             if (

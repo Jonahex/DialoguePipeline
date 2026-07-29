@@ -63,6 +63,17 @@ ALIGNMENT_DEFAULTS: dict[str, Any] = {
     "intra_segment_trim_min_token_coverage": 0.85,
     "intra_segment_trim_min_token_precision": 0.85,
     "intra_segment_trim_min_ordered_score": 70.0,
+    "edge_trim_min_gap_seconds": 0.30,
+    "boundary_noise_cleanup_enabled": True,
+    "boundary_noise_cleanup_min_match_score": 85.0,
+    "edge_cue_extension_enabled": True,
+    "edge_cue_extension_max_gap_seconds": 0.40,
+    "edge_cue_extension_max_segment_seconds": 5.0,
+    "edge_cue_auto_review": True,
+    "boundary_clause_consensus_enabled": True,
+    "boundary_clause_consensus_min_exact_score": 85.0,
+    "boundary_clause_consensus_min_support_score": 95.0,
+    "boundary_clause_consensus_max_words": 3,
     "span_word_min_overlap_seconds": 0.20,
     "span_word_min_overlap_fraction": 0.20,
     "short_line_min_score": 88.0,
@@ -219,6 +230,37 @@ _GROUPED_KEYS: dict[tuple[str, ...], str] = {
     ("recovery", "trim_minimum_ordered_score"): (
         "intra_segment_trim_min_ordered_score"
     ),
+    ("recovery", "edge_trim_minimum_gap_seconds"): (
+        "edge_trim_min_gap_seconds"
+    ),
+    ("recovery", "clean_paralinguistic_boundaries"): (
+        "boundary_noise_cleanup_enabled"
+    ),
+    ("recovery", "boundary_cleanup_minimum_score"): (
+        "boundary_noise_cleanup_min_match_score"
+    ),
+    ("recovery", "edge_cues", "extend_adjacent_segments"): (
+        "edge_cue_extension_enabled"
+    ),
+    ("recovery", "edge_cues", "maximum_gap_seconds"): (
+        "edge_cue_extension_max_gap_seconds"
+    ),
+    ("recovery", "edge_cues", "maximum_segment_seconds"): (
+        "edge_cue_extension_max_segment_seconds"
+    ),
+    ("quality", "review_edge_performance_cues"): "edge_cue_auto_review",
+    ("quality", "boundary_clause_consensus", "enabled"): (
+        "boundary_clause_consensus_enabled"
+    ),
+    ("quality", "boundary_clause_consensus", "minimum_exact_score"): (
+        "boundary_clause_consensus_min_exact_score"
+    ),
+    ("quality", "boundary_clause_consensus", "minimum_support_score"): (
+        "boundary_clause_consensus_min_support_score"
+    ),
+    ("quality", "boundary_clause_consensus", "maximum_clause_words"): (
+        "boundary_clause_consensus_max_words"
+    ),
     ("quality", "reject_clipping"): "auto_reject_clipping",
     ("quality", "minimum_technical_score"): "auto_min_technical_score",
     ("quality", "reject_untranscribed_merge"): (
@@ -307,6 +349,7 @@ class AlignmentSettings(Mapping[str, Any]):
             "fragment_join_max_actions",
             "fragment_join_max_segments",
             "reliable_boundary_window_tokens",
+            "boundary_clause_consensus_max_words",
         ):
             if int(values[key]) < 1:
                 raise ValueError(f"alignment.{key} must be at least 1")
@@ -322,6 +365,9 @@ class AlignmentSettings(Mapping[str, Any]):
             "max_span_seconds",
             "take_group_gap_seconds",
             "intra_segment_trim_min_gap_seconds",
+            "edge_trim_min_gap_seconds",
+            "edge_cue_extension_max_gap_seconds",
+            "edge_cue_extension_max_segment_seconds",
             "untranscribed_merge_min_seconds",
         ):
             if float(values[key]) < 0.0:
@@ -337,6 +383,9 @@ class AlignmentSettings(Mapping[str, Any]):
             "fragment_join_fallback_min_match_score",
             "intra_segment_trim_min_match_score",
             "intra_segment_trim_min_ordered_score",
+            "boundary_noise_cleanup_min_match_score",
+            "boundary_clause_consensus_min_exact_score",
+            "boundary_clause_consensus_min_support_score",
             "auto_min_technical_score",
         ):
             if not 0.0 <= float(values[key]) <= 100.0:

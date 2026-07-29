@@ -269,11 +269,21 @@ base segment already covered by a merged primary action, alignment can recover
 line-sized trimmed candidates from the independent base-ASR word timestamps.
 Fragment joins can also trim the first or last base segment at the same
 pause-based boundaries, allowing a line to cross a shared take-boundary
-segment. Cuts are considered only at pauses of at least 0.4 seconds and are
-independently transcribed again before `AUTO_OK`. The untrimmed candidates
-remain available for comparison.
+segment. Edge joins use a 0.3-second pause by default, while trims wholly
+inside one base retain the more conservative 0.4-second default. When two
+complete copies of the same line are adjacent but Whisper stretches a boundary
+word across the pause, the repetition itself supplies a split boundary and
+both halves are independently transcribed again before `AUTO_OK`. The
+untrimmed candidates remain available for comparison.
 Inline performance cues such as `(laugh)` and `(hiccup)` are not treated as
-spoken words during matching. Original fragments remain available.
+spoken words during text matching. A cue at the beginning or end of a spoken
+line nevertheless prevents `AUTO_OK` with
+`EDGE_VOCALIZATION_UNVERIFIED`, because speech ASR cannot prove that the
+performance was preserved. Pause-based trimming is not allowed to remove that
+scripted edge, and a nearby standalone vocalization segment is added as an
+extended review candidate when its transcript resembles laughter, a sigh,
+breathing, or another common vocalization. Original fragments remain
+available.
 
 `max_merge_segments` is the base-segment span limit for both the primary
 aligner and fragment recovery. An existing `fragment_join_max_segments` value
@@ -290,6 +300,22 @@ untranscribed pieces receive `MERGED_UNTRANSCRIBED_AUDIO`, and candidates below
 `reliable_min_duration_plausibility` receive `POSSIBLE_REPEATED_TAKES`. The
 duration gate covers short segments where ASR collapses two or more audible
 performances into a single exact transcript.
+
+Standalone boundary segments transcribed as common paralinguistic sounds such
+as `Pfft.`, laughter, sighs, coughs, or breathing are treated as noise unless
+the script includes the sound at that edge. Alignment retains the original
+merged span for review, rejects it from `AUTO_OK` when exact-span ASR omits the
+sound, and creates a clean candidate without that boundary segment. This
+handles imprecise segmentation without blindly trimming quiet padding or
+untranscribed performance from inside a base segment.
+
+Exact merged-span ASR normally remains authoritative. One narrow exception is
+a short opening or closing clause rejected by exact ASR when both the
+constituent base transcription and the recording-level transcription
+independently support that scripted boundary while the rest of the exact span
+is complete. Such candidates use
+`constituent_recording_boundary_consensus` and record
+`boundary_clause_consensus: true` in `alignment.json`.
 
 With the default segment-transcription and candidate-verification settings,
 a candidate cannot become `AUTO_OK` until the exact WAV that would be exported
@@ -316,6 +342,9 @@ when a nonverbal line is selected.
 - `"weak_order"`: assign distinct chronological take groups to duplicate rows.
   If nearby takes collapse into one group but there are enough distinct spans,
   distribute those spans chronologically instead of leaving later rows missing.
+  Only candidates meeting the normal reliability score anchor take groups;
+  weaker fuzzy matches attach to the nearest anchor without bridging or
+  rebalancing genuine groups.
 - `"reuse"`: permit one exact segment to satisfy duplicate text. Pair this with
   `export.allow_segment_reuse: true` or `finalize --allow-segment-reuse`.
 
@@ -354,11 +383,26 @@ setting is serialized and available in the settings window:
       "max_segments": 8,
       "trim_oversized_segments": true,
       "trim_candidates_per_line": 2,
-      "trim_minimum_gap_seconds": 0.4
+      "trim_minimum_gap_seconds": 0.4,
+      "edge_trim_minimum_gap_seconds": 0.3,
+      "clean_paralinguistic_boundaries": true,
+      "boundary_cleanup_minimum_score": 85.0,
+      "edge_cues": {
+        "extend_adjacent_segments": true,
+        "maximum_gap_seconds": 0.4,
+        "maximum_segment_seconds": 5.0
+      }
     },
     "quality": {
       "reject_clipping": true,
-      "reject_untranscribed_merge": true
+      "reject_untranscribed_merge": true,
+      "review_edge_performance_cues": true,
+      "boundary_clause_consensus": {
+        "enabled": true,
+        "minimum_exact_score": 85.0,
+        "minimum_support_score": 95.0,
+        "maximum_clause_words": 3
+      }
     }
   }
 }

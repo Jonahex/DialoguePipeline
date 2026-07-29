@@ -12,13 +12,17 @@ import pytest
 
 from dialogue_pipeline.alignment import (
     _apply_duplicate_line_policy,
+    _boundary_clause_consensus_transcript,
+    _boundary_noise_cleanup_actions,
     _candidate_reliability,
+    _edge_vocalization_extension_actions,
     _exact_line_scores,
     _expand_alignment_actions,
     _has_unsafe_untranscribed_merge,
     _intra_segment_trim_actions,
     _multisentence_fragment_join_actions,
     _reroute_actions_to_exact_asr_primary_matches,
+    SpanCatalog,
     TranscriptEvaluator,
     align_project,
     order_independent_align,
@@ -1548,6 +1552,74 @@ def test_trim_recovery_scans_bases_inside_a_merged_primary_action() -> None:
     assert "Nothing too substantial Nothing" not in recovered["transcript"]
 
 
+def test_trim_recovery_splits_adjacent_repeated_line_without_word_gap() -> None:
+    line_text = "Wonderful to see you again."
+    repeated_words = [
+        {"word": " wonderful", "start": 0.16, "end": 0.80},
+        {"word": " to", "start": 0.80, "end": 1.02},
+        {"word": " see", "start": 1.02, "end": 1.30},
+        {"word": " you", "start": 1.30, "end": 1.54},
+        {"word": " again", "start": 1.54, "end": 1.90},
+        # Large-v3 can stretch the first word of the second take across
+        # the pause, leaving no timestamp gap at the repeated boundary.
+        {"word": " wonderful", "start": 1.90, "end": 3.46},
+        {"word": " to", "start": 3.46, "end": 3.78},
+        {"word": " see", "start": 3.78, "end": 4.10},
+        {"word": " you", "start": 4.10, "end": 4.40},
+        {"word": " again", "start": 4.40, "end": 4.78},
+    ]
+    segment = {
+        "segment_id": "session__s00001",
+        "start_sample": 0,
+        "end_sample": round(5.65 * 48000),
+        "start_seconds": 0.0,
+        "end_seconds": 5.65,
+        "transcript": (
+            "wonderful to see you again "
+            "wonderful to see you again"
+        ),
+        "asr_probability": 0.9,
+        "segment_asr": {
+            "primary": {
+                "transcript": (
+                    "wonderful to see you again "
+                    "wonderful to see you again"
+                ),
+                "words": repeated_words,
+            }
+        },
+    }
+    lines = [{"line_id": "target", "line": line_text}]
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 86.0,
+        "transcript": segment["transcript"],
+        "duration_plausibility": 40.0,
+        "order_hint": 0.0,
+        "top_matches": [],
+    }
+
+    trimmed = _intra_segment_trim_actions(
+        [action],
+        lines=lines,
+        base_segments=[segment],
+        sample_rate=48000,
+        settings={},
+        evaluator=TranscriptEvaluator(lines, {}),
+    )
+
+    assert len(trimmed) == 2
+    first, second = trimmed
+    expected_boundary = round(((1.90 + 3.46) / 2.0) * 48000)
+    assert first["trim_start_sample"] == 0
+    assert first["trim_end_sample"] == expected_boundary
+    assert second["trim_start_sample"] == expected_boundary
+    assert second["trim_end_sample"] == segment["end_sample"]
+    assert all(item["match_score"] == 100.0 for item in trimmed)
+
+
 def test_fragment_join_can_trim_shared_take_boundary_segment() -> None:
     line_text = "It's... not over... yet..."
     lines = [{"line_id": "target", "line": line_text}]
@@ -1599,9 +1671,9 @@ def test_fragment_join_can_trim_shared_take_boundary_segment() -> None:
             "Yet. It's not over.",
             [
                 {"word": " Yet", "start": 0.0, "end": 0.3},
-                {"word": " It's", "start": 0.9, "end": 1.2},
-                {"word": " not", "start": 1.2, "end": 1.5},
-                {"word": " over", "start": 1.5, "end": 1.9},
+                {"word": " It's", "start": 0.64, "end": 0.94},
+                {"word": " not", "start": 0.94, "end": 1.24},
+                {"word": " over", "start": 1.24, "end": 1.64},
             ],
             2.0,
         ),
@@ -1670,6 +1742,205 @@ def test_fragment_join_can_trim_shared_take_boundary_segment() -> None:
     assert second_take["trim_start_sample"] > segments[2]["start_sample"]
     assert first_take["match_score"] == 100.0
     assert second_take["match_score"] == 100.0
+
+
+def test_boundary_noise_cleanup_recovers_clean_single_base_span() -> None:
+    lines = [{"line_id": "target", "line": "Better get going then."}]
+    segments = [
+        {
+            "segment_id": "session__s00001",
+            "start_sample": 0,
+            "end_sample": 36000,
+            "start_seconds": 0.0,
+            "end_seconds": 0.75,
+            "transcript": "Pfft.",
+            "asr_probability": 0.5,
+            "metrics": {"duration_seconds": 0.75, "rms_dbfs": -47.0},
+            "segment_asr": {
+                "primary": {
+                    "transcript": "Pfft.",
+                    "words": [
+                        {"word": " Pfft.", "start": 0.0, "end": 0.7}
+                    ],
+                }
+            },
+        },
+        {
+            "segment_id": "session__s00002",
+            "start_sample": 36000,
+            "end_sample": 132000,
+            "start_seconds": 0.75,
+            "end_seconds": 2.75,
+            "transcript": "Better get going then.",
+            "asr_probability": 0.95,
+            "metrics": {"duration_seconds": 2.0, "rms_dbfs": -18.0},
+            "segment_asr": {
+                "primary": {
+                    "transcript": "Better get going then.",
+                    "words": [],
+                }
+            },
+        },
+    ]
+    evaluator = TranscriptEvaluator(lines, {})
+    action = {
+        "type": "assigned",
+        "start_index": 0,
+        "count": 2,
+        "line_index": 0,
+        "match_score": 96.0,
+        "transcript": "Pfft. Better get going then.",
+        "duration_plausibility": 80.0,
+        "order_hint": 0.0,
+        "top_matches": [],
+    }
+
+    cleaned = _boundary_noise_cleanup_actions(
+        [action],
+        lines=lines,
+        base_segments=segments,
+        settings={},
+        evaluator=evaluator,
+        span_catalog=SpanCatalog(segments, {}),
+    )
+
+    assert len(cleaned) == 1
+    assert cleaned[0]["start_index"] == 1
+    assert cleaned[0]["count"] == 1
+    assert cleaned[0]["match_score"] == 100.0
+    assert cleaned[0]["boundary_noise_cleanup"] is True
+
+
+def test_edge_cue_recovery_attaches_adjacent_vocalization_segment() -> None:
+    lines = [
+        {
+            "line_id": "target",
+            "line": (
+                "(cackle) You have no idea how satisfying it is "
+                "to see you in a cell."
+            ),
+        }
+    ]
+    segments = [
+        {
+            "segment_id": "session__s00001",
+            "start_sample": 0,
+            "end_sample": 144000,
+            "start_seconds": 0.0,
+            "end_seconds": 3.0,
+            "transcript": "Ha ha ha ha!",
+            "asr_probability": 0.8,
+            "metrics": {"duration_seconds": 3.0, "rms_dbfs": -20.0},
+            "segment_asr": {
+                "primary": {
+                    "transcript": "Ha ha ha ha!",
+                    "words": [],
+                }
+            },
+        },
+        {
+            "segment_id": "session__s00002",
+            "start_sample": 144000,
+            "end_sample": 480000,
+            "start_seconds": 3.0,
+            "end_seconds": 10.0,
+            "transcript": (
+                "You have no idea how satisfying it is "
+                "to see you in a cell."
+            ),
+            "asr_probability": 0.95,
+            "metrics": {"duration_seconds": 7.0, "rms_dbfs": -18.0},
+            "segment_asr": {
+                "primary": {
+                    "transcript": (
+                        "You have no idea how satisfying it is "
+                        "to see you in a cell."
+                    ),
+                    "words": [],
+                }
+            },
+        },
+    ]
+    evaluator = TranscriptEvaluator(lines, {})
+    action = {
+        "type": "assigned",
+        "start_index": 1,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 100.0,
+        "transcript": segments[1]["transcript"],
+        "duration_plausibility": 80.0,
+        "order_hint": 0.0,
+        "top_matches": [],
+    }
+
+    extended = _edge_vocalization_extension_actions(
+        [action],
+        lines=lines,
+        base_segments=segments,
+        settings={},
+        evaluator=evaluator,
+        span_catalog=SpanCatalog(segments, {}),
+    )
+
+    assert len(extended) == 1
+    assert extended[0]["start_index"] == 0
+    assert extended[0]["count"] == 2
+    assert extended[0]["edge_vocalization_extension"] is True
+    assert (
+        extended[0]["forced_review_reason"]
+        == "EDGE_VOCALIZATION_UNVERIFIED"
+    )
+
+
+def test_intra_segment_trim_does_not_remove_scripted_edge_cue() -> None:
+    line_text = "(laugh) See! What did I tell you?"
+    lines = [{"line_id": "target", "line": line_text}]
+    words = [
+        {"word": " Ha!", "start": 0.0, "end": 0.4},
+        {"word": " See!", "start": 1.0, "end": 1.4},
+        {"word": " What", "start": 1.6, "end": 1.8},
+        {"word": " did", "start": 1.8, "end": 2.0},
+        {"word": " I", "start": 2.0, "end": 2.1},
+        {"word": " tell", "start": 2.1, "end": 2.3},
+        {"word": " you?", "start": 2.3, "end": 2.6},
+    ]
+    segment = {
+        "segment_id": "session__s00001",
+        "start_sample": 0,
+        "end_sample": 144000,
+        "start_seconds": 0.0,
+        "end_seconds": 3.0,
+        "transcript": "Ha! See! What did I tell you?",
+        "asr_probability": 0.95,
+        "segment_asr": {
+            "primary": {
+                "transcript": "Ha! See! What did I tell you?",
+                "words": words,
+            }
+        },
+    }
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 98.0,
+        "transcript": segment["transcript"],
+        "duration_plausibility": 80.0,
+        "order_hint": 0.0,
+        "top_matches": [],
+    }
+
+    trimmed = _intra_segment_trim_actions(
+        [action],
+        lines=lines,
+        base_segments=[segment],
+        sample_rate=48000,
+        settings={},
+        evaluator=TranscriptEvaluator(lines, {}),
+    )
+
+    assert all(item["trim_start_sample"] == 0 for item in trimmed)
 
 
 def test_secondary_near_complete_match_can_seed_fragment_join() -> None:
@@ -2322,7 +2593,7 @@ def test_fragment_join_recovers_seven_fragments_with_ten_segment_limit() -> None
     )
 
 
-def test_inline_nonverbal_cues_do_not_make_spoken_line_incomplete() -> None:
+def test_inline_edge_cues_do_not_affect_fidelity_but_require_review() -> None:
     line_text = "(laugh) See! What did I tell you?"
     observed = "See! What did I tell you?"
 
@@ -2334,7 +2605,7 @@ def test_inline_nonverbal_cues_do_not_make_spoken_line_incomplete() -> None:
         margin=20.0,
         settings={},
         observed=observed,
-    ) == (True, "")
+    ) == (False, "EDGE_VOCALIZATION_UNVERIFIED")
 
 
 def test_fragment_join_searches_neighbor_before_worse_selected_candidate() -> None:
@@ -2571,6 +2842,104 @@ def test_exact_asr_boundary_gap_rejects_collapsed_repeated_take() -> None:
     assert unsafe is True
 
 
+def test_exact_asr_omitting_boundary_pfft_rejects_noisy_merge() -> None:
+    unsafe = _has_unsafe_untranscribed_merge(
+        action={
+            "start_index": 0,
+            "count": 2,
+            "transcript": "Pfft. Better get going then.",
+        },
+        base_segments=[
+            {
+                "transcript": "Pfft.",
+                "metrics": {"duration_seconds": 0.75, "rms_dbfs": -47.0},
+                "segment_asr": {
+                    "primary": {"transcript": "Pfft."},
+                },
+            },
+            {
+                "transcript": "Better get going then.",
+                "metrics": {"duration_seconds": 2.0, "rms_dbfs": -18.0},
+            },
+        ],
+        segment={
+            "start_seconds": 0.0,
+            "end_seconds": 2.75,
+            "metrics": {"duration_seconds": 2.75},
+            "transcript": "Better get going then.",
+            "words": [
+                {"word": "Better", "start": 0.8, "end": 1.2},
+                {"word": "then", "start": 1.8, "end": 2.2},
+            ],
+        },
+        settings={},
+    )
+
+    assert unsafe is True
+
+
+def test_short_boundary_clause_can_use_three_decode_consensus() -> None:
+    lines = [
+        {
+            "line_id": "target",
+            "line": (
+                "I know! That was different. "
+                "It was a long time ago..."
+            ),
+        }
+    ]
+    evaluator = TranscriptEvaluator(lines, {})
+
+    rescued = _boundary_clause_consensus_transcript(
+        line_index=0,
+        exact_transcript=(
+            "Hey, no! That was different. It was a long time ago."
+        ),
+        preliminary_transcript=(
+            "I know! That was different. It was... A long time ago."
+        ),
+        recording_transcript=(
+            "Know That Was Different It Was A Long Time Ago"
+        ),
+        evaluator=evaluator,
+        settings={},
+    )
+
+    assert rescued == (
+        "I know! That was different. It was... A long time ago."
+    )
+
+
+def test_boundary_clause_consensus_requires_recording_support() -> None:
+    lines = [
+        {
+            "line_id": "target",
+            "line": (
+                "I know! That was different. "
+                "It was a long time ago..."
+            ),
+        }
+    ]
+    evaluator = TranscriptEvaluator(lines, {})
+
+    rescued = _boundary_clause_consensus_transcript(
+        line_index=0,
+        exact_transcript=(
+            "Hey, no! That was different. It was a long time ago."
+        ),
+        preliminary_transcript=(
+            "I know! That was different. It was... A long time ago."
+        ),
+        recording_transcript=(
+            "Hey No That Was Different It Was A Long Time Ago"
+        ),
+        evaluator=evaluator,
+        settings={},
+    )
+
+    assert rescued is None
+
+
 def test_word_timestamp_gaps_split_a_region_into_take_candidates() -> None:
     transcription = {
         "segments": [
@@ -2769,6 +3138,84 @@ def test_duplicate_weak_order_distributes_nearby_distinct_takes() -> None:
 
     assert [action["line_index"] for action in actions] == [0, 1]
     assert all(action["duplicate_resolved"] for action in actions)
+
+
+def test_duplicate_weak_order_ignores_weak_matches_when_grouping_takes() -> None:
+    lines = [
+        {"line_id": "a", "line": "Found you!"},
+        {"line_id": "b", "line": "Found you!"},
+    ]
+    correct_times = {0.0, 1.0, 100.0, 101.0, 140.0, 141.0}
+    start_times = [
+        0.0,
+        1.0,
+        *[float(value) for value in range(10, 100, 10)],
+        100.0,
+        101.0,
+        110.0,
+        120.0,
+        130.0,
+        140.0,
+        141.0,
+        *[float(value) for value in range(150, 401, 10)],
+    ]
+    segments = [
+        {
+            "start_seconds": start_seconds,
+            "end_seconds": start_seconds + 0.8,
+        }
+        for start_seconds in start_times
+    ]
+    actions = [
+        {
+            "start_index": index,
+            "count": 1,
+            "line_index": 0,
+            "match_score": (
+                100.0 if start_seconds in correct_times else 79.0
+            ),
+            "top_matches": [
+                {
+                    "line_index": 0,
+                    "match_score": (
+                        100.0 if start_seconds in correct_times else 79.0
+                    ),
+                },
+                {
+                    "line_index": 1,
+                    "match_score": (
+                        100.0 if start_seconds in correct_times else 79.0
+                    ),
+                },
+            ],
+        }
+        for index, start_seconds in enumerate(start_times)
+    ]
+
+    _apply_duplicate_line_policy(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings={
+            "duplicate_line_policy": "weak_order",
+            "take_group_gap_seconds": 12.0,
+            "short_line_min_score": 88.0,
+        },
+    )
+
+    assigned_correct_times = {
+        start_times[int(action["start_index"])]: int(action["line_index"])
+        for action in actions
+        if float(action["match_score"]) == 100.0
+    }
+    assert assigned_correct_times == {
+        0.0: 0,
+        1.0: 0,
+        100.0: 0,
+        101.0: 0,
+        140.0: 1,
+        141.0: 1,
+    }
 
 
 def test_duplicate_review_and_reuse_expand_only_identical_targets() -> None:

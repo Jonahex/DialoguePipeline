@@ -11,6 +11,7 @@ from .audio import (
     detect_silences,
     pcm_voice_bounds,
     prepare_pcm_segmentation_source,
+    probe_audio,
     quietest_pcm_boundary,
     seconds_to_sample,
     transcript_for_region,
@@ -186,6 +187,48 @@ def prevent_region_overlaps(
         for region in ordered
         if float(region["end"]) > float(region["start"])
     ]
+
+
+def _segment_voice_bounds(
+    audio_path: Path,
+    *,
+    start_sample: int,
+    end_sample: int,
+    settings: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not bool(settings.get("enabled", True)):
+        return None
+    speech_bounds = pcm_voice_bounds(
+        audio_path,
+        start_sample=start_sample,
+        end_sample=end_sample,
+        threshold=float(settings.get("vad_threshold", 0.50)),
+    )
+    breath_bounds = pcm_voice_bounds(
+        audio_path,
+        start_sample=start_sample,
+        end_sample=end_sample,
+        threshold=float(settings.get("breath_vad_threshold", 0.70)),
+    )
+    return {
+        "source": "silero_vad",
+        "speech": (
+            {
+                "start_sample": speech_bounds[0],
+                "end_sample": speech_bounds[1],
+            }
+            if speech_bounds is not None
+            else None
+        ),
+        "strict_speech": (
+            {
+                "start_sample": breath_bounds[0],
+                "end_sample": breath_bounds[1],
+            }
+            if breath_bounds is not None
+            else None
+        ),
+    }
 
 
 def segment_project(
@@ -384,41 +427,12 @@ def segment_project(
                 end_sample=end_sample,
                 fade_ms=float(settings.get("fade_ms", 5.0)),
             )
-            voice_bounds = None
-            if voice_boundary_settings["enabled"]:
-                speech_bounds = pcm_voice_bounds(
-                    working_audio,
-                    start_sample=start_sample,
-                    end_sample=end_sample,
-                    threshold=voice_boundary_settings["vad_threshold"],
-                )
-                breath_bounds = pcm_voice_bounds(
-                    working_audio,
-                    start_sample=start_sample,
-                    end_sample=end_sample,
-                    threshold=voice_boundary_settings[
-                        "breath_vad_threshold"
-                    ],
-                )
-                voice_bounds = {
-                    "source": "silero_vad",
-                    "speech": (
-                        {
-                            "start_sample": speech_bounds[0],
-                            "end_sample": speech_bounds[1],
-                        }
-                        if speech_bounds is not None
-                        else None
-                    ),
-                    "strict_speech": (
-                        {
-                            "start_sample": breath_bounds[0],
-                            "end_sample": breath_bounds[1],
-                        }
-                        if breath_bounds is not None
-                        else None
-                    ),
-                }
+            voice_bounds = _segment_voice_bounds(
+                working_audio,
+                start_sample=start_sample,
+                end_sample=end_sample,
+                settings=voice_boundary_settings,
+            )
             transcript, words, probability = transcript_for_region(
                 transcription,
                 start_sample / sample_rate,
@@ -489,6 +503,313 @@ def segment_project(
     check_processing_cancelled()
     write_json(manifest_path, manifest)
     return manifest_path
+
+
+def refresh_project_audio(
+    *,
+    project_dir: Path,
+    project: dict[str, Any],
+) -> dict[str, Any]:
+    """Re-cut stored segment spans after source audio-only edits.
+
+    The caller is asserting that the spoken content and its timing did not
+    change. Existing transcripts, segment boundaries, alignment results, and
+    review selections are therefore preserved. Updated sources must normalize
+    to the exact sample rate and frame count recorded by the manifest.
+    """
+
+    project_dir = project_dir.resolve()
+    manifest_path = project_dir / "segments_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Missing segment manifest: {manifest_path}. Run segment first."
+        )
+    inventory_path = resolve_project_path(
+        project_dir,
+        project["audio_inventory"],
+    )
+    previous_inventory = (
+        read_json(inventory_path) if inventory_path.is_file() else {"files": []}
+    )
+    previous_inventory_by_path = {
+        Path(item["path"]).resolve(): item
+        for item in previous_inventory.get("files", [])
+    }
+
+    configured_sessions = project.get("sessions") or []
+    session_by_id = {
+        str(session["id"]): session for session in configured_sessions
+    }
+    if len(session_by_id) != len(configured_sessions):
+        raise ValueError("Project contains duplicate session IDs.")
+
+    audio_paths = {
+        resolve_project_path(project_dir, str(session["audio"])).resolve()
+        for session in configured_sessions
+    }
+    configured_audio_dir = project.get("audio_dir")
+    if configured_audio_dir:
+        audio_dir = resolve_project_path(project_dir, str(configured_audio_dir))
+        if audio_dir.is_dir():
+            audio_paths.update(path.resolve() for path in audio_dir.glob("*.wav"))
+    if not audio_paths:
+        raise ValueError("Project has no configured source recordings.")
+
+    ordered_audio_paths = sorted(
+        audio_paths,
+        key=lambda path: (path.name.casefold(), str(path).casefold()),
+    )
+    refreshed_inventory = []
+    for index, audio_path in enumerate(ordered_audio_paths, start=1):
+        check_processing_cancelled()
+        if not audio_path.is_file():
+            raise FileNotFoundError(f"Source recording not found: {audio_path}")
+        print(
+            f"[refresh inventory {index}/{len(ordered_audio_paths)}] "
+            f"{audio_path.name}",
+            flush=True,
+        )
+        refreshed_inventory.append(probe_audio(audio_path, include_hash=True))
+    refreshed_inventory_by_path = {
+        Path(item["path"]).resolve(): item for item in refreshed_inventory
+    }
+
+    manifest = read_json(manifest_path)
+    manifest_sessions = manifest.get("sessions")
+    if not isinstance(manifest_sessions, list) or not manifest_sessions:
+        raise ValueError("Segment manifest has no sessions to refresh.")
+
+    export_settings = dict(project.get("export") or {})
+    segmentation_settings = dict(
+        manifest.get("settings") or project.get("segmentation") or {}
+    )
+    fade_ms = float(segmentation_settings.get("fade_ms", 5.0))
+    prepared_sessions: dict[str, dict[str, Any]] = {}
+    total_segment_count = 0
+
+    # Prepare and validate every source before overwriting any segment file.
+    for session_entry in manifest_sessions:
+        check_processing_cancelled()
+        session_id = str(session_entry.get("session_id") or "")
+        session = session_by_id.get(session_id)
+        if session is None:
+            raise KeyError(
+                f"Manifest session is not configured in project.json: {session_id}"
+            )
+        audio_path = resolve_project_path(
+            project_dir,
+            str(session["audio"]),
+        ).resolve()
+        inventory_item = refreshed_inventory_by_path.get(audio_path)
+        if inventory_item is None:
+            raise KeyError(f"Audio is not present in refreshed inventory: {audio_path}")
+
+        base_segments = session_entry.get("segments") or []
+        derived_segments = session_entry.get("derived_segments") or []
+        all_segments = [*base_segments, *derived_segments]
+        total_segment_count += len(all_segments)
+
+        sample_rate = int(
+            session_entry.get(
+                "sample_rate",
+                export_settings.get("sample_rate", 48000),
+            )
+        )
+        first_metrics = (
+            dict((all_segments[0].get("metrics") or {}))
+            if all_segments
+            else {}
+        )
+        channels = int(
+            first_metrics.get(
+                "channels",
+                export_settings.get("channels", 1),
+            )
+        )
+        bits_per_sample = int(
+            first_metrics.get(
+                "bits_per_sample",
+                export_settings.get("bits_per_sample", 16),
+            )
+        )
+        expected_frames = int(session_entry.get("source_frames", -1))
+        if sample_rate <= 0 or channels <= 0 or bits_per_sample <= 0:
+            raise ValueError(
+                f"Invalid stored audio format for session {session_id}."
+            )
+        if expected_frames < 0:
+            raise ValueError(
+                f"Session {session_id} has no stored source frame count; "
+                "run segmentation once before refreshing audio."
+            )
+
+        normalization_name = (
+            f"{session_id}__{inventory_item['sha256'][:16]}__"
+            f"{sample_rate}hz_{channels}ch_s{bits_per_sample}.wav"
+        )
+        working_audio, working_shape, normalized = (
+            prepare_pcm_segmentation_source(
+                audio_path,
+                project_dir / "normalized_sources" / normalization_name,
+                sample_rate=sample_rate,
+                channels=channels,
+                bits_per_sample=bits_per_sample,
+            )
+        )
+        actual_shape = {
+            "sample_rate": int(working_shape["sample_rate"]),
+            "channels": int(working_shape["channels"]),
+            "bits_per_sample": int(working_shape["bits_per_sample"]),
+        }
+        expected_shape = {
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "bits_per_sample": bits_per_sample,
+        }
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"Updated source for {session_id} normalizes to "
+                f"{actual_shape!r}, expected {expected_shape!r}."
+            )
+        actual_frames = int(working_shape["frame_count"])
+        if actual_frames != expected_frames:
+            raise ValueError(
+                f"Updated source duration changed for {session_id}: "
+                f"{actual_frames} frames instead of {expected_frames}. "
+                "This refresh is only safe when spoken timing is unchanged."
+            )
+
+        for segment in all_segments:
+            segment_id = str(segment.get("segment_id") or "")
+            if not segment_id or not segment.get("file"):
+                raise ValueError(
+                    f"Session {session_id} contains a segment without an ID or file."
+                )
+            try:
+                start_sample = int(segment["start_sample"])
+                end_sample = int(segment["end_sample"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Segment {segment_id} has invalid stored sample bounds."
+                ) from error
+            if not 0 <= start_sample < end_sample <= actual_frames:
+                raise ValueError(
+                    f"Segment {segment_id} bounds {start_sample}..{end_sample} "
+                    f"are outside the updated {actual_frames}-frame source."
+                )
+
+        stored_voice_settings = session_entry.get("voice_boundary_detection")
+        voice_settings = (
+            dict(stored_voice_settings)
+            if isinstance(stored_voice_settings, dict)
+            else {
+                "enabled": bool(
+                    segmentation_settings.get(
+                        "voice_boundary_detection_enabled",
+                        True,
+                    )
+                ),
+                "vad_threshold": float(
+                    segmentation_settings.get(
+                        "voice_boundary_vad_threshold",
+                        0.50,
+                    )
+                ),
+                "breath_vad_threshold": float(
+                    segmentation_settings.get(
+                        "voice_boundary_breath_vad_threshold",
+                        0.70,
+                    )
+                ),
+            }
+        )
+        prepared_sessions[session_id] = {
+            "session": session,
+            "inventory": inventory_item,
+            "working_audio": working_audio,
+            "working_shape": working_shape,
+            "normalized": normalized,
+            "voice_settings": voice_settings,
+        }
+
+    refreshed_segments = 0
+    refreshed_derived_segments = 0
+    for session_index, session_entry in enumerate(manifest_sessions, start=1):
+        check_processing_cancelled()
+        session_id = str(session_entry["session_id"])
+        prepared = prepared_sessions[session_id]
+        session = prepared["session"]
+        inventory_item = prepared["inventory"]
+        working_audio = prepared["working_audio"]
+        working_shape = prepared["working_shape"]
+        sample_rate = int(working_shape["sample_rate"])
+        base_segments = session_entry.get("segments") or []
+        derived_segments = session_entry.get("derived_segments") or []
+        all_segments = [*base_segments, *derived_segments]
+        base_segment_objects = {id(segment) for segment in base_segments}
+        print(
+            f"[refresh segments {session_index}/{len(manifest_sessions)}] "
+            f"{session_id}: {len(all_segments)} file(s)",
+            flush=True,
+        )
+
+        for segment in all_segments:
+            check_processing_cancelled()
+            start_sample = int(segment["start_sample"])
+            end_sample = int(segment["end_sample"])
+            output_path = resolve_project_path(project_dir, str(segment["file"]))
+            segment["metrics"] = cut_pcm_wav(
+                working_audio,
+                output_path,
+                start_sample=start_sample,
+                end_sample=end_sample,
+                fade_ms=fade_ms,
+            )
+            segment["session_id"] = session_id
+            segment["source_audio"] = session["audio"]
+            segment["source_sha256"] = inventory_item["sha256"]
+            segment["start_seconds"] = start_sample / sample_rate
+            segment["end_seconds"] = end_sample / sample_rate
+            if id(segment) in base_segment_objects:
+                segment["voice_bounds"] = _segment_voice_bounds(
+                    working_audio,
+                    start_sample=start_sample,
+                    end_sample=end_sample,
+                    settings=prepared["voice_settings"],
+                )
+
+        refreshed_segments += len(base_segments)
+        refreshed_derived_segments += len(derived_segments)
+        session_entry["audio"] = session["audio"]
+        session_entry["working_audio"] = relpath_for_config(
+            working_audio,
+            project_dir,
+        )
+        session_entry["normalized_source"] = bool(prepared["normalized"])
+        session_entry["source_sha256"] = inventory_item["sha256"]
+        session_entry["sample_rate"] = sample_rate
+        session_entry["source_frames"] = int(working_shape["frame_count"])
+        session_entry["voice_boundary_detection"] = prepared["voice_settings"]
+
+    check_processing_cancelled()
+    write_json(inventory_path, {"files": refreshed_inventory})
+    write_json(manifest_path, manifest)
+
+    changed_source_count = sum(
+        1
+        for path, item in refreshed_inventory_by_path.items()
+        if (previous_inventory_by_path.get(path) or {}).get("sha256")
+        != item.get("sha256")
+    )
+    return {
+        "audio_inventory": inventory_path,
+        "segments_manifest": manifest_path,
+        "source_count": len(refreshed_inventory),
+        "changed_source_count": changed_source_count,
+        "segment_count": refreshed_segments,
+        "derived_segment_count": refreshed_derived_segments,
+        "total_segment_count": total_segment_count,
+    }
 
 
 def materialize_derived_segment(

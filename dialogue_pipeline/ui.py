@@ -33,7 +33,7 @@ from .review import (
     save_line_review,
     segment_file_for_id,
 )
-from .segmentation import segment_project
+from .segmentation import refresh_project_audio, segment_project
 from .transcription import transcribe_project, transcribe_segments_project
 from .util import project_file_from_arg, write_json
 
@@ -687,14 +687,21 @@ class DialogueReviewApp:
             text="Open Project",
             style="Primary.TButton",
             command=self.choose_existing_project,
-            width=28,
+            width=40,
         ).pack(ipady=8, pady=7)
         ttk.Button(
             card,
             text="Create or Reprocess Project",
             style="Primary.TButton",
             command=self.choose_new_project,
-            width=28,
+            width=40,
+        ).pack(ipady=8, pady=7)
+        ttk.Button(
+            card,
+            text="Refresh Segments from Updated Audio",
+            style="Primary.TButton",
+            command=self.choose_audio_refresh,
+            width=40,
         ).pack(ipady=8, pady=7)
 
     def choose_existing_project(self) -> None:
@@ -768,6 +775,48 @@ class DialogueReviewApp:
             project_dir=project_dir,
             project_settings=project_settings,
         )
+
+    def choose_audio_refresh(self) -> None:
+        selected = filedialog.askdirectory(
+            title="Select project with updated source audio"
+        )
+        if not selected:
+            return
+        project_dir = Path(selected).resolve()
+        try:
+            project_file_from_arg(project_dir)
+            if not (project_dir / "segments_manifest.json").is_file():
+                raise FileNotFoundError(
+                    f"Missing segment manifest: "
+                    f"{project_dir / 'segments_manifest.json'}"
+                )
+            if not (project_dir / REVIEW_FILE_NAME).is_file():
+                raise FileNotFoundError(
+                    f"Missing review data: {project_dir / REVIEW_FILE_NAME}"
+                )
+        except Exception as error:
+            messagebox.showerror(
+                "Cannot refresh project audio",
+                str(error),
+                parent=self.root,
+            )
+            return
+
+        confirmed = messagebox.askokcancel(
+            "Refresh segments from updated audio?",
+            (
+                "Continue only if the recordings contain the same spoken "
+                "performances at the same timing (for example, only volume "
+                "was adjusted).\n\n"
+                "Existing segment WAV files will be replaced from their "
+                "stored sample ranges. Transcripts, alignment results, and "
+                "review selections will be kept."
+            ),
+            parent=self.root,
+        )
+        if not confirmed:
+            return
+        self.run_audio_refresh(project_dir)
 
     def ask_project_settings(
         self,
@@ -874,6 +923,37 @@ class DialogueReviewApp:
             return loaded_dir
 
         self._start_worker(work, self._pipeline_finished)
+
+    def run_audio_refresh(self, project_dir: Path) -> None:
+        self.show_progress(
+            project_dir,
+            title="Refreshing segments from updated audio",
+        )
+
+        def work() -> tuple[Path, dict[str, Any]]:
+            check_processing_cancelled()
+            loaded_dir, project = load_project(
+                project_file_from_arg(project_dir)
+            )
+            print(
+                "Refreshing source inventory and re-cutting stored base and "
+                "derived segments.",
+                flush=True,
+            )
+            result = refresh_project_audio(
+                project_dir=loaded_dir,
+                project=project,
+            )
+            check_processing_cancelled()
+            print(
+                "Audio refresh complete: "
+                f"{result['changed_source_count']} changed source(s), "
+                f"{result['total_segment_count']} segment file(s).",
+                flush=True,
+            )
+            return loaded_dir, result
+
+        self._start_worker(work, self._audio_refresh_finished)
 
     def show_progress(self, project_dir: Path, *, title: str) -> None:
         self._clear()
@@ -1017,6 +1097,28 @@ class DialogueReviewApp:
             self.open_project(project_dir)
         except Exception as error:
             self._pipeline_failed(error)
+
+    def _audio_refresh_finished(
+        self,
+        payload: tuple[Path, dict[str, Any]],
+    ) -> None:
+        project_dir, result = payload
+        try:
+            self.open_project(project_dir)
+        except Exception as error:
+            self._pipeline_failed(error)
+            return
+        messagebox.showinfo(
+            "Audio refresh complete",
+            (
+                f"Updated {result['total_segment_count']} segment file(s) "
+                f"from {result['changed_source_count']} changed source "
+                "recording(s).\n\n"
+                "Existing transcripts, alignment, and review selections "
+                "were preserved."
+            ),
+            parent=self.root,
+        )
 
     def _pipeline_failed(self, error: Exception) -> None:
         messagebox.showerror("Pipeline failed", str(error), parent=self.root)

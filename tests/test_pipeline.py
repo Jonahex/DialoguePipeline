@@ -64,6 +64,7 @@ from dialogue_pipeline.review import (
 from dialogue_pipeline.segmentation import (
     materialize_trimmed_segment,
     prevent_region_overlaps,
+    refresh_project_audio,
     segment_project,
     split_regions_on_word_gaps,
 )
@@ -97,15 +98,225 @@ def _alignment_settings(**groups: Any) -> AlignmentSettings:
     return AlignmentSettings.from_value(groups)
 
 
-def _write_tone(path: Path, duration_seconds: float = 1.0) -> None:
+def _write_tone(
+    path: Path,
+    duration_seconds: float = 1.0,
+    amplitude: int = 8000,
+) -> None:
     sample_rate = 48000
     time = np.arange(int(sample_rate * duration_seconds)) / sample_rate
-    samples = np.rint(np.sin(2 * math.pi * 440 * time) * 8000).astype("<i2")
+    samples = np.rint(np.sin(2 * math.pi * 440 * time) * amplitude).astype("<i2")
     with wave.open(str(path), "wb") as writer:
         writer.setnchannels(1)
         writer.setsampwidth(2)
         writer.setframerate(sample_rate)
         writer.writeframes(samples.tobytes())
+
+
+def test_refresh_project_audio_recuts_existing_spans_without_reprocessing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.segmentation as segmentation_module
+
+    def fake_probe_audio(
+        path: Path,
+        *,
+        include_hash: bool = True,
+    ) -> dict[str, Any]:
+        with wave.open(str(path), "rb") as reader:
+            result = {
+                "path": str(path.resolve()),
+                "size_bytes": path.stat().st_size,
+                "duration_seconds": reader.getnframes() / reader.getframerate(),
+                "codec": "pcm_s16le",
+                "sample_format": "s16",
+                "sample_rate": reader.getframerate(),
+                "channels": reader.getnchannels(),
+                "channel_layout": "mono",
+                "bits_per_sample": reader.getsampwidth() * 8,
+            }
+        if include_hash:
+            result["sha256"] = sha256_file(path)
+        return result
+
+    monkeypatch.setattr(segmentation_module, "probe_audio", fake_probe_audio)
+
+    source = tmp_path / "source.wav"
+    _write_tone(source, duration_seconds=2.0, amplitude=4000)
+    old_source_hash = sha256_file(source)
+    base_file = tmp_path / "segments" / "session" / "session__s00001.wav"
+    derived_file = (
+        tmp_path
+        / "segments"
+        / "session"
+        / "session__t00001_0000024000_0000072000.wav"
+    )
+    base_metrics = cut_pcm_wav(
+        source,
+        base_file,
+        start_sample=0,
+        end_sample=48000,
+        fade_ms=0.0,
+    )
+    derived_metrics = cut_pcm_wav(
+        source,
+        derived_file,
+        start_sample=24000,
+        end_sample=72000,
+        fade_ms=0.0,
+    )
+    project = {
+        "audio_dir": ".",
+        "audio_inventory": "audio_inventory.json",
+        "sessions": [
+            {
+                "id": "session",
+                "enabled": True,
+                "audio": "source.wav",
+            }
+        ],
+        "export": {
+            "sample_rate": 48000,
+            "channels": 1,
+            "bits_per_sample": 16,
+        },
+        "segmentation": {
+            "fade_ms": 0.0,
+            "voice_boundary_detection_enabled": False,
+        },
+    }
+    write_json(
+        tmp_path / "audio_inventory.json",
+        {"files": [fake_probe_audio(source)]},
+    )
+    write_json(
+        tmp_path / "segments_manifest.json",
+        {
+            "schema_version": 1,
+            "settings": project["segmentation"],
+            "sessions": [
+                {
+                    "session_id": "session",
+                    "cache_key": "preserved-segmentation-cache-key",
+                    "audio": "source.wav",
+                    "working_audio": "source.wav",
+                    "normalized_source": False,
+                    "source_sha256": old_source_hash,
+                    "sample_rate": 48000,
+                    "source_frames": 96000,
+                    "voice_boundary_detection": {"enabled": False},
+                    "segments": [
+                        {
+                            "segment_id": "session__s00001",
+                            "kind": "base",
+                            "session_id": "session",
+                            "source_audio": "source.wav",
+                            "source_sha256": old_source_hash,
+                            "base_indices": [0],
+                            "start_sample": 0,
+                            "end_sample": 48000,
+                            "start_seconds": 0.0,
+                            "end_seconds": 1.0,
+                            "file": base_file.relative_to(tmp_path).as_posix(),
+                            "transcript": "Keep this transcript",
+                            "segment_asr": {"primary": {"transcript": "Keep this transcript"}},
+                            "voice_bounds": None,
+                            "metrics": base_metrics,
+                        }
+                    ],
+                    "derived_segments": [
+                        {
+                            "segment_id": (
+                                "session__t00001_0000024000_0000072000"
+                            ),
+                            "kind": "trimmed",
+                            "session_id": "session",
+                            "source_audio": "source.wav",
+                            "source_sha256": old_source_hash,
+                            "base_indices": [0],
+                            "start_sample": 24000,
+                            "end_sample": 72000,
+                            "start_seconds": 0.5,
+                            "end_seconds": 1.5,
+                            "file": derived_file.relative_to(tmp_path).as_posix(),
+                            "transcript": "Keep the derived transcript",
+                            "candidate_asr": {
+                                "transcript": "Keep the derived transcript"
+                            },
+                            "metrics": derived_metrics,
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    review_payload = {
+        "schema_version": 1,
+        "lines": [],
+        "unmatched_segments": [],
+    }
+    write_json(tmp_path / "line_review.json", review_payload)
+
+    old_base_hash = sha256_file(base_file)
+    _write_tone(source, duration_seconds=2.1, amplitude=12000)
+    with pytest.raises(ValueError, match="duration changed"):
+        refresh_project_audio(project_dir=tmp_path, project=project)
+    assert sha256_file(base_file) == old_base_hash
+    assert (
+        read_json(tmp_path / "audio_inventory.json")["files"][0]["sha256"]
+        == old_source_hash
+    )
+
+    _write_tone(source, duration_seconds=2.0, amplitude=12000)
+    new_source_hash = sha256_file(source)
+    assert new_source_hash != old_source_hash
+
+    result = refresh_project_audio(project_dir=tmp_path, project=project)
+
+    assert result["changed_source_count"] == 1
+    assert result["segment_count"] == 1
+    assert result["derived_segment_count"] == 1
+    inventory = read_json(tmp_path / "audio_inventory.json")
+    assert inventory["files"][0]["sha256"] == new_source_hash
+
+    manifest_session = read_json(tmp_path / "segments_manifest.json")["sessions"][0]
+    assert manifest_session["source_sha256"] == new_source_hash
+    assert manifest_session["cache_key"] == "preserved-segmentation-cache-key"
+    base_segment = manifest_session["segments"][0]
+    derived_segment = manifest_session["derived_segments"][0]
+    assert base_segment["source_sha256"] == new_source_hash
+    assert derived_segment["source_sha256"] == new_source_hash
+    assert base_segment["transcript"] == "Keep this transcript"
+    assert base_segment["segment_asr"]["primary"]["transcript"] == (
+        "Keep this transcript"
+    )
+    assert derived_segment["candidate_asr"]["transcript"] == (
+        "Keep the derived transcript"
+    )
+    assert base_segment["metrics"]["rms_dbfs"] > base_metrics["rms_dbfs"] + 8.0
+    assert derived_segment["metrics"]["rms_dbfs"] > (
+        derived_metrics["rms_dbfs"] + 8.0
+    )
+    assert read_json(tmp_path / "line_review.json") == review_payload
+
+    with wave.open(str(source), "rb") as reader:
+        source_samples = np.frombuffer(
+            reader.readframes(reader.getnframes()),
+            dtype="<i2",
+        )
+    with wave.open(str(base_file), "rb") as reader:
+        base_samples = np.frombuffer(
+            reader.readframes(reader.getnframes()),
+            dtype="<i2",
+        )
+    with wave.open(str(derived_file), "rb") as reader:
+        derived_samples = np.frombuffer(
+            reader.readframes(reader.getnframes()),
+            dtype="<i2",
+        )
+    np.testing.assert_array_equal(base_samples, source_samples[:48000])
+    np.testing.assert_array_equal(derived_samples, source_samples[24000:72000])
 
 
 def _write_pattern(path: Path) -> None:

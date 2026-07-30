@@ -12,7 +12,7 @@ from .doctor import run_doctor
 from .finalize import finalize_review
 from .project import create_project, load_project
 from .review import REVIEW_FILE_NAME
-from .segmentation import segment_project
+from .segmentation import refresh_project_audio, segment_project
 from .transcription import transcribe_project, transcribe_segments_project
 from .util import project_file_from_arg
 
@@ -84,6 +84,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Process only this session ID; may be specified multiple times.",
     )
     segment_parser.add_argument("--force", action="store_true")
+
+    refresh_audio_parser = subparsers.add_parser(
+        "refresh-audio",
+        help=(
+            "Re-probe changed source recordings and re-cut every stored "
+            "segment without transcription or alignment."
+        ),
+    )
+    _project_argument(refresh_audio_parser)
 
     segment_transcribe_parser = subparsers.add_parser(
         "transcribe-segments",
@@ -229,6 +238,14 @@ def dispatch(args: argparse.Namespace) -> int:
             force=args.force,
         )
         _print_json({"segments_manifest": output})
+        return 0
+    if args.command == "refresh-audio":
+        _print_json(
+            refresh_project_audio(
+                project_dir=project_dir,
+                project=project,
+            )
+        )
         return 0
     if args.command == "transcribe-segments":
         output = transcribe_segments_project(

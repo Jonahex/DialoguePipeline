@@ -44,6 +44,12 @@ cache-aware pipeline runs again. New destinations use the same settings dialog
 after the UI asks for the lines workbook and recorded WAV directory, then run
 inventory, transcription, segmentation, segment transcription, and alignment
 in the background while showing the pipeline log.
+`Refresh Segments from Updated Audio` is for source-only edits such as volume
+adjustments. It re-probes the configured recordings and re-cuts every existing
+base, merged, bounded, and trimmed segment at its stored sample range, then
+opens the unchanged review package. It does not rerun transcription or
+alignment. The updated recordings must preserve the spoken content, timing,
+and normalized frame count.
 Alignment settings must use the grouped schema documented below. A forced CLI
 metadata refresh writes
 `project.before-force.json` and carries the existing settings and reviewed
@@ -78,6 +84,23 @@ This creates `project.json`, `source_lines.json`, and `audio_inventory.json`.
 Review the generated `sessions` section in `project.json` before transcription.
 Each session specifies its source WAV and the script sheets or Excel rows that
 may occur in that recording.
+
+### Refresh segments after source-only audio edits
+
+If completed source recordings were post-processed without changing their
+spoken content or timing, refresh the project without ASR or alignment:
+
+```powershell
+.\run_pipeline.ps1 refresh-audio --project MaleElfYoung\PipelineWork
+```
+
+This updates `audio_inventory.json`, including source hashes and media
+metadata, and overwrites all WAVs represented in `segments_manifest.json`
+using their existing sample boundaries. Segment source hashes, audio metrics,
+and stored voice bounds are updated while transcripts, candidate mappings,
+alignment results, and manual selections remain unchanged. The command stops
+before replacing segment files if an updated source normalizes to a different
+sample rate, channel/bit-depth shape, or frame count.
 
 ### 2. Transcribe
 

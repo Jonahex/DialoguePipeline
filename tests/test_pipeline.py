@@ -59,7 +59,9 @@ from dialogue_pipeline.review import (
     load_line_review,
     preserve_manual_selections,
     prune_line_candidates,
+    save_edited_candidate,
     save_line_review,
+    segment_edit_source,
 )
 from dialogue_pipeline.segmentation import (
     materialize_trimmed_segment,
@@ -82,6 +84,7 @@ from dialogue_pipeline.ui import (
     _project_settings_from_values,
     _selected_segment_score,
     _uses_unmatched_candidates,
+    _zoomed_sample_window,
 )
 from dialogue_pipeline.util import (
     default_model_cache_root,
@@ -4268,6 +4271,217 @@ def test_review_regeneration_preserves_manual_selection() -> None:
     assert merged["lines"][0]["candidates"][0]["segment_id"] == (
         "session__s00001"
     )
+
+
+def test_waveform_scroll_zoom_is_cursor_centered_and_keeps_markers_visible() -> None:
+    zoomed = _zoomed_sample_window(
+        view_start=0,
+        view_end=120000,
+        context_start=0,
+        context_end=120000,
+        selection_start=50000,
+        selection_end=70000,
+        anchor_sample=60000,
+        zoom_factor=0.5,
+        sample_rate=1000,
+    )
+    assert zoomed == (30000, 90000)
+
+    closest = _zoomed_sample_window(
+        view_start=zoomed[0],
+        view_end=zoomed[1],
+        context_start=0,
+        context_end=120000,
+        selection_start=50000,
+        selection_end=70000,
+        anchor_sample=50000,
+        zoom_factor=0.01,
+        sample_rate=1000,
+    )
+    assert closest[1] - closest[0] == 20100
+    assert closest[0] <= 50000
+    assert closest[1] >= 70000
+
+    zoomed_out = _zoomed_sample_window(
+        view_start=closest[0],
+        view_end=closest[1],
+        context_start=0,
+        context_end=120000,
+        selection_start=50000,
+        selection_end=70000,
+        anchor_sample=50000,
+        zoom_factor=100.0,
+        sample_rate=1000,
+    )
+    assert zoomed_out == (0, 120000)
+
+
+def test_copy_edit_materializes_segment_and_persists_manual_candidate(
+    tmp_path: Path,
+) -> None:
+    sample_rate = 48000
+    source_path = tmp_path / "source.wav"
+    _write_tone(source_path, duration_seconds=4.0)
+    source_segment_path = (
+        tmp_path / "segments" / "session" / "session__s00001.wav"
+    )
+    source_metrics = cut_pcm_wav(
+        source_path,
+        source_segment_path,
+        start_sample=sample_rate,
+        end_sample=sample_rate * 2,
+        fade_ms=0.0,
+    )
+    source_segment = {
+        "segment_id": "session__s00001",
+        "kind": "base",
+        "session_id": "session",
+        "source_audio": "source.wav",
+        "source_sha256": "source-hash",
+        "base_indices": [0],
+        "start_sample": sample_rate,
+        "end_sample": sample_rate * 2,
+        "start_seconds": 1.0,
+        "end_seconds": 2.0,
+        "file": "segments/session/session__s00001.wav",
+        "transcript": "Hello there.",
+        "word_count": 2,
+        "asr_probability": 0.97,
+        "metrics": source_metrics,
+    }
+    write_json(
+        tmp_path / "segments_manifest.json",
+        {
+            "schema_version": 1,
+            "settings": {"fade_ms": 0.0},
+            "sessions": [
+                {
+                    "session_id": "session",
+                    "audio": "source.wav",
+                    "working_audio": "source.wav",
+                    "source_sha256": "source-hash",
+                    "sample_rate": sample_rate,
+                    "source_frames": sample_rate * 4,
+                    "segments": [source_segment],
+                    "derived_segments": [],
+                }
+            ],
+        },
+    )
+    line = {
+        "line_id": "Sheet::R3",
+        "sheet": "Sheet",
+        "excel_row": 3,
+        "line": "Hello there.",
+        "target_filename": "hello",
+    }
+    source_candidate = {
+        "segment_id": source_segment["segment_id"],
+        "segment_file": source_segment["file"],
+        "session_id": "session",
+        "base_indices": [0],
+        "transcript": "Hello there.",
+        "match_score": 100.0,
+        "selection_score": 100.0,
+        "technical_score": 98.0,
+        "is_primary_match": True,
+        "reliable": True,
+        "reliability_reason": "",
+        "source_audio": "source.wav",
+        "start_seconds": 1.0,
+        "end_seconds": 2.0,
+        "duration_seconds": 1.0,
+    }
+    review_path = tmp_path / "line_review.json"
+    review = build_line_review(
+        source_lines=[line],
+        candidates_by_line={line["line_id"]: [source_candidate]},
+        unmatched_segments=[],
+    )
+    save_line_review(review_path, review)
+
+    context = segment_edit_source(
+        project_dir=tmp_path,
+        segment_id=source_segment["segment_id"],
+    )
+    assert context["audio_path"] == source_path
+    assert context["sample_rate"] == sample_rate
+
+    edited = save_edited_candidate(
+        project_dir=tmp_path,
+        project={"segmentation": {"fade_ms": 0.0}},
+        review_path=review_path,
+        review_data=review,
+        line_id=line["line_id"],
+        source_candidate=review["lines"][0]["candidates"][0],
+        start_sample=sample_rate // 2,
+        end_sample=sample_rate * 5 // 2,
+    )
+
+    assert edited["manual_edit"] is True
+    assert edited["edited_from_segment_id"] == source_segment["segment_id"]
+    assert edited["reliable"] is False
+    assert edited["reliability_reason"] == "MANUALLY_EDITED_BOUNDARIES"
+    assert edited["duration_seconds"] == pytest.approx(2.0)
+    with wave.open(str(tmp_path / edited["segment_file"]), "rb") as reader:
+        assert reader.getnframes() == sample_rate * 2
+
+    manifest = read_json(tmp_path / "segments_manifest.json")
+    derived = manifest["sessions"][0]["derived_segments"]
+    assert len(derived) == 1
+    assert derived[0]["kind"] == "manual_edit"
+    assert derived[0]["edited_from_segment_id"] == source_segment["segment_id"]
+    assert derived[0]["manual_line_ids"] == [line["line_id"]]
+    assert derived[0]["start_sample"] == sample_rate // 2
+    assert derived[0]["end_sample"] == sample_rate * 5 // 2
+
+    loaded = load_line_review(review_path)
+    assert [candidate["segment_id"] for candidate in loaded["lines"][0]["candidates"]] == [
+        source_segment["segment_id"],
+        edited["segment_id"],
+    ]
+    assert loaded["lines"][0]["selected_segment_id"] == source_segment["segment_id"]
+
+    save_edited_candidate(
+        project_dir=tmp_path,
+        project={"segmentation": {"fade_ms": 0.0}},
+        review_path=review_path,
+        review_data=review,
+        line_id=line["line_id"],
+        source_candidate=review["lines"][0]["candidates"][0],
+        start_sample=sample_rate // 2,
+        end_sample=sample_rate * 5 // 2,
+    )
+    assert len(
+        read_json(tmp_path / "segments_manifest.json")["sessions"][0][
+            "derived_segments"
+        ]
+    ) == 1
+    assert len(load_line_review(review_path)["lines"][0]["candidates"]) == 2
+
+    regenerated = build_line_review(
+        source_lines=[line],
+        candidates_by_line={},
+        unmatched_segments=[],
+    )
+    preserved = preserve_manual_selections(regenerated, loaded)
+    assert preserved["lines"][0]["status"] == "REVIEW"
+    assert [
+        candidate["segment_id"]
+        for candidate in preserved["lines"][0]["candidates"]
+    ] == [edited["segment_id"]]
+
+    review["lines"][0]["selected_segment_id"] = edited["segment_id"]
+    review["lines"][0]["status"] = "MANUALLY_REVIEWED"
+    save_line_review(review_path, review)
+    finalized = finalize_review(
+        project_dir=tmp_path,
+        project={"export": {}},
+        review_path=review_path,
+        output_dir=tmp_path / "final",
+        dry_run=True,
+    )
+    assert finalized["export_count"] == 1
 
 
 def test_missing_line_can_select_and_preserve_unmatched_segment() -> None:

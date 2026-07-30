@@ -1008,3 +1008,123 @@ def materialize_trimmed_segment(
     }
     session_entry.setdefault("derived_segments", []).append(derived)
     return derived
+
+
+def materialize_manual_segment(
+    *,
+    project_dir: Path,
+    project: dict[str, Any],
+    session_entry: dict[str, Any],
+    source_segment: dict[str, Any],
+    line_id: str,
+    start_sample: int,
+    end_sample: int,
+    transcript: str,
+) -> dict[str, Any]:
+    """Copy a review candidate with user-selected sample boundaries."""
+
+    sample_rate = int(session_entry["sample_rate"])
+    source_frames = int(session_entry["source_frames"])
+    start_sample = max(0, min(int(start_sample), source_frames))
+    end_sample = max(start_sample, min(int(end_sample), source_frames))
+    if end_sample <= start_sample:
+        raise ValueError("An edited segment must contain at least one sample.")
+
+    edit_key = stable_hash(
+        {
+            "line_id": line_id,
+            "source_segment_id": str(source_segment["segment_id"]),
+            "start_sample": start_sample,
+            "end_sample": end_sample,
+        }
+    )
+    segment_id = f"{session_entry['session_id']}__e{edit_key[:12]}"
+    existing = next(
+        (
+            segment
+            for segment in session_entry.get("derived_segments", [])
+            if str(segment.get("segment_id")) == segment_id
+        ),
+        None,
+    )
+    if existing is not None:
+        line_ids = existing.setdefault("manual_line_ids", [])
+        if line_id not in line_ids:
+            line_ids.append(line_id)
+            line_ids.sort()
+        if resolve_project_path(project_dir, str(existing["file"])).is_file():
+            return existing
+
+    base_segments = session_entry.get("segments") or []
+    base_indices = [
+        index
+        for index, segment in enumerate(base_segments)
+        if (
+            start_sample < int(segment["end_sample"])
+            and end_sample > int(segment["start_sample"])
+        )
+    ]
+    working_audio = resolve_project_path(
+        project_dir,
+        str(session_entry.get("working_audio") or session_entry["audio"]),
+    )
+    output_path = (
+        project_dir
+        / "segments"
+        / str(session_entry["session_id"])
+        / f"{segment_id}.wav"
+    )
+    metrics = cut_pcm_wav(
+        working_audio,
+        output_path,
+        start_sample=start_sample,
+        end_sample=end_sample,
+        fade_ms=float(
+            (project.get("segmentation") or {}).get("fade_ms", 5.0)
+        ),
+    )
+    manual_line_ids = sorted(
+        {
+            line_id,
+            *(
+                str(value)
+                for value in (
+                    existing.get("manual_line_ids", [])
+                    if existing is not None
+                    else []
+                )
+            ),
+        }
+    )
+    manual_segment = {
+        "segment_id": segment_id,
+        "kind": "manual_edit",
+        "session_id": str(session_entry["session_id"]),
+        "source_audio": str(
+            source_segment.get("source_audio") or session_entry["audio"]
+        ),
+        "source_sha256": str(
+            source_segment.get("source_sha256")
+            or session_entry.get("source_sha256")
+            or ""
+        ),
+        "base_indices": base_indices,
+        "start_sample": start_sample,
+        "end_sample": end_sample,
+        "start_seconds": start_sample / sample_rate,
+        "end_seconds": end_sample / sample_rate,
+        "file": output_path.relative_to(project_dir).as_posix(),
+        "transcript": transcript,
+        "word_count": len(normalize_spoken_text(transcript).split()),
+        "asr_probability": source_segment.get("asr_probability"),
+        "transcript_source": "manual_copy_edit",
+        "edited_from_segment_id": str(source_segment["segment_id"]),
+        "manual_line_ids": manual_line_ids,
+        "metrics": metrics,
+    }
+    if existing is None:
+        session_entry.setdefault("derived_segments", []).append(manual_segment)
+    else:
+        existing.clear()
+        existing.update(manual_segment)
+    return manual_segment

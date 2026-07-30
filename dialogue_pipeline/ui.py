@@ -4,16 +4,20 @@ import contextlib
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
+import wave
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from .alignment import align_project
 from .alignment_settings import AlignmentSettings
+from .audio import cut_pcm_wav
 from .cancellation import (
     ProcessingCancelled,
     cancellation_scope,
@@ -31,6 +35,8 @@ from .review import (
     REVIEW_FILE_NAME,
     load_line_review,
     save_line_review,
+    save_edited_candidate,
+    segment_edit_source,
     segment_file_for_id,
 )
 from .segmentation import refresh_project_audio, segment_project
@@ -123,6 +129,486 @@ class AudioPlayer:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+
+def _clock_time(sample: int, sample_rate: int) -> str:
+    seconds = max(0.0, sample / sample_rate)
+    minutes, seconds = divmod(seconds, 60.0)
+    hours, minutes = divmod(int(minutes), 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:06.3f}"
+    return f"{minutes:02d}:{seconds:06.3f}"
+
+
+def _zoomed_sample_window(
+    *,
+    view_start: int,
+    view_end: int,
+    context_start: int,
+    context_end: int,
+    selection_start: int,
+    selection_end: int,
+    anchor_sample: int,
+    zoom_factor: float,
+    sample_rate: int,
+) -> tuple[int, int]:
+    """Scale a waveform window around a sample while retaining both markers."""
+
+    context_span = context_end - context_start
+    view_span = view_end - view_start
+    selection_span = selection_end - selection_start
+    if context_span <= 0 or view_span <= 0 or selection_span <= 0:
+        raise ValueError("Waveform zoom intervals must have positive durations.")
+    if zoom_factor <= 0.0:
+        raise ValueError("Waveform zoom factor must be positive.")
+
+    marker_margin = max(1, int(round(sample_rate * 0.05)))
+    minimum_span = min(
+        context_span,
+        max(
+            int(round(sample_rate * 0.25)),
+            selection_span + marker_margin * 2,
+        ),
+    )
+    target_span = max(
+        minimum_span,
+        min(context_span, int(round(view_span * zoom_factor))),
+    )
+    if target_span == view_span:
+        return view_start, view_end
+
+    anchor_sample = max(view_start, min(anchor_sample, view_end))
+    anchor_fraction = (anchor_sample - view_start) / view_span
+    new_start = int(round(anchor_sample - anchor_fraction * target_span))
+    new_end = new_start + target_span
+
+    required_start = selection_start - marker_margin
+    required_end = selection_end + marker_margin
+    if new_start > required_start:
+        new_start = required_start
+        new_end = new_start + target_span
+    if new_end < required_end:
+        new_end = required_end
+        new_start = new_end - target_span
+
+    if new_start < context_start:
+        new_start = context_start
+        new_end = new_start + target_span
+    if new_end > context_end:
+        new_end = context_end
+        new_start = new_end - target_span
+    return int(new_start), int(new_end)
+
+
+class SegmentEditorDialog:
+    WAVEFORM_BINS = 2400
+    CONTEXT_SECONDS = 30.0
+
+    def __init__(
+        self,
+        *,
+        parent: tk.Tk,
+        player: AudioPlayer,
+        segment_id: str,
+        audio_path: Path,
+        sample_rate: int,
+        source_frames: int,
+        start_sample: int,
+        end_sample: int,
+        save_callback: Callable[[int, int], None],
+    ) -> None:
+        self.player = player
+        self.audio_path = audio_path
+        self.sample_rate = sample_rate
+        self.source_frames = source_frames
+        self.save_callback = save_callback
+        self.start_sample = start_sample
+        self.end_sample = end_sample
+        if not 0 <= start_sample < end_sample <= source_frames:
+            raise ValueError("The candidate has invalid source sample boundaries.")
+        context_frames = int(round(self.CONTEXT_SECONDS * sample_rate))
+        self.context_start = max(0, start_sample - context_frames)
+        self.context_end = min(source_frames, end_sample + context_frames)
+        self.view_start = self.context_start
+        self.view_end = self.context_end
+        self._envelope_min, self._envelope_max = self._read_waveform()
+        self._drag_boundary: str | None = None
+        self._drag_changed = False
+        self._playback_active = False
+        self._playback_after_id: str | None = None
+        self._temporary_dir = tempfile.TemporaryDirectory(
+            prefix="dialogue-va-segment-editor-"
+        )
+        self.saved = False
+
+        self.window = tk.Toplevel(parent)
+        self.window.title(f"Copy and edit segment — {segment_id}")
+        self.window.geometry("1040x500")
+        self.window.minsize(760, 420)
+        self.window.transient(parent)
+        self.window.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        outer = ttk.Frame(self.window, padding=16)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(
+            outer,
+            text=(
+                "Drag the green start line and red end line to set the copy. "
+                "Use the mouse wheel over the waveform to zoom the time scale."
+            ),
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
+        self.canvas = tk.Canvas(
+            outer,
+            height=310,
+            background="#f8fafc",
+            highlightthickness=1,
+            highlightbackground="#94a3b8",
+        )
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", self._canvas_resized)
+        self.canvas.bind("<Button-1>", self._drag_started)
+        self.canvas.bind("<B1-Motion>", self._drag_moved)
+        self.canvas.bind("<ButtonRelease-1>", self._drag_finished)
+        self.canvas.bind("<Motion>", self._canvas_motion)
+        self.canvas.bind("<MouseWheel>", self._mouse_wheel)
+        self.canvas.bind("<Button-4>", self._mouse_wheel_up)
+        self.canvas.bind("<Button-5>", self._mouse_wheel_down)
+
+        controls = ttk.Frame(outer, padding=(0, 12, 0, 0))
+        controls.pack(fill="x")
+        self.play_button = ttk.Button(
+            controls,
+            text="\u25b6 Play",
+            command=self.play,
+        )
+        self.play_button.pack(side="left")
+        self.bounds_text = tk.StringVar()
+        ttk.Label(
+            controls,
+            textvariable=self.bounds_text,
+            style="Muted.TLabel",
+        ).pack(side="left", padx=16)
+        ttk.Button(controls, text="Cancel", command=self.cancel).pack(
+            side="right"
+        )
+        ttk.Button(
+            controls,
+            text="Save",
+            style="Primary.TButton",
+            command=self.save,
+        ).pack(side="right", padx=(0, 8))
+
+        self._update_bounds_text()
+        self.window.grab_set()
+        self.window.focus_set()
+        self.window.after_idle(self._redraw)
+
+    def _read_waveform(self) -> tuple[np.ndarray, np.ndarray]:
+        with wave.open(str(self.audio_path), "rb") as reader:
+            if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
+                raise ValueError(
+                    "Waveform editing requires an uncompressed 16-bit PCM source."
+                )
+            if reader.getframerate() != self.sample_rate:
+                raise ValueError("The source sample rate does not match its manifest.")
+            if reader.getnframes() != self.source_frames:
+                raise ValueError("The source frame count does not match its manifest.")
+            channels = reader.getnchannels()
+            reader.setpos(self.view_start)
+            raw = reader.readframes(self.view_end - self.view_start)
+        samples = np.frombuffer(raw, dtype="<i2")
+        if channels > 1 and samples.size:
+            samples = samples.reshape(-1, channels).mean(axis=1)
+        else:
+            samples = samples.astype(np.float32, copy=False)
+        if not samples.size:
+            return np.zeros(1), np.zeros(1)
+        bin_count = min(self.WAVEFORM_BINS, samples.size)
+        edges = np.linspace(
+            0,
+            samples.size,
+            bin_count + 1,
+            dtype=np.int64,
+        )
+        starts = edges[:-1]
+        minimum = np.minimum.reduceat(samples, starts) / 32768.0
+        maximum = np.maximum.reduceat(samples, starts) / 32768.0
+        return minimum, maximum
+
+    def _canvas_resized(self, _event: tk.Event[Any]) -> None:
+        self.window.after_idle(self._redraw)
+
+    def _sample_to_x(self, sample: int) -> float:
+        width = max(1, self.canvas.winfo_width())
+        duration = max(1, self.view_end - self.view_start)
+        return (sample - self.view_start) * width / duration
+
+    def _x_to_sample(self, x: float) -> int:
+        width = max(1, self.canvas.winfo_width())
+        fraction = max(0.0, min(1.0, x / width))
+        return int(
+            round(
+                self.view_start
+                + fraction * (self.view_end - self.view_start)
+            )
+        )
+
+    def _mouse_wheel(self, event: tk.Event[Any]) -> str:
+        delta = int(getattr(event, "delta", 0))
+        if not delta:
+            return "break"
+        steps = min(4, max(1, abs(delta) // 120))
+        factor = (0.80 if delta > 0 else 1.25) ** steps
+        self._change_time_scale(event.x, factor)
+        return "break"
+
+    def _mouse_wheel_up(self, event: tk.Event[Any]) -> str:
+        self._change_time_scale(event.x, 0.80)
+        return "break"
+
+    def _mouse_wheel_down(self, event: tk.Event[Any]) -> str:
+        self._change_time_scale(event.x, 1.25)
+        return "break"
+
+    def _change_time_scale(self, x: float, zoom_factor: float) -> None:
+        new_start, new_end = _zoomed_sample_window(
+            view_start=self.view_start,
+            view_end=self.view_end,
+            context_start=self.context_start,
+            context_end=self.context_end,
+            selection_start=self.start_sample,
+            selection_end=self.end_sample,
+            anchor_sample=self._x_to_sample(x),
+            zoom_factor=zoom_factor,
+            sample_rate=self.sample_rate,
+        )
+        if (new_start, new_end) == (self.view_start, self.view_end):
+            return
+        self.view_start = new_start
+        self.view_end = new_end
+        self._envelope_min, self._envelope_max = self._read_waveform()
+        self._update_bounds_text()
+        self._redraw()
+
+    def _redraw(self) -> None:
+        if not self.window.winfo_exists():
+            return
+        self.canvas.delete("all")
+        width = max(1, self.canvas.winfo_width())
+        height = max(1, self.canvas.winfo_height())
+        middle = height / 2.0
+        start_x = self._sample_to_x(self.start_sample)
+        end_x = self._sample_to_x(self.end_sample)
+        self.canvas.create_rectangle(
+            start_x,
+            0,
+            end_x,
+            height,
+            fill="#dbeafe",
+            outline="",
+        )
+        self.canvas.create_line(0, middle, width, middle, fill="#cbd5e1")
+
+        count = len(self._envelope_min)
+        if count:
+            x_values = np.linspace(0.0, width, count, endpoint=False)
+            amplitude = max(1.0, middle - 24.0)
+            for x, low, high in zip(
+                x_values,
+                self._envelope_min,
+                self._envelope_max,
+            ):
+                self.canvas.create_line(
+                    float(x),
+                    middle - float(high) * amplitude,
+                    float(x),
+                    middle - float(low) * amplitude,
+                    fill="#334155",
+                )
+
+        for fraction in np.linspace(0.0, 1.0, 7):
+            x = float(fraction * width)
+            sample = int(
+                round(
+                    self.view_start
+                    + fraction * (self.view_end - self.view_start)
+                )
+            )
+            self.canvas.create_line(
+                x,
+                height - 18,
+                x,
+                height,
+                fill="#94a3b8",
+            )
+            self.canvas.create_text(
+                x,
+                height - 20,
+                text=_clock_time(sample, self.sample_rate),
+                anchor="s",
+                fill="#475569",
+                font=("Segoe UI", 8),
+            )
+
+        self._draw_boundary(
+            start_x,
+            "#16a34a",
+            f"Start {_clock_time(self.start_sample, self.sample_rate)}",
+            "nw",
+        )
+        self._draw_boundary(
+            end_x,
+            "#dc2626",
+            f"End {_clock_time(self.end_sample, self.sample_rate)}",
+            "ne",
+        )
+
+    def _draw_boundary(
+        self,
+        x: float,
+        color: str,
+        label: str,
+        anchor: str,
+    ) -> None:
+        height = max(1, self.canvas.winfo_height())
+        self.canvas.create_line(x, 0, x, height, fill=color, width=3)
+        offset = 5 if anchor == "nw" else -5
+        self.canvas.create_text(
+            x + offset,
+            5,
+            text=label,
+            anchor=anchor,
+            fill=color,
+            font=("Segoe UI", 9, "bold"),
+        )
+
+    def _nearest_boundary(self, x: float) -> str | None:
+        distances = {
+            "start": abs(x - self._sample_to_x(self.start_sample)),
+            "end": abs(x - self._sample_to_x(self.end_sample)),
+        }
+        name = min(distances, key=distances.get)
+        return name if distances[name] <= 12.0 else None
+
+    def _drag_started(self, event: tk.Event[Any]) -> None:
+        self._drag_boundary = self._nearest_boundary(event.x)
+        self._drag_changed = False
+
+    def _drag_moved(self, event: tk.Event[Any]) -> None:
+        if self._drag_boundary is None:
+            return
+        sample = self._x_to_sample(event.x)
+        minimum_frames = max(1, int(round(self.sample_rate * 0.01)))
+        if self._drag_boundary == "start":
+            sample = min(sample, self.end_sample - minimum_frames)
+            sample = max(self.view_start, sample)
+            changed = sample != self.start_sample
+            self.start_sample = sample
+        else:
+            sample = max(sample, self.start_sample + minimum_frames)
+            sample = min(self.view_end, sample)
+            changed = sample != self.end_sample
+            self.end_sample = sample
+        self._drag_changed = self._drag_changed or changed
+        self._update_bounds_text()
+        self._redraw()
+
+    def _drag_finished(self, _event: tk.Event[Any]) -> None:
+        changed = self._drag_changed
+        self._drag_boundary = None
+        self._drag_changed = False
+        if changed and self._playback_active:
+            self._play_current()
+
+    def _canvas_motion(self, event: tk.Event[Any]) -> None:
+        self.canvas.configure(
+            cursor="sb_h_double_arrow"
+            if self._nearest_boundary(event.x)
+            else ""
+        )
+
+    def _update_bounds_text(self) -> None:
+        duration = (self.end_sample - self.start_sample) / self.sample_rate
+        visible_seconds = (self.view_end - self.view_start) / self.sample_rate
+        self.bounds_text.set(
+            f"Start {_clock_time(self.start_sample, self.sample_rate)}   "
+            f"End {_clock_time(self.end_sample, self.sample_rate)}   "
+            f"Duration {duration:.3f} s   View {visible_seconds:.2f} s"
+        )
+
+    def play(self) -> None:
+        self._play_current()
+
+    def _play_current(self) -> None:
+        self._cancel_playback_timer()
+        self.player.stop()
+        preview_path = Path(self._temporary_dir.name) / "preview.wav"
+        try:
+            cut_pcm_wav(
+                self.audio_path,
+                preview_path,
+                start_sample=self.start_sample,
+                end_sample=self.end_sample,
+                fade_ms=0.0,
+            )
+            self.player.play(preview_path)
+        except Exception as error:
+            self._playback_active = False
+            messagebox.showerror(
+                "Cannot play edited segment",
+                str(error),
+                parent=self.window,
+            )
+            return
+        self._playback_active = True
+        duration_ms = int(
+            round(
+                1000.0
+                * (self.end_sample - self.start_sample)
+                / self.sample_rate
+            )
+        )
+        self._playback_after_id = self.window.after(
+            max(100, duration_ms + 100),
+            self._playback_finished,
+        )
+
+    def _playback_finished(self) -> None:
+        self._playback_after_id = None
+        self._playback_active = False
+
+    def _cancel_playback_timer(self) -> None:
+        if self._playback_after_id is not None:
+            self.window.after_cancel(self._playback_after_id)
+            self._playback_after_id = None
+
+    def save(self) -> None:
+        try:
+            self.save_callback(self.start_sample, self.end_sample)
+        except Exception as error:
+            messagebox.showerror(
+                "Cannot save edited segment",
+                str(error),
+                parent=self.window,
+            )
+            return
+        self.saved = True
+        self._close()
+
+    def cancel(self) -> None:
+        self.saved = False
+        self._close()
+
+    def _close(self) -> None:
+        self._cancel_playback_timer()
+        self._playback_active = False
+        self.player.stop()
+        with contextlib.suppress(tk.TclError):
+            self.window.grab_release()
+        self.window.destroy()
+        with contextlib.suppress(OSError):
+            self._temporary_dir.cleanup()
 
 
 class QueueWriter:
@@ -1290,7 +1776,14 @@ class DialogueReviewApp:
             columnspan=2,
             sticky="ew",
         )
-        candidate_columns = ("segment", "transcript", "score", "audio", "selection")
+        candidate_columns = (
+            "segment",
+            "transcript",
+            "score",
+            "audio",
+            "selection",
+            "edit",
+        )
         self.candidate_tree = ttk.Treeview(
             right,
             columns=candidate_columns,
@@ -1303,6 +1796,7 @@ class DialogueReviewApp:
             "score": ("Score", 70, "center"),
             "audio": ("", 48, "center"),
             "selection": ("Selection", 90, "center"),
+            "edit": ("Copy/Edit", 80, "center"),
         }
         for column, (heading, width, anchor) in candidate_headings.items():
             self.candidate_tree.heading(column, text=heading)
@@ -1531,15 +2025,19 @@ class DialogueReviewApp:
             )
         self.candidate_description.configure(text=description)
 
-        candidates = (
-            self.review_data["unmatched_segments"]
-            if uses_unmatched
-            else line["candidates"]
-        )
+        candidates = self._displayed_candidates(line)
         if uses_unmatched:
+            manual_ids = {
+                str(candidate["segment_id"])
+                for candidate in line["candidates"]
+                if candidate.get("manual_edit")
+            }
             candidates = sorted(
                 candidates,
-                key=lambda candidate: str(candidate["segment_id"]).casefold(),
+                key=lambda candidate: (
+                    str(candidate["segment_id"]) not in manual_ids,
+                    str(candidate["segment_id"]).casefold(),
+                ),
             )
         else:
             candidates = sorted(
@@ -1571,6 +2069,7 @@ class DialogueReviewApp:
                     f"{float(candidate.get('score', 0.0)):.1f}",
                     "▶",
                     "Unselect" if is_selected else "Select",
+                    "\u2398 \u270e",
                 ),
                 tags=("selected",) if is_selected else (),
             )
@@ -1584,6 +2083,8 @@ class DialogueReviewApp:
             self.play_segment(segment_id)
         elif column == "#5":
             self.toggle_candidate(segment_id)
+        elif column == "#6":
+            self.copy_and_edit_candidate(segment_id)
 
     def _candidate_table_motion(self, event: tk.Event[Any]) -> None:
         segment_id = self.candidate_tree.identify_row(event.y)
@@ -1591,10 +2092,85 @@ class DialogueReviewApp:
         self.candidate_tree.configure(
             cursor=(
                 "hand2"
-                if segment_id and column in {"#4", "#5"}
+                if segment_id and column in {"#4", "#5", "#6"}
                 else ""
             )
         )
+
+    def _displayed_candidates(
+        self,
+        line: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        assert self.review_data is not None
+        if line["type"] == "nonverbal":
+            combined = [
+                *line["candidates"],
+                *self.review_data["unmatched_segments"],
+            ]
+            unique: dict[str, dict[str, Any]] = {}
+            for candidate in combined:
+                unique.setdefault(str(candidate["segment_id"]), candidate)
+            return list(unique.values())
+        if _uses_unmatched_candidates(line):
+            return list(self.review_data["unmatched_segments"])
+        return list(line["candidates"])
+
+    def copy_and_edit_candidate(self, segment_id: str) -> None:
+        assert self.project_dir is not None
+        assert self.project is not None
+        assert self.review_path is not None
+        assert self.review_data is not None
+        line = self._selected_line()
+        if line is None:
+            return
+        candidate = next(
+            (
+                item
+                for item in self._displayed_candidates(line)
+                if str(item["segment_id"]) == segment_id
+            ),
+            None,
+        )
+        if candidate is None:
+            return
+        try:
+            source = segment_edit_source(
+                project_dir=self.project_dir,
+                segment_id=segment_id,
+            )
+            segment = source["segment"]
+            self.player.stop()
+            dialog = SegmentEditorDialog(
+                parent=self.root,
+                player=self.player,
+                segment_id=segment_id,
+                audio_path=source["audio_path"],
+                sample_rate=int(source["sample_rate"]),
+                source_frames=int(source["source_frames"]),
+                start_sample=int(segment["start_sample"]),
+                end_sample=int(segment["end_sample"]),
+                save_callback=lambda start, end: save_edited_candidate(
+                    project_dir=self.project_dir,
+                    project=self.project,
+                    review_path=self.review_path,
+                    review_data=self.review_data,
+                    line_id=str(line["line_id"]),
+                    source_candidate=candidate,
+                    start_sample=start,
+                    end_sample=end,
+                ),
+            )
+            self.root.wait_window(dialog.window)
+        except Exception as error:
+            messagebox.showerror(
+                "Cannot edit segment",
+                str(error),
+                parent=self.root,
+            )
+            return
+        if dialog.saved:
+            self.render_lines()
+            self.render_candidates()
 
     def play_segment(self, segment_id: str) -> None:
         assert self.project_dir is not None

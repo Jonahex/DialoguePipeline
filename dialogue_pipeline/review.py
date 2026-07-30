@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import copy
 import re
 from pathlib import Path
 from typing import Any
 
+from .segmentation import materialize_manual_segment
 from .util import is_vocalization_script, read_json, resolve_project_path, write_json
 
 
@@ -382,6 +384,173 @@ def save_line_review(path: Path, data: dict[str, Any]) -> None:
     write_json(path, data)
 
 
+def segment_edit_source(
+    *,
+    project_dir: Path,
+    segment_id: str,
+) -> dict[str, Any]:
+    """Resolve a review segment to its full normalized source recording."""
+
+    manifest_path = project_dir / "segments_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(manifest_path)
+    manifest = read_json(manifest_path)
+    found: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for session in manifest.get("sessions", []):
+        for segment in [
+            *(session.get("segments") or []),
+            *(session.get("derived_segments") or []),
+        ]:
+            if str(segment.get("segment_id")) == segment_id:
+                found.append((session, segment))
+    if not found:
+        raise KeyError(f"Segment is not present in the manifest: {segment_id}")
+    if len(found) > 1:
+        raise ValueError(f"Duplicate segment ID in manifest: {segment_id}")
+
+    session, segment = found[0]
+    sample_rate = int(session["sample_rate"])
+    source_frames = int(session["source_frames"])
+    if sample_rate <= 0 or source_frames <= 0:
+        raise ValueError(f"Invalid source shape for segment: {segment_id}")
+    audio_path = resolve_project_path(
+        project_dir,
+        str(session.get("working_audio") or session["audio"]),
+    )
+    if not audio_path.is_file():
+        raise FileNotFoundError(audio_path)
+    return {
+        "manifest_path": manifest_path,
+        "manifest": manifest,
+        "session": session,
+        "segment": segment,
+        "audio_path": audio_path,
+        "sample_rate": sample_rate,
+        "source_frames": source_frames,
+    }
+
+
+def save_edited_candidate(
+    *,
+    project_dir: Path,
+    project: dict[str, Any],
+    review_path: Path,
+    review_data: dict[str, Any],
+    line_id: str,
+    source_candidate: dict[str, Any],
+    start_sample: int,
+    end_sample: int,
+) -> dict[str, Any]:
+    """Materialize edited audio and attach it to one review line."""
+
+    validate_line_review(review_data)
+    updated_review = copy.deepcopy(review_data)
+    line = next(
+        (
+            item
+            for item in updated_review["lines"]
+            if str(item["line_id"]) == line_id
+        ),
+        None,
+    )
+    if line is None:
+        raise KeyError(f"Review line is not present: {line_id}")
+
+    source_id = str(source_candidate["segment_id"])
+    edit_source = segment_edit_source(
+        project_dir=project_dir,
+        segment_id=source_id,
+    )
+    start_sample = int(start_sample)
+    end_sample = int(end_sample)
+    if not 0 <= start_sample < end_sample <= int(edit_source["source_frames"]):
+        raise ValueError(
+            f"Edited bounds {start_sample}..{end_sample} are outside the source."
+        )
+
+    transcript = str(
+        source_candidate.get("transcript")
+        or edit_source["segment"].get("transcript")
+        or ""
+    )
+    segment = materialize_manual_segment(
+        project_dir=project_dir,
+        project=project,
+        session_entry=edit_source["session"],
+        source_segment=edit_source["segment"],
+        line_id=line_id,
+        start_sample=start_sample,
+        end_sample=end_sample,
+        transcript=transcript,
+    )
+    score = float(
+        source_candidate.get(
+            "score",
+            source_candidate.get("technical_score", 0.0),
+        )
+    )
+    candidate = dict(source_candidate)
+    candidate.update(
+        {
+            "segment_id": str(segment["segment_id"]),
+            "segment_file": str(segment["file"]),
+            "session_id": str(segment["session_id"]),
+            "base_indices": list(segment.get("base_indices") or []),
+            "transcript": transcript,
+            "score": score,
+            "match_score": float(
+                source_candidate.get("match_score", score)
+            ),
+            "selection_score": float(
+                source_candidate.get("selection_score", score)
+            ),
+            "reliable": False,
+            "reliability_reason": "MANUALLY_EDITED_BOUNDARIES",
+            "source_audio": str(segment.get("source_audio") or ""),
+            "start_seconds": float(segment["start_seconds"]),
+            "end_seconds": float(segment["end_seconds"]),
+            "duration_seconds": (
+                float(segment["end_seconds"])
+                - float(segment["start_seconds"])
+            ),
+            "manual_edit": True,
+            "edited_from_segment_id": source_id,
+        }
+    )
+
+    existing = next(
+        (
+            item
+            for item in line["candidates"]
+            if str(item.get("segment_id")) == candidate["segment_id"]
+        ),
+        None,
+    )
+    if existing is None:
+        line["candidates"].append(candidate)
+    else:
+        existing.clear()
+        existing.update(candidate)
+        candidate = existing
+    line["candidates"].sort(
+        key=lambda item: float(item.get("score", 0.0)),
+        reverse=True,
+    )
+    for rank, item in enumerate(line["candidates"], start=1):
+        item["rank"] = rank
+    if not line.get("suggested_segment_id"):
+        line["suggested_segment_id"] = candidate["segment_id"]
+    if not line.get("selected_segment_id") and line["status"] == "MISSING":
+        line["status"] = "REVIEW"
+
+    validate_line_review(updated_review)
+    write_json(edit_source["manifest_path"], edit_source["manifest"])
+    save_line_review(review_path, updated_review)
+    review_data.clear()
+    review_data.update(updated_review)
+    return candidate
+
+
 def preserve_manual_selections(
     new_data: dict[str, Any],
     previous_data: dict[str, Any],
@@ -398,11 +567,40 @@ def preserve_manual_selections(
     new_lines = {line["line_id"]: line for line in new_data["lines"]}
 
     for previous_line in previous_data["lines"]:
+        new_line = new_lines.get(previous_line["line_id"])
+        if new_line is None:
+            continue
+        existing_candidate_ids = {
+            str(candidate["segment_id"])
+            for candidate in new_line["candidates"]
+        }
+        for candidate in previous_line["candidates"]:
+            if (
+                bool(candidate.get("manual_edit"))
+                and str(candidate["segment_id"]) not in existing_candidate_ids
+            ):
+                new_line["candidates"].append(candidate)
+                existing_candidate_ids.add(str(candidate["segment_id"]))
+        new_line["candidates"].sort(
+            key=lambda candidate: float(candidate.get("score", 0.0)),
+            reverse=True,
+        )
+        for rank, candidate in enumerate(new_line["candidates"], start=1):
+            candidate["rank"] = rank
+        if new_line["candidates"] and new_line["status"] == "MISSING":
+            new_line["status"] = "REVIEW"
+        if (
+            new_line["candidates"]
+            and not new_line.get("suggested_segment_id")
+        ):
+            new_line["suggested_segment_id"] = new_line["candidates"][0][
+                "segment_id"
+            ]
+
         if previous_line["status"] != "MANUALLY_REVIEWED":
             continue
         selected_id = previous_line.get("selected_segment_id")
-        new_line = new_lines.get(previous_line["line_id"])
-        if not selected_id or new_line is None:
+        if not selected_id:
             continue
         new_line["selected_segment_id"] = selected_id
         new_line["status"] = "MANUALLY_REVIEWED"

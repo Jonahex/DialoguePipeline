@@ -12,7 +12,13 @@ from .util import is_vocalization_script, read_json, resolve_project_path, write
 REVIEW_FILE_NAME = "line_review.json"
 REVIEW_SCHEMA_VERSION = 1
 LINE_TYPES = {"normal", "nonverbal"}
-LINE_STATUSES = {"AUTO_OK", "REVIEW", "MISSING", "MANUALLY_REVIEWED"}
+LINE_STATUSES = {
+    "AUTO_OK",
+    "REVIEW",
+    "MISSING",
+    "MANUALLY_REVIEWED",
+    "RETAKE",
+}
 REVIEW_CANDIDATE_SCORE_GAP = 12.0
 REVIEW_CANDIDATE_MAX_SCORE_DROP = 15.0
 STRUCTURALLY_INCOMPLETE_REASONS = {
@@ -368,6 +374,10 @@ def validate_line_review(data: Any) -> dict[str, Any]:
             raise ValueError(
                 f"Invalid status for {line_id}: {line['status']!r}"
             )
+        if line["status"] == "RETAKE" and line.get("selected_segment_id"):
+            raise ValueError(
+                f"Retake line {line_id} cannot have a selected segment"
+            )
         if not isinstance(line["candidates"], list):
             raise ValueError(f"Candidates for {line_id} must be a list")
     return data
@@ -597,6 +607,10 @@ def preserve_manual_selections(
                 "segment_id"
             ]
 
+        if previous_line["status"] == "RETAKE":
+            new_line["selected_segment_id"] = None
+            new_line["status"] = "RETAKE"
+            continue
         if previous_line["status"] != "MANUALLY_REVIEWED":
             continue
         selected_id = previous_line.get("selected_segment_id")

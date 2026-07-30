@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
 
 from dialogue_pipeline.alignment import (
     _apply_duplicate_line_policy,
@@ -54,6 +56,7 @@ from dialogue_pipeline.project import (
     infer_sessions,
     migrate_project_config,
 )
+from dialogue_pipeline.retakes import export_retake_script
 from dialogue_pipeline.review import (
     build_line_review,
     load_line_review,
@@ -4120,6 +4123,182 @@ def test_finalize_omits_unselected_lines(tmp_path: Path) -> None:
 
     assert result["export_count"] == 0
     assert result["error_count"] == 0
+
+
+def test_mark_for_retake_clears_selection_and_is_preserved(
+    tmp_path: Path,
+) -> None:
+    line = {
+        "line_id": "Sheet::R3",
+        "sheet": "Sheet",
+        "sheet_index": 0,
+        "excel_row": 3,
+        "line": "Record this again.",
+        "target_filename": "retake",
+    }
+    candidate = {
+        "segment_id": "session__s00001",
+        "segment_file": "segment.wav",
+        "session_id": "session",
+        "base_indices": [0],
+        "transcript": line["line"],
+        "match_score": 100.0,
+        "selection_score": 100.0,
+        "reliable": True,
+    }
+    review_path = tmp_path / "line_review.json"
+    review = build_line_review(
+        source_lines=[line],
+        candidates_by_line={line["line_id"]: [candidate]},
+        unmatched_segments=[],
+    )
+    save_line_review(review_path, review)
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    app.review_path = review_path
+    app.review_data = review
+    app.selected_line_id = line["line_id"]
+    app.render_lines = lambda: None
+    app.render_candidates = lambda: None
+
+    app.mark_for_retake()
+
+    saved = load_line_review(review_path)
+    assert saved["lines"][0]["status"] == "RETAKE"
+    assert saved["lines"][0]["selected_segment_id"] is None
+
+    regenerated = build_line_review(
+        source_lines=[line],
+        candidates_by_line={line["line_id"]: [candidate]},
+        unmatched_segments=[],
+    )
+    preserved = preserve_manual_selections(regenerated, saved)
+    assert preserved["lines"][0]["status"] == "RETAKE"
+    assert preserved["lines"][0]["selected_segment_id"] is None
+
+
+def test_retake_status_rejects_a_selected_candidate(tmp_path: Path) -> None:
+    line = {
+        "line_id": "Sheet::R3",
+        "sheet": "Sheet",
+        "sheet_index": 0,
+        "excel_row": 3,
+        "line": "Record this again.",
+        "target_filename": "retake",
+    }
+    review = build_line_review(
+        source_lines=[line],
+        candidates_by_line={},
+        unmatched_segments=[],
+    )
+    review["lines"][0]["status"] = "RETAKE"
+    review["lines"][0]["selected_segment_id"] = "not-allowed"
+
+    with pytest.raises(ValueError, match="cannot have a selected segment"):
+        save_line_review(tmp_path / "line_review.json", review)
+
+
+def test_export_retake_script_keeps_rows_on_their_original_formatted_sheets(
+    tmp_path: Path,
+) -> None:
+    workbook_path = tmp_path / "lines.xlsx"
+    workbook = Workbook()
+    first = workbook.active
+    first.title = "First"
+    second = workbook.create_sheet("Second")
+    third = workbook.create_sheet("Third")
+    headers = [
+        "Quest",
+        "Context",
+        "Line to Speak",
+        "Acting Note",
+        "Facial Emotion",
+        "Filename",
+    ]
+    for worksheet in (first, second, third):
+        worksheet.cell(1, 2).value = "You are voicing Actor"
+        for column, header in enumerate(headers, start=1):
+            worksheet.cell(2, column).value = header
+        worksheet.freeze_panes = "A3"
+        worksheet.column_dimensions["C"].width = 42
+    first.append(
+        ["Quest A", "Context A", "Keep this line.", "", "", "keep_a"]
+    )
+    first.append(
+        ["", "Context B", "Retake from first.", "Softer", "", "retake_a"]
+    )
+    second.append(
+        ["Quest B", "Context C", "Retake from second.", "", "Sad", "retake_b"]
+    )
+    third.append(
+        ["Quest C", "Context D", "Keep this too.", "", "", "keep_c"]
+    )
+    first["C4"].fill = PatternFill("solid", fgColor="FFF2CC")
+    second["C3"].fill = PatternFill("solid", fgColor="DDEBF7")
+    workbook.save(workbook_path)
+    workbook.close()
+
+    source_data = parse_workbook(workbook_path)
+    write_json(tmp_path / "source_lines.json", source_data)
+    review = build_line_review(
+        source_lines=source_data["lines"],
+        candidates_by_line={},
+        unmatched_segments=[],
+    )
+    retake_ids = {"First::R4", "Second::R3"}
+    for review_line in review["lines"]:
+        if review_line["line_id"] in retake_ids:
+            review_line["status"] = "RETAKE"
+    review_path = tmp_path / "line_review.json"
+    save_line_review(review_path, review)
+
+    output_path = tmp_path / "retakes.xlsx"
+    result = export_retake_script(
+        project_dir=tmp_path,
+        project={
+            "workbook": "lines.xlsx",
+            "source_lines": "source_lines.json",
+        },
+        review_path=review_path,
+        output_path=output_path,
+    )
+
+    assert result["export_count"] == 2
+    assert result["sheet_names"] == ["First", "Second"]
+    exported = load_workbook(output_path)
+    assert exported.sheetnames == ["First", "Second"]
+    first_export = exported["First"]
+    second_export = exported["Second"]
+    assert first_export.freeze_panes == "A3"
+    assert second_export.freeze_panes == "A3"
+    assert first_export.column_dimensions["C"].width == 42
+    assert second_export.column_dimensions["C"].width == 42
+    assert first_export["A3"].value == "Quest A"
+    assert first_export["C3"].value == "Retake from first."
+    assert first_export["F3"].value == "retake_a"
+    assert second_export["A3"].value == "Quest B"
+    assert second_export["C3"].value == "Retake from second."
+    assert second_export["F3"].value == "retake_b"
+    assert first_export["C3"].fill.fgColor.rgb == "00FFF2CC"
+    assert second_export["C3"].fill.fgColor.rgb == "00DDEBF7"
+    exported.close()
+
+    parsed_export = parse_workbook(output_path)
+    assert parsed_export["sheet_count"] == 2
+    assert [line["line"] for line in parsed_export["lines"]] == [
+        "Retake from first.",
+        "Retake from second.",
+    ]
+    with pytest.raises(ValueError, match="cannot replace the source workbook"):
+        export_retake_script(
+            project_dir=tmp_path,
+            project={
+                "workbook": "lines.xlsx",
+                "source_lines": "source_lines.json",
+            },
+            review_path=review_path,
+            output_path=workbook_path,
+            overwrite=True,
+        )
 
 
 def test_review_candidates_keep_primary_top_score_cluster() -> None:

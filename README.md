@@ -74,8 +74,12 @@ right mouse button and drag to move left or right through the surrounding
 audio. Drag the start and end markers, preview the current range, then save it
 as a new manual candidate for the selected line. Saving writes a sample-accurate
 WAV and records it in both `segments_manifest.json` and `line_review.json`;
-canceling leaves the project unchanged. `Finalize Selected Lines` copies every
-selected take to its target filename.
+canceling leaves the project unchanged. `Mark for retake` clears the line's
+selected candidate and changes its status to `RETAKE`. `Export retakes script`
+writes all lines with that status to their original worksheets, omitting sheets
+without retakes while preserving the original script's workbook type, columns,
+and row formatting. `Finalize Selected Lines` copies every selected take to its
+target filename.
 
 ## Commands
 
@@ -243,7 +247,9 @@ Outputs:
 Use the desktop app to audition and change selections. Normal lines are
 `AUTO_OK`, `REVIEW`, or `MISSING` after alignment. Selecting a candidate changes
 the status to `MANUALLY_REVIEWED`; unselecting it changes the status to
-`REVIEW`, or back to `MISSING` when no alignment candidate exists.
+`REVIEW`, or back to `MISSING` when no alignment candidate exists. A line
+marked `RETAKE` cannot have a selected candidate, and that mark survives later
+alignment runs.
 
 The review candidate list is intentionally narrower than the diagnostic
 candidate set in `alignment.json`. It removes

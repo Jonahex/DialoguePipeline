@@ -30,6 +30,7 @@ from .project import (
     editable_project_settings,
     load_project,
 )
+from .retakes import export_retake_script
 from .review import (
     LINE_STATUSES,
     REVIEW_FILE_NAME,
@@ -59,6 +60,7 @@ STATUS_COLORS = {
     "REVIEW": "#fef3c7",
     "MISSING": "#fee2e2",
     "MANUALLY_REVIEWED": "#dbeafe",
+    "RETAKE": "#fce7f3",
 }
 
 
@@ -67,7 +69,7 @@ def _uses_unmatched_candidates(line: dict[str, Any]) -> bool:
         line["type"] == "nonverbal"
         or (
             not line.get("candidates")
-            and line["status"] in {"MISSING", "MANUALLY_REVIEWED"}
+            and line["status"] in {"MISSING", "MANUALLY_REVIEWED", "RETAKE"}
         )
     )
 
@@ -1788,6 +1790,11 @@ class DialogueReviewApp:
             style="Primary.TButton",
             command=self.finalize,
         ).pack(side="right")
+        ttk.Button(
+            toolbar,
+            text="Export retakes script",
+            command=self.export_retakes,
+        ).pack(side="right", padx=(0, 8))
 
         controls = ttk.Frame(self.root, padding=(16, 0, 16, 10))
         controls.pack(fill="x")
@@ -1924,6 +1931,19 @@ class DialogueReviewApp:
             columnspan=2,
             sticky="ew",
         )
+        candidate_actions = ttk.Frame(right, padding=(4, 0, 4, 8))
+        candidate_actions.grid(
+            row=2,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+        )
+        self.mark_retake_button = ttk.Button(
+            candidate_actions,
+            text="Mark for retake",
+            command=self.mark_for_retake,
+        )
+        self.mark_retake_button.pack(side="left")
         candidate_columns = (
             "segment",
             "transcript",
@@ -1970,12 +1990,12 @@ class DialogueReviewApp:
             yscrollcommand=self.candidate_vertical_scrollbar.set,
             xscrollcommand=self.candidate_horizontal_scrollbar.set,
         )
-        right.grid_rowconfigure(2, weight=1)
+        right.grid_rowconfigure(3, weight=1)
         right.grid_columnconfigure(0, weight=1)
-        self.candidate_tree.grid(row=2, column=0, sticky="nsew")
-        self.candidate_vertical_scrollbar.grid(row=2, column=1, sticky="ns")
+        self.candidate_tree.grid(row=3, column=0, sticky="nsew")
+        self.candidate_vertical_scrollbar.grid(row=3, column=1, sticky="ns")
         self.candidate_horizontal_scrollbar.grid(
-            row=3,
+            row=4,
             column=0,
             sticky="ew",
         )
@@ -2147,6 +2167,7 @@ class DialogueReviewApp:
             self.candidate_tree.delete(*children)
         line = self._selected_line()
         if line is None:
+            self.mark_retake_button.configure(state="disabled")
             self.selected_context_label.configure(text="—")
             self.selected_line_label.configure(text="—")
             self.selected_acting_note_label.configure(text="—")
@@ -2155,21 +2176,32 @@ class DialogueReviewApp:
             )
             return
 
+        self.mark_retake_button.configure(
+            state=("disabled" if line["status"] == "RETAKE" else "normal")
+        )
         self.selected_context_label.configure(text=line.get("context") or "—")
         self.selected_line_label.configure(text=line["line_text"] or "—")
         self.selected_acting_note_label.configure(
             text=line.get("acting_note") or "—"
         )
         uses_unmatched = _uses_unmatched_candidates(line)
-        description = ""
+        description = (
+            "This line is marked for retake. Selecting a candidate will remove "
+            "the retake status."
+            if line["status"] == "RETAKE"
+            else ""
+        )
         if uses_unmatched:
-            description = (
+            unmatched_description = (
                 "Unmatched audible segments are shown for nonverbal lines."
                 if line["type"] == "nonverbal"
                 else (
                     "No alignment candidate was found; all unmatched audible "
                     "segments are shown."
                 )
+            )
+            description = "\n".join(
+                value for value in (description, unmatched_description) if value
             )
         self.candidate_description.configure(text=description)
 
@@ -2352,6 +2384,74 @@ class DialogueReviewApp:
         save_line_review(self.review_path, self.review_data)
         self.render_lines()
         self.render_candidates()
+
+    def mark_for_retake(self) -> None:
+        assert self.review_path is not None
+        assert self.review_data is not None
+        line = self._selected_line()
+        if line is None:
+            return
+        line["selected_segment_id"] = None
+        line["status"] = "RETAKE"
+        save_line_review(self.review_path, self.review_data)
+        self.render_lines()
+        self.render_candidates()
+
+    def export_retakes(self) -> None:
+        assert self.project_dir is not None
+        assert self.project is not None
+        assert self.review_path is not None
+        assert self.review_data is not None
+        retake_count = sum(
+            line["status"] == "RETAKE" for line in self.review_data["lines"]
+        )
+        if not retake_count:
+            messagebox.showwarning(
+                "No retakes",
+                "No lines are marked for retake.",
+                parent=self.root,
+            )
+            return
+
+        source_name = Path(str(self.project["workbook"])).name
+        source_suffix = Path(source_name).suffix.lower()
+        output = filedialog.asksaveasfilename(
+            title="Export retakes script",
+            initialdir=str(self.project_dir),
+            initialfile=(
+                f"{Path(source_name).stem}_retakes{source_suffix}"
+            ),
+            defaultextension=source_suffix,
+            filetypes=[
+                ("Excel workbook", f"*{source_suffix}"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not output:
+            return
+        try:
+            result = export_retake_script(
+                project_dir=self.project_dir,
+                project=self.project,
+                review_path=self.review_path,
+                output_path=Path(output),
+                overwrite=True,
+            )
+        except Exception as error:
+            messagebox.showerror(
+                "Retake export failed",
+                str(error),
+                parent=self.root,
+            )
+            return
+        messagebox.showinfo(
+            "Retake export complete",
+            (
+                f"Exported {result['export_count']} retake line(s) to:\n"
+                f"{result['output_path']}"
+            ),
+            parent=self.root,
+        )
 
     def finalize(self) -> None:
         assert self.project_dir is not None

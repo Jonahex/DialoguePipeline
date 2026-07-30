@@ -81,6 +81,8 @@ from dialogue_pipeline.transcription import (
 )
 from dialogue_pipeline.ui import (
     DialogueReviewApp,
+    _initial_segment_window,
+    _panned_sample_window,
     _project_settings_from_values,
     _selected_segment_score,
     _uses_unmatched_candidates,
@@ -4314,6 +4316,48 @@ def test_waveform_scroll_zoom_is_cursor_centered_and_keeps_markers_visible() -> 
         sample_rate=1000,
     )
     assert zoomed_out == (0, 120000)
+
+
+def test_waveform_opens_close_and_right_drag_pans_the_timeline() -> None:
+    initial = _initial_segment_window(
+        context_start=0,
+        context_end=120000,
+        selection_start=50000,
+        selection_end=70000,
+        sample_rate=1000,
+    )
+    assert initial == (46500, 73500)
+    assert 0.70 < 20000 / (initial[1] - initial[0]) < 0.80
+
+    dragged_right = _panned_sample_window(
+        view_start=initial[0],
+        view_end=initial[1],
+        context_start=0,
+        context_end=120000,
+        drag_pixels=100,
+        canvas_width=1000,
+    )
+    assert dragged_right == (43800, 70800)
+
+    dragged_left = _panned_sample_window(
+        view_start=initial[0],
+        view_end=initial[1],
+        context_start=0,
+        context_end=120000,
+        drag_pixels=-100,
+        canvas_width=1000,
+    )
+    assert dragged_left == (49200, 76200)
+
+    clamped = _panned_sample_window(
+        view_start=initial[0],
+        view_end=initial[1],
+        context_start=0,
+        context_end=120000,
+        drag_pixels=100000,
+        canvas_width=1000,
+    )
+    assert clamped == (0, 27000)
 
 
 def test_copy_edit_materializes_segment_and_persists_manual_candidate(

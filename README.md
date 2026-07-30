@@ -68,12 +68,14 @@ wheel scrolling. Nonverbal lines use the
 name-sorted shared pool of audible segments that are not retained candidates
 for any normal dialogue line. Each candidate also has a copy/edit control. It
 opens a waveform view with 30 seconds of source context on either side of the
-take. Use the mouse wheel over the waveform to zoom the time scale around the
-pointer, drag the start and end markers, preview the current range, then save
-it as a new manual candidate for the selected line. Saving writes a
-sample-accurate WAV and records it in both `segments_manifest.json` and
-`line_review.json`; canceling leaves the project unchanged. `Finalize Selected
-Lines` copies every selected take to its target filename.
+take and initially zooms so the segment fills most of the graph. Use the mouse
+wheel over the waveform to zoom the time scale around the pointer, or hold the
+right mouse button and drag to move left or right through the surrounding
+audio. Drag the start and end markers, preview the current range, then save it
+as a new manual candidate for the selected line. Saving writes a sample-accurate
+WAV and records it in both `segments_manifest.json` and `line_review.json`;
+canceling leaves the project unchanged. `Finalize Selected Lines` copies every
+selected take to its target filename.
 
 ## Commands
 

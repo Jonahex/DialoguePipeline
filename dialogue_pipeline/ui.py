@@ -151,6 +151,8 @@ def _zoomed_sample_window(
     anchor_sample: int,
     zoom_factor: float,
     sample_rate: int,
+    maximum_span: int | None = None,
+    keep_selection_visible: bool = True,
 ) -> tuple[int, int]:
     """Scale a waveform window around a sample while retaining both markers."""
 
@@ -162,17 +164,26 @@ def _zoomed_sample_window(
     if zoom_factor <= 0.0:
         raise ValueError("Waveform zoom factor must be positive.")
 
+    maximum_span = (
+        context_span
+        if maximum_span is None
+        else max(1, min(context_span, int(maximum_span)))
+    )
     marker_margin = max(1, int(round(sample_rate * 0.05)))
     minimum_span = min(
-        context_span,
+        maximum_span,
         max(
             int(round(sample_rate * 0.25)),
-            selection_span + marker_margin * 2,
+            (
+                selection_span + marker_margin * 2
+                if keep_selection_visible
+                else 0
+            ),
         ),
     )
     target_span = max(
         minimum_span,
-        min(context_span, int(round(view_span * zoom_factor))),
+        min(maximum_span, int(round(view_span * zoom_factor))),
     )
     if target_span == view_span:
         return view_start, view_end
@@ -182,14 +193,15 @@ def _zoomed_sample_window(
     new_start = int(round(anchor_sample - anchor_fraction * target_span))
     new_end = new_start + target_span
 
-    required_start = selection_start - marker_margin
-    required_end = selection_end + marker_margin
-    if new_start > required_start:
-        new_start = required_start
-        new_end = new_start + target_span
-    if new_end < required_end:
-        new_end = required_end
-        new_start = new_end - target_span
+    if keep_selection_visible:
+        required_start = selection_start - marker_margin
+        required_end = selection_end + marker_margin
+        if new_start > required_start:
+            new_start = required_start
+            new_end = new_start + target_span
+        if new_end < required_end:
+            new_end = required_end
+            new_start = new_end - target_span
 
     if new_start < context_start:
         new_start = context_start
@@ -198,6 +210,65 @@ def _zoomed_sample_window(
         new_end = context_end
         new_start = new_end - target_span
     return int(new_start), int(new_end)
+
+
+def _initial_segment_window(
+    *,
+    context_start: int,
+    context_end: int,
+    selection_start: int,
+    selection_end: int,
+    sample_rate: int,
+) -> tuple[int, int]:
+    """Frame a segment prominently while retaining a little editing context."""
+
+    context_span = context_end - context_start
+    selection_span = selection_end - selection_start
+    if context_span <= 0 or selection_span <= 0:
+        raise ValueError("Editor intervals must have positive durations.")
+    if not context_start <= selection_start < selection_end <= context_end:
+        raise ValueError("The segment must be inside its editing context.")
+    marker_margin = max(1, int(round(sample_rate * 0.05)))
+    target_span = min(
+        context_span,
+        max(
+            int(round(selection_span * 1.35)),
+            selection_span + marker_margin * 2,
+        ),
+    )
+    return _zoomed_sample_window(
+        view_start=context_start,
+        view_end=context_end,
+        context_start=context_start,
+        context_end=context_end,
+        selection_start=selection_start,
+        selection_end=selection_end,
+        anchor_sample=(selection_start + selection_end) // 2,
+        zoom_factor=target_span / context_span,
+        sample_rate=sample_rate,
+    )
+
+
+def _panned_sample_window(
+    *,
+    view_start: int,
+    view_end: int,
+    context_start: int,
+    context_end: int,
+    drag_pixels: float,
+    canvas_width: int,
+) -> tuple[int, int]:
+    """Move a fixed-width view as though the waveform were grabbed and dragged."""
+
+    view_span = view_end - view_start
+    context_span = context_end - context_start
+    if view_span <= 0 or context_span < view_span or canvas_width <= 0:
+        raise ValueError("Invalid waveform pan dimensions.")
+    sample_delta = int(round(-drag_pixels * view_span / canvas_width))
+    new_start = view_start + sample_delta
+    maximum_start = context_end - view_span
+    new_start = max(context_start, min(new_start, maximum_start))
+    return new_start, new_start + view_span
 
 
 class SegmentEditorDialog:
@@ -229,11 +300,20 @@ class SegmentEditorDialog:
         context_frames = int(round(self.CONTEXT_SECONDS * sample_rate))
         self.context_start = max(0, start_sample - context_frames)
         self.context_end = min(source_frames, end_sample + context_frames)
-        self.view_start = self.context_start
-        self.view_end = self.context_end
+        self.view_start, self.view_end = _initial_segment_window(
+            context_start=self.context_start,
+            context_end=self.context_end,
+            selection_start=start_sample,
+            selection_end=end_sample,
+            sample_rate=sample_rate,
+        )
         self._envelope_min, self._envelope_max = self._read_waveform()
         self._drag_boundary: str | None = None
         self._drag_changed = False
+        self._pan_start_x: int | None = None
+        self._pan_view_start = self.view_start
+        self._pan_view_end = self.view_end
+        self._pan_render_after_id: str | None = None
         self._playback_active = False
         self._playback_after_id: str | None = None
         self._temporary_dir = tempfile.TemporaryDirectory(
@@ -254,7 +334,7 @@ class SegmentEditorDialog:
             outer,
             text=(
                 "Drag the green start line and red end line to set the copy. "
-                "Use the mouse wheel over the waveform to zoom the time scale."
+                "Mouse wheel: zoom. Right-drag: move along the timeline."
             ),
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(0, 8))
@@ -270,6 +350,9 @@ class SegmentEditorDialog:
         self.canvas.bind("<Button-1>", self._drag_started)
         self.canvas.bind("<B1-Motion>", self._drag_moved)
         self.canvas.bind("<ButtonRelease-1>", self._drag_finished)
+        self.canvas.bind("<Button-3>", self._pan_started)
+        self.canvas.bind("<B3-Motion>", self._pan_moved)
+        self.canvas.bind("<ButtonRelease-3>", self._pan_finished)
         self.canvas.bind("<Motion>", self._canvas_motion)
         self.canvas.bind("<MouseWheel>", self._mouse_wheel)
         self.canvas.bind("<Button-4>", self._mouse_wheel_up)
@@ -372,6 +455,11 @@ class SegmentEditorDialog:
         return "break"
 
     def _change_time_scale(self, x: float, zoom_factor: float) -> None:
+        self._cancel_pan_refresh()
+        markers_visible = (
+            self.view_start <= self.start_sample
+            and self.end_sample <= self.view_end
+        )
         new_start, new_end = _zoomed_sample_window(
             view_start=self.view_start,
             view_end=self.view_end,
@@ -382,11 +470,67 @@ class SegmentEditorDialog:
             anchor_sample=self._x_to_sample(x),
             zoom_factor=zoom_factor,
             sample_rate=self.sample_rate,
+            keep_selection_visible=markers_visible,
         )
         if (new_start, new_end) == (self.view_start, self.view_end):
             return
         self.view_start = new_start
         self.view_end = new_end
+        self._envelope_min, self._envelope_max = self._read_waveform()
+        self._update_bounds_text()
+        self._redraw()
+
+    def _pan_started(self, event: tk.Event[Any]) -> str:
+        self._pan_start_x = event.x
+        self._pan_view_start = self.view_start
+        self._pan_view_end = self.view_end
+        self.canvas.configure(cursor="fleur")
+        return "break"
+
+    def _pan_moved(self, event: tk.Event[Any]) -> str:
+        if self._pan_start_x is None:
+            return "break"
+        width = max(1, self.canvas.winfo_width())
+        new_start, new_end = _panned_sample_window(
+            view_start=self._pan_view_start,
+            view_end=self._pan_view_end,
+            context_start=self.context_start,
+            context_end=self.context_end,
+            drag_pixels=event.x - self._pan_start_x,
+            canvas_width=width,
+        )
+        if (new_start, new_end) != (self.view_start, self.view_end):
+            self.view_start = new_start
+            self.view_end = new_end
+            self._schedule_pan_refresh()
+        return "break"
+
+    def _pan_finished(self, event: tk.Event[Any]) -> str:
+        if self._pan_start_x is None:
+            return "break"
+        self._pan_moved(event)
+        self._pan_start_x = None
+        self._cancel_pan_refresh()
+        self._refresh_waveform()
+        self._canvas_motion(event)
+        return "break"
+
+    def _schedule_pan_refresh(self) -> None:
+        if self._pan_render_after_id is None:
+            self._pan_render_after_id = self.window.after(
+                50,
+                self._refresh_waveform,
+            )
+
+    def _cancel_pan_refresh(self) -> None:
+        if self._pan_render_after_id is not None:
+            self.window.after_cancel(self._pan_render_after_id)
+            self._pan_render_after_id = None
+
+    def _refresh_waveform(self) -> None:
+        self._pan_render_after_id = None
+        if not self.window.winfo_exists():
+            return
         self._envelope_min, self._envelope_max = self._read_waveform()
         self._update_bounds_text()
         self._redraw()
@@ -522,6 +666,9 @@ class SegmentEditorDialog:
             self._play_current()
 
     def _canvas_motion(self, event: tk.Event[Any]) -> None:
+        if self._pan_start_x is not None:
+            self.canvas.configure(cursor="fleur")
+            return
         self.canvas.configure(
             cursor="sb_h_double_arrow"
             if self._nearest_boundary(event.x)
@@ -601,6 +748,7 @@ class SegmentEditorDialog:
         self._close()
 
     def _close(self) -> None:
+        self._cancel_pan_refresh()
         self._cancel_playback_timer()
         self._playback_active = False
         self.player.stop()

@@ -32,6 +32,7 @@ from .project import (
 )
 from .retakes import export_retake_script
 from .review import (
+    delete_edited_candidate,
     LINE_STATUSES,
     REVIEW_FILE_NAME,
     load_line_review,
@@ -39,6 +40,7 @@ from .review import (
     save_edited_candidate,
     segment_edit_source,
     segment_file_for_id,
+    transcribe_edited_candidate,
 )
 from .segmentation import refresh_project_audio, segment_project
 from .transcription import transcribe_project, transcribe_segments_project
@@ -88,6 +90,45 @@ def _selected_segment_score(
         if candidate["segment_id"] == selected_id:
             return float(candidate.get("score", 0.0))
     return None
+
+
+def _selected_line_ids_by_segment(
+    review_data: dict[str, Any],
+) -> dict[str, list[str]]:
+    selected: dict[str, list[str]] = {}
+    for line in review_data["lines"]:
+        segment_id = line.get("selected_segment_id")
+        if segment_id:
+            selected.setdefault(str(segment_id), []).append(str(line["line_id"]))
+    return selected
+
+
+def _candidate_selection_display(
+    *,
+    line: dict[str, Any],
+    segment_id: str,
+    selected_line_ids: dict[str, list[str]],
+) -> tuple[str, tuple[str, ...]]:
+    is_selected = str(line.get("selected_segment_id") or "") == segment_id
+    other_selection_count = len(
+        [
+            selected_line_id
+            for selected_line_id in selected_line_ids.get(segment_id, [])
+            if selected_line_id != str(line["line_id"])
+        ]
+    )
+    if is_selected:
+        return (
+            (
+                f"Unselect (+{other_selection_count})"
+                if other_selection_count
+                else "Unselect"
+            ),
+            ("selected",),
+        )
+    if line["type"] == "nonverbal" and other_selection_count:
+        return f"In use ({other_selection_count})", ("selected_elsewhere",)
+    return "Select", ()
 
 
 class AudioPlayer:
@@ -1270,6 +1311,7 @@ class DialogueReviewApp:
         self._cancel_button: ttk.Button | None = None
         self._cancel_status: tk.StringVar | None = None
         self._worker_thread: threading.Thread | None = None
+        self._candidate_transcription_runtime: dict[str, Any] = {}
 
         self._configure_styles()
         self.show_start()
@@ -1951,6 +1993,8 @@ class DialogueReviewApp:
             "audio",
             "selection",
             "edit",
+            "transcribe",
+            "delete",
         )
         self.candidate_tree = ttk.Treeview(
             right,
@@ -1965,6 +2009,8 @@ class DialogueReviewApp:
             "audio": ("", 48, "center"),
             "selection": ("Selection", 90, "center"),
             "edit": ("Copy/Edit", 80, "center"),
+            "transcribe": ("Transcribe", 90, "center"),
+            "delete": ("Delete", 65, "center"),
         }
         for column, (heading, width, anchor) in candidate_headings.items():
             self.candidate_tree.heading(column, text=heading)
@@ -1976,6 +2022,7 @@ class DialogueReviewApp:
                 anchor=anchor,
             )
         self.candidate_tree.tag_configure("selected", background="#bbf7d0")
+        self.candidate_tree.tag_configure("selected_elsewhere", background="#fde68a")
         self.candidate_vertical_scrollbar = ttk.Scrollbar(
             right,
             orient="vertical",
@@ -2193,7 +2240,8 @@ class DialogueReviewApp:
         )
         if uses_unmatched:
             unmatched_description = (
-                "Unmatched audible segments are shown for nonverbal lines."
+                "Unmatched audible segments are shown for nonverbal lines. "
+                "Amber candidates are already selected for another line."
                 if line["type"] == "nonverbal"
                 else (
                     "No alignment candidate was found; all unmatched audible "
@@ -2234,11 +2282,30 @@ class DialogueReviewApp:
             )
             return
 
-        selected_id = line.get("selected_segment_id")
+        selected_line_ids = _selected_line_ids_by_segment(self.review_data)
         for candidate in candidates:
-            is_selected = candidate["segment_id"] == selected_id
-            transcript = str(candidate.get("transcript") or "[No transcript]")
+            is_manual_edit = bool(candidate.get("manual_edit"))
+            has_custom_asr = (
+                str(candidate.get("transcript_source") or "")
+                == "candidate_asr_manual_copy_edit"
+            )
+            transcript = str(candidate.get("transcript") or "").strip()
+            if not transcript:
+                transcript = (
+                    (
+                        "[Transcribed - no speech recognized]"
+                        if has_custom_asr
+                        else "[Custom segment - not transcribed]"
+                    )
+                    if is_manual_edit
+                    else "[No transcript]"
+                )
             segment_id = str(candidate["segment_id"])
+            selection_text, tags = _candidate_selection_display(
+                line=line,
+                segment_id=segment_id,
+                selected_line_ids=selected_line_ids,
+            )
             self.candidate_tree.insert(
                 "",
                 "end",
@@ -2248,10 +2315,16 @@ class DialogueReviewApp:
                     transcript,
                     f"{float(candidate.get('score', 0.0)):.1f}",
                     "▶",
-                    "Unselect" if is_selected else "Select",
+                    selection_text,
                     "\u2398 \u270e",
+                    (
+                        "Retranscribe"
+                        if is_manual_edit and has_custom_asr
+                        else ("Transcribe" if is_manual_edit else "")
+                    ),
+                    "Delete" if is_manual_edit else "",
                 ),
-                tags=("selected",) if is_selected else (),
+                tags=tags,
             )
 
     def _candidate_table_clicked(self, event: tk.Event[Any]) -> None:
@@ -2265,14 +2338,26 @@ class DialogueReviewApp:
             self.toggle_candidate(segment_id)
         elif column == "#6":
             self.copy_and_edit_candidate(segment_id)
+        elif column == "#7" and self.candidate_tree.set(segment_id, "transcribe"):
+            self.transcribe_custom_candidate(segment_id)
+        elif column == "#8" and self.candidate_tree.set(segment_id, "delete"):
+            self.delete_custom_candidate(segment_id)
 
     def _candidate_table_motion(self, event: tk.Event[Any]) -> None:
         segment_id = self.candidate_tree.identify_row(event.y)
         column = self.candidate_tree.identify_column(event.x)
+        manual_action = bool(
+            segment_id
+            and column in {"#7", "#8"}
+            and self.candidate_tree.set(
+                segment_id,
+                "transcribe" if column == "#7" else "delete",
+            )
+        )
         self.candidate_tree.configure(
             cursor=(
                 "hand2"
-                if segment_id and column in {"#4", "#5", "#6"}
+                if segment_id and (column in {"#4", "#5", "#6"} or manual_action)
                 else ""
             )
         )
@@ -2351,6 +2436,70 @@ class DialogueReviewApp:
         if dialog.saved:
             self.render_lines()
             self.render_candidates()
+
+    def transcribe_custom_candidate(self, segment_id: str) -> None:
+        assert self.project_dir is not None
+        assert self.project is not None
+        assert self.review_path is not None
+        assert self.review_data is not None
+        self.candidate_description.configure(
+            text="Transcribing the custom segment..."
+        )
+        self.root.configure(cursor="wait")
+        self.root.update_idletasks()
+        try:
+            transcribe_edited_candidate(
+                project_dir=self.project_dir,
+                project=self.project,
+                review_path=self.review_path,
+                review_data=self.review_data,
+                segment_id=segment_id,
+                transcription_runtime=self._candidate_transcription_runtime,
+            )
+        except Exception as error:
+            messagebox.showerror(
+                "Cannot transcribe custom segment",
+                str(error),
+                parent=self.root,
+            )
+        finally:
+            self.root.configure(cursor="")
+            self.render_lines()
+            self.render_candidates()
+
+    def delete_custom_candidate(self, segment_id: str) -> None:
+        assert self.project_dir is not None
+        assert self.review_path is not None
+        assert self.review_data is not None
+        if not messagebox.askyesno(
+            "Delete custom segment",
+            "Permanently delete this copy-and-edit segment?",
+            parent=self.root,
+        ):
+            return
+        try:
+            self.player.stop()
+            result = delete_edited_candidate(
+                project_dir=self.project_dir,
+                review_path=self.review_path,
+                review_data=self.review_data,
+                segment_id=segment_id,
+            )
+        except Exception as error:
+            messagebox.showerror(
+                "Cannot delete custom segment",
+                str(error),
+                parent=self.root,
+            )
+            return
+        self.render_lines()
+        self.render_candidates()
+        if result["warnings"]:
+            messagebox.showwarning(
+                "Custom segment removed with warnings",
+                "\n".join(result["warnings"]),
+                parent=self.root,
+            )
 
     def play_segment(self, segment_id: str) -> None:
         assert self.project_dir is not None

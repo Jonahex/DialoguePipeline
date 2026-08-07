@@ -66,14 +66,19 @@ text, and acting note are shown above the candidate table. Both tables have
 permanently allocated vertical and horizontal scrollbars in addition to mouse
 wheel scrolling. Nonverbal lines use the
 name-sorted shared pool of audible segments that are not retained candidates
-for any normal dialogue line. Each candidate also has a copy/edit control. It
+for any normal dialogue line. A shared candidate that is already selected for
+another line is marked in amber in the candidate table. Each candidate also
+has a copy/edit control. It
 opens a waveform view with 30 seconds of source context on either side of the
 take and initially zooms so the segment fills most of the graph. Use the mouse
 wheel over the waveform to zoom the time scale around the pointer, or hold the
 right mouse button and drag to move left or right through the surrounding
 audio. Drag the start and end markers, preview the current range, then save it
 as a new manual candidate for the selected line. Saving writes a sample-accurate
-WAV and records it in both `segments_manifest.json` and `line_review.json`;
+WAV immediately and records it in both `segments_manifest.json` and
+`line_review.json`. New custom segments are marked as untranscribed; use their
+`Transcribe` control to generate an exact-span transcript only when needed.
+Their `Delete` control removes the custom candidate and generated WAV;
 canceling leaves the project unchanged. `Mark for retake` clears the line's
 selected candidate and changes its status to `RETAKE`. `Export retakes script`
 writes all lines with that status to their original worksheets, omitting sheets

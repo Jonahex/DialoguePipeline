@@ -59,12 +59,14 @@ from dialogue_pipeline.project import (
 from dialogue_pipeline.retakes import export_retake_script
 from dialogue_pipeline.review import (
     build_line_review,
+    delete_edited_candidate,
     load_line_review,
     preserve_manual_selections,
     prune_line_candidates,
     save_edited_candidate,
     save_line_review,
     segment_edit_source,
+    transcribe_edited_candidate,
 )
 from dialogue_pipeline.segmentation import (
     materialize_trimmed_segment,
@@ -84,10 +86,12 @@ from dialogue_pipeline.transcription import (
 )
 from dialogue_pipeline.ui import (
     DialogueReviewApp,
+    _candidate_selection_display,
     _initial_segment_window,
     _panned_sample_window,
     _project_settings_from_values,
     _selected_segment_score,
+    _selected_line_ids_by_segment,
     _uses_unmatched_candidates,
     _zoomed_sample_window,
 )
@@ -4094,6 +4098,41 @@ def test_line_review_types_nonverbal_lines_and_uses_audible_unmatched_pool(
     ] == ["audible"]
 
 
+def test_selected_line_ids_mark_shared_nonverbal_candidates() -> None:
+    review_data = {
+        "lines": [
+            {
+                "line_id": "Sheet::R3",
+                "selected_segment_id": "shared-segment",
+            },
+            {
+                "line_id": "Sheet::R4",
+                "selected_segment_id": None,
+            },
+            {
+                "line_id": "Sheet::R5",
+                "selected_segment_id": "shared-segment",
+            },
+        ]
+    }
+
+    selected_line_ids = _selected_line_ids_by_segment(review_data)
+    assert selected_line_ids == {
+        "shared-segment": ["Sheet::R3", "Sheet::R5"]
+    }
+    selection_text, tags = _candidate_selection_display(
+        line={
+            "line_id": "Sheet::R4",
+            "type": "nonverbal",
+            "selected_segment_id": None,
+        },
+        segment_id="shared-segment",
+        selected_line_ids=selected_line_ids,
+    )
+    assert selection_text == "In use (2)"
+    assert tags == ("selected_elsewhere",)
+
+
 def test_finalize_omits_unselected_lines(tmp_path: Path) -> None:
     line = {
         "line_id": "Sheet::R3",
@@ -4539,9 +4578,28 @@ def test_waveform_opens_close_and_right_drag_pans_the_timeline() -> None:
     assert clamped == (0, 27000)
 
 
-def test_copy_edit_materializes_segment_and_persists_manual_candidate(
+def test_copy_edit_saves_quickly_then_can_transcribe_and_delete_manual_candidate(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import dialogue_pipeline.review as review_module
+
+    transcription_calls = []
+
+    def fake_transcribe_candidate_span(**kwargs: Any) -> dict[str, Any]:
+        transcription_calls.append(kwargs)
+        return {
+            "transcript": "New exact edited transcript.",
+            "word_count": 4,
+            "words": [{"word": "New", "start": 0.1, "end": 0.3}],
+            "asr_probability": 0.88,
+        }
+
+    monkeypatch.setattr(
+        review_module,
+        "transcribe_candidate_span",
+        fake_transcribe_candidate_span,
+    )
     sample_rate = 48000
     source_path = tmp_path / "source.wav"
     _write_tone(source_path, duration_seconds=4.0)
@@ -4646,6 +4704,10 @@ def test_copy_edit_materializes_segment_and_persists_manual_candidate(
     assert edited["reliable"] is False
     assert edited["reliability_reason"] == "MANUALLY_EDITED_BOUNDARIES"
     assert edited["duration_seconds"] == pytest.approx(2.0)
+    assert edited["transcript"] == ""
+    assert edited["transcript_source"] == "manual_copy_edit_untranscribed"
+    assert edited["asr_probability"] is None
+    assert transcription_calls == []
     with wave.open(str(tmp_path / edited["segment_file"]), "rb") as reader:
         assert reader.getnframes() == sample_rate * 2
 
@@ -4655,6 +4717,9 @@ def test_copy_edit_materializes_segment_and_persists_manual_candidate(
     assert derived[0]["kind"] == "manual_edit"
     assert derived[0]["edited_from_segment_id"] == source_segment["segment_id"]
     assert derived[0]["manual_line_ids"] == [line["line_id"]]
+    assert derived[0]["transcript"] == ""
+    assert derived[0]["transcript_source"] == "manual_copy_edit_untranscribed"
+    assert derived[0]["asr_probability"] is None
     assert derived[0]["start_sample"] == sample_rate // 2
     assert derived[0]["end_sample"] == sample_rate * 5 // 2
 
@@ -4681,6 +4746,33 @@ def test_copy_edit_materializes_segment_and_persists_manual_candidate(
         ]
     ) == 1
     assert len(load_line_review(review_path)["lines"][0]["candidates"]) == 2
+    assert transcription_calls == []
+
+    transcribed = transcribe_edited_candidate(
+        project_dir=tmp_path,
+        project={"segmentation": {"fade_ms": 0.0}},
+        review_path=review_path,
+        review_data=review,
+        segment_id=edited["segment_id"],
+    )
+    assert transcribed["transcript"] == "New exact edited transcript."
+    assert transcribed["transcript_source"] == "candidate_asr_manual_copy_edit"
+    assert transcribed["asr_probability"] == pytest.approx(0.88)
+    assert len(transcription_calls) == 1
+
+    duplicate_save = save_edited_candidate(
+        project_dir=tmp_path,
+        project={"segmentation": {"fade_ms": 0.0}},
+        review_path=review_path,
+        review_data=review,
+        line_id=line["line_id"],
+        source_candidate=review["lines"][0]["candidates"][0],
+        start_sample=sample_rate // 2,
+        end_sample=sample_rate * 5 // 2,
+    )
+    assert duplicate_save["transcript"] == "New exact edited transcript."
+    assert len(transcription_calls) == 1
+    loaded = load_line_review(review_path)
 
     regenerated = build_line_review(
         source_lines=[line],
@@ -4705,6 +4797,34 @@ def test_copy_edit_materializes_segment_and_persists_manual_candidate(
         dry_run=True,
     )
     assert finalized["export_count"] == 1
+
+    segment_path = tmp_path / edited["segment_file"]
+    assert segment_path.is_file()
+    cache_path = (
+        tmp_path
+        / "segment_transcripts"
+        / "candidates"
+        / f"{edited['segment_id']}.json"
+    )
+    write_json(cache_path, {"transcript": "cached"})
+    deleted = delete_edited_candidate(
+        project_dir=tmp_path,
+        review_path=review_path,
+        review_data=review,
+        segment_id=edited["segment_id"],
+    )
+    assert deleted["warnings"] == []
+    assert not segment_path.exists()
+    assert not cache_path.exists()
+    assert read_json(tmp_path / "segments_manifest.json")["sessions"][0][
+        "derived_segments"
+    ] == []
+    after_delete = load_line_review(review_path)["lines"][0]
+    assert edited["segment_id"] not in {
+        candidate["segment_id"] for candidate in after_delete["candidates"]
+    }
+    assert after_delete["selected_segment_id"] is None
+    assert after_delete["status"] == "REVIEW"
 
 
 def test_missing_line_can_select_and_preserve_unmatched_segment() -> None:

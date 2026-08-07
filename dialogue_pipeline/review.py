@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .segmentation import materialize_manual_segment
+from .transcription import transcribe_candidate_span
 from .util import is_vocalization_script, read_json, resolve_project_path, write_json
 
 
@@ -451,7 +452,7 @@ def save_edited_candidate(
     start_sample: int,
     end_sample: int,
 ) -> dict[str, Any]:
-    """Materialize edited audio and attach it to one review line."""
+    """Materialize untranscribed edited audio and attach it to one review line."""
 
     validate_line_review(review_data)
     updated_review = copy.deepcopy(review_data)
@@ -478,11 +479,6 @@ def save_edited_candidate(
             f"Edited bounds {start_sample}..{end_sample} are outside the source."
         )
 
-    transcript = str(
-        source_candidate.get("transcript")
-        or edit_source["segment"].get("transcript")
-        or ""
-    )
     segment = materialize_manual_segment(
         project_dir=project_dir,
         project=project,
@@ -491,8 +487,20 @@ def save_edited_candidate(
         line_id=line_id,
         start_sample=start_sample,
         end_sample=end_sample,
-        transcript=transcript,
+        transcript="",
     )
+    if str(segment.get("transcript_source") or "") != (
+        "candidate_asr_manual_copy_edit"
+    ):
+        segment.update(
+            {
+                "transcript": "",
+                "word_count": 0,
+                "words": [],
+                "asr_probability": None,
+                "transcript_source": "manual_copy_edit_untranscribed",
+            }
+        )
     score = float(
         source_candidate.get(
             "score",
@@ -506,7 +514,10 @@ def save_edited_candidate(
             "segment_file": str(segment["file"]),
             "session_id": str(segment["session_id"]),
             "base_indices": list(segment.get("base_indices") or []),
-            "transcript": transcript,
+            "transcript": str(segment.get("transcript") or ""),
+            "transcript_source": str(segment["transcript_source"]),
+            "words": list(segment.get("words") or []),
+            "asr_probability": segment.get("asr_probability"),
             "score": score,
             "match_score": float(
                 source_candidate.get("match_score", score)
@@ -559,6 +570,172 @@ def save_edited_candidate(
     review_data.clear()
     review_data.update(updated_review)
     return candidate
+
+
+def transcribe_edited_candidate(
+    *,
+    project_dir: Path,
+    project: dict[str, Any],
+    review_path: Path,
+    review_data: dict[str, Any],
+    segment_id: str,
+    transcription_runtime: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Generate and persist an exact-span transcript for a manual edit."""
+
+    validate_line_review(review_data)
+    matching_candidates = [
+        candidate
+        for line in review_data["lines"]
+        for candidate in line["candidates"]
+        if str(candidate.get("segment_id")) == segment_id
+    ]
+    if not matching_candidates or not all(
+        bool(candidate.get("manual_edit")) for candidate in matching_candidates
+    ):
+        raise ValueError("Only copy-and-edit segments can be transcribed here.")
+
+    edit_source = segment_edit_source(
+        project_dir=project_dir,
+        segment_id=segment_id,
+    )
+    segment = edit_source["segment"]
+    if str(segment.get("kind") or "") != "manual_edit":
+        raise ValueError("The manifest entry is not a copy-and-edit segment.")
+
+    exact_asr = transcribe_candidate_span(
+        project_dir=project_dir,
+        project=project,
+        segment=segment,
+        runtime=(
+            transcription_runtime
+            if transcription_runtime is not None
+            else {}
+        ),
+    )
+    transcript = str(exact_asr.get("transcript") or "").strip()
+    transcript_fields = {
+        "transcript": transcript,
+        "word_count": int(exact_asr.get("word_count") or 0),
+        "words": list(exact_asr.get("words") or []),
+        "asr_probability": exact_asr.get("asr_probability"),
+        "transcript_source": "candidate_asr_manual_copy_edit",
+    }
+    segment.update(transcript_fields)
+
+    updated_review = copy.deepcopy(review_data)
+    updated_candidate = None
+    for line in updated_review["lines"]:
+        for candidate in line["candidates"]:
+            if str(candidate.get("segment_id")) == segment_id:
+                candidate.update(transcript_fields)
+                updated_candidate = candidate
+    if updated_candidate is None:
+        raise KeyError(f"Manual candidate is not present in review data: {segment_id}")
+
+    write_json(edit_source["manifest_path"], edit_source["manifest"])
+    save_line_review(review_path, updated_review)
+    review_data.clear()
+    review_data.update(updated_review)
+    return updated_candidate
+
+
+def delete_edited_candidate(
+    *,
+    project_dir: Path,
+    review_path: Path,
+    review_data: dict[str, Any],
+    segment_id: str,
+) -> dict[str, Any]:
+    """Remove a manual edit from the manifest, review data, and disk."""
+
+    validate_line_review(review_data)
+    matching_candidates = [
+        candidate
+        for line in review_data["lines"]
+        for candidate in line["candidates"]
+        if str(candidate.get("segment_id")) == segment_id
+    ]
+    if not matching_candidates or not all(
+        bool(candidate.get("manual_edit")) for candidate in matching_candidates
+    ):
+        raise ValueError("Only copy-and-edit segments can be deleted here.")
+
+    manifest_path = project_dir / "segments_manifest.json"
+    manifest = read_json(manifest_path)
+    manifest_matches = [
+        (session, segment)
+        for session in manifest.get("sessions", [])
+        for segment in session.get("derived_segments") or []
+        if str(segment.get("segment_id")) == segment_id
+    ]
+    if len(manifest_matches) != 1:
+        raise ValueError(
+            f"Expected one manifest entry for manual segment {segment_id}, "
+            f"found {len(manifest_matches)}."
+        )
+    session, segment = manifest_matches[0]
+    if str(segment.get("kind") or "") != "manual_edit":
+        raise ValueError("The manifest entry is not a copy-and-edit segment.")
+
+    project_root = project_dir.resolve()
+    segment_path = resolve_project_path(project_dir, str(segment["file"]))
+    try:
+        segment_path.resolve().relative_to(project_root)
+    except ValueError as error:
+        raise ValueError("Manual segment file is outside the project directory.") from error
+
+    updated_review = copy.deepcopy(review_data)
+    for line in updated_review["lines"]:
+        line["candidates"] = [
+            candidate
+            for candidate in line["candidates"]
+            if str(candidate.get("segment_id")) != segment_id
+        ]
+        for rank, candidate in enumerate(line["candidates"], start=1):
+            candidate["rank"] = rank
+        if str(line.get("suggested_segment_id") or "") == segment_id:
+            line["suggested_segment_id"] = (
+                line["candidates"][0]["segment_id"]
+                if line["candidates"]
+                else None
+            )
+        if str(line.get("selected_segment_id") or "") == segment_id:
+            line["selected_segment_id"] = None
+            line["status"] = (
+                "MISSING"
+                if line["type"] == "normal" and not line["candidates"]
+                else "REVIEW"
+            )
+        elif (
+            line["type"] == "normal"
+            and not line["candidates"]
+            and not line.get("selected_segment_id")
+            and line["status"] != "RETAKE"
+        ):
+            line["status"] = "MISSING"
+
+    session["derived_segments"] = [
+        candidate
+        for candidate in session.get("derived_segments") or []
+        if str(candidate.get("segment_id")) != segment_id
+    ]
+    validate_line_review(updated_review)
+    write_json(manifest_path, manifest)
+    save_line_review(review_path, updated_review)
+    review_data.clear()
+    review_data.update(updated_review)
+
+    warnings = []
+    for generated_path in (
+        segment_path,
+        project_dir / "segment_transcripts" / "candidates" / f"{segment_id}.json",
+    ):
+        try:
+            generated_path.unlink(missing_ok=True)
+        except OSError as error:
+            warnings.append(f"Could not delete {generated_path}: {error}")
+    return {"segment_id": segment_id, "warnings": warnings}
 
 
 def preserve_manual_selections(

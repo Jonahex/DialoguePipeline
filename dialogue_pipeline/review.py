@@ -224,13 +224,18 @@ def build_line_review(
         )
         for source_line in source_lines
     }
-    verbal_candidate_segment_ids: set[str] = set()
-    verbal_candidate_base_segments: set[tuple[str, int]] = set()
+    reliable_verbal_segment_ids: set[str] = set()
+    reliable_verbal_base_segments: set[tuple[str, int]] = set()
     for candidates in retained_by_line.values():
         for candidate in candidates:
-            verbal_candidate_segment_ids.add(str(candidate["segment_id"]))
+            # An unreliable review alternative does not claim its constituent
+            # base segments. Those clips must remain available in the shared
+            # unmatched pool for nonverbal and missing lines.
+            if not bool(candidate.get("reliable", False)):
+                continue
+            reliable_verbal_segment_ids.add(str(candidate["segment_id"]))
             session_id = str(candidate.get("session_id") or "")
-            verbal_candidate_base_segments.update(
+            reliable_verbal_base_segments.update(
                 (session_id, int(base_index))
                 for base_index in candidate.get("base_indices") or []
             )
@@ -308,8 +313,8 @@ def build_line_review(
                 not in str(segment.get("technical_flags") or "").split(","),
             )
         )
-        and str(segment["segment_id"]) not in verbal_candidate_segment_ids
-        and _base_segment_key(segment) not in verbal_candidate_base_segments
+        and str(segment["segment_id"]) not in reliable_verbal_segment_ids
+        and _base_segment_key(segment) not in reliable_verbal_base_segments
     ]
     audible_unmatched.sort(
         key=lambda segment: (

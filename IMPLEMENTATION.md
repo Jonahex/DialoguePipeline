@@ -260,8 +260,9 @@ both halves are then transcribed independently.
 
 Parenthesized directions and recognized sounds such as coughs, grunts, and
 death rattles have line type `nonverbal`. They start in `REVIEW`, are never
-auto-selected, and use the shared pool of audible segments not retained for
-normal dialogue.
+auto-selected, and use the shared pool of audible segments not reliably matched
+to normal dialogue. Unreliable normal-dialogue alternatives do not reserve their
+constituent base segments from this pool.
 
 Inline performance cues are excluded from spoken-text matching. A cue at the
 start or end of a verbal line prevents `AUTO_OK` with

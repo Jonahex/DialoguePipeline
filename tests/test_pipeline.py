@@ -4098,6 +4098,80 @@ def test_line_review_types_nonverbal_lines_and_uses_audible_unmatched_pool(
     ] == ["audible"]
 
 
+def test_unreliable_verbal_merge_does_not_claim_unmatched_base_segments() -> None:
+    normal_line = {
+        "line_id": "Sheet::R65",
+        "sheet": "Sheet",
+        "sheet_index": 0,
+        "excel_row": 65,
+        "line": "Anyone there?",
+        "target_filename": "anyone_there",
+    }
+    nonverbal_line = {
+        "line_id": "Sheet::R64",
+        "sheet": "Sheet",
+        "sheet_index": 0,
+        "excel_row": 64,
+        "line": "Huh?",
+        "target_filename": "huh",
+    }
+    reliable_candidate = {
+        "segment_id": "session__s00027",
+        "segment_file": "s00027.wav",
+        "session_id": "session",
+        "base_indices": [26],
+        "transcript": "Anyone there?",
+        "match_score": 100.0,
+        "selection_score": 121.0,
+        "is_primary_match": True,
+        "reliable": True,
+        "reliability_reason": "",
+    }
+    unreliable_merge = {
+        "segment_id": "session__m00025_00027",
+        "segment_file": "m00025_00027.wav",
+        "session_id": "session",
+        "base_indices": [24, 25, 26],
+        "transcript": "Huh? Huh? Anyone there?",
+        "match_score": 91.4,
+        "selection_score": 112.7,
+        "is_primary_match": True,
+        "reliable": False,
+        "reliability_reason": "POSSIBLE_REPEATED_TAKES",
+    }
+    unmatched_segments = [
+        {
+            "segment_id": f"session__s{base_index + 1:05d}",
+            "segment_file": f"s{base_index + 1:05d}.wav",
+            "session_id": "session",
+            "base_index": base_index,
+            "transcript": "Huh?",
+            "technical_score": technical_score,
+            "audible": True,
+        }
+        for base_index, technical_score in ((24, 97.0), (25, 95.0))
+    ]
+
+    review = build_line_review(
+        source_lines=[nonverbal_line, normal_line],
+        candidates_by_line={
+            normal_line["line_id"]: [reliable_candidate, unreliable_merge]
+        },
+        unmatched_segments=unmatched_segments,
+    )
+
+    reviewed_normal = next(
+        line for line in review["lines"] if line["line_id"] == normal_line["line_id"]
+    )
+    assert [candidate["segment_id"] for candidate in reviewed_normal["candidates"]] == [
+        "session__s00027",
+        "session__m00025_00027",
+    ]
+    assert [
+        segment["segment_id"] for segment in review["unmatched_segments"]
+    ] == ["session__s00025", "session__s00026"]
+
+
 def test_selected_line_ids_mark_shared_nonverbal_candidates() -> None:
     review_data = {
         "lines": [

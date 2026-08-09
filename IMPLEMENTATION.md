@@ -265,8 +265,9 @@ auto-selected, and use the shared pool of audible segments not reliably matched
 to normal dialogue. Unreliable normal-dialogue alternatives do not reserve their
 constituent base segments from this pool.
 
-Inline performance cues are excluded from spoken-text matching. A cue at the
-start or end of a verbal line prevents `AUTO_OK` with
+Parenthesized performance cues and square-bracketed implementation details are
+excluded from spoken-text matching. A parenthesized cue at the start or end of
+a verbal line prevents `AUTO_OK` with
 `EDGE_VOCALIZATION_UNVERIFIED`, because speech ASR cannot prove that the cue was
 preserved. Pause-based trimming cannot remove that scripted edge. A nearby
 standalone vocalization may be added as an extended review candidate.

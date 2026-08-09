@@ -66,9 +66,9 @@ def normalize_text(value: str) -> str:
 
 
 def verbal_script_text(value: str) -> str:
-    """Remove inline nonverbal performance cues from a spoken script line."""
+    """Remove non-spoken cues and implementation details from a script line."""
 
-    without_cues = re.sub(r"\([^)]*\)", " ", value or "")
+    without_cues = re.sub(r"\([^)]*\)|\[[^]]*\]", " ", value or "")
     return re.sub(r"\s+", " ", without_cues).strip()
 
 

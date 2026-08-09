@@ -77,8 +77,10 @@ from dialogue_pipeline.segmentation import (
 )
 from dialogue_pipeline.transcription import (
     _automatic_batch_size,
+    _best_ordered_script_score,
     _decode_clips_batched,
     _likely_silence_hallucination,
+    _prompt_candidates,
     transcribe_candidate_span,
     transcribe_candidate_spans,
     transcribe_project,
@@ -101,6 +103,7 @@ from dialogue_pipeline.util import (
     resolve_model_cache_root,
     sha256_file,
     stable_hash,
+    verbal_script_text,
     write_json,
 )
 from dialogue_pipeline.workbook_io import parse_workbook
@@ -1251,6 +1254,43 @@ def test_spoken_form_normalization_accepts_equivalent_phrasing(
         observed=observed,
         duration_plausibility=80.0,
     ) == (True, "")
+
+
+def test_square_bracket_metadata_is_ignored_for_spoken_matching() -> None:
+    expected = "[if Ternimir Pass is blocked] The road to Leyawiin is blocked."
+    observed = "The road to Leyawiin is blocked."
+
+    assert verbal_script_text(expected) == observed
+    assert text_similarity(expected, observed) == pytest.approx(100.0)
+    assert transcript_fidelity(expected, observed) == transcript_fidelity(
+        observed,
+        observed,
+    )
+    assert sentence_fidelity(expected, observed)["missing_clause_count"] == 0
+    assert _candidate_reliability(
+        line={"line": expected},
+        match_score=100.0,
+        margin=20.0,
+        settings={},
+        observed=observed,
+        duration_plausibility=80.0,
+    ) == (True, "")
+
+
+def test_segment_prompt_matching_ignores_square_bracket_metadata() -> None:
+    target = {
+        "line_id": "target",
+        "line": "[only after the quest is complete] The road is open.",
+    }
+    other = {"line_id": "other", "line": "Nothing has changed."}
+
+    assert _best_ordered_script_score([target, other], "The road is open.") == 100.0
+    assert _prompt_candidates(
+        [target, other],
+        "The road is open.",
+        maximum_words=4,
+        top_k=1,
+    ) == [target]
 
 
 def test_missing_single_sentence_boundary_prevents_auto_acceptance() -> None:

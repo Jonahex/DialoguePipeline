@@ -19,6 +19,7 @@ from .util import (
     resolve_model_cache_root,
     resolve_project_path,
     stable_hash,
+    verbal_script_text,
     word_count,
     write_json,
 )
@@ -1040,7 +1041,7 @@ def _prompt_candidates(
         for line in lines
         if (
             not is_vocalization_script(line["line"])
-            and 0 < word_count(line["line"]) <= maximum_words
+            and 0 < word_count(verbal_script_text(line["line"])) <= maximum_words
         )
     ]
     if not transcript:
@@ -1048,7 +1049,7 @@ def _prompt_candidates(
     return sorted(
         eligible,
         key=lambda line: fuzz.WRatio(
-            normalize_text(line["line"]),
+            normalize_text(verbal_script_text(line["line"])),
             normalize_text(transcript),
         ),
         reverse=True,
@@ -1064,9 +1065,12 @@ def _best_ordered_script_score(
         return 0.0
     return max(
         (
-            fuzz.ratio(normalize_text(line["line"]), observed)
+            fuzz.ratio(
+                normalize_text(verbal_script_text(line["line"])),
+                observed,
+            )
             for line in lines
-            if normalize_text(line["line"])
+            if normalize_text(verbal_script_text(line["line"]))
         ),
         default=0.0,
     )
@@ -1373,9 +1377,9 @@ def transcribe_segments_project(
                     maximum_words=prompt_max_words,
                     top_k=prompt_top_k,
                 )
-                prompt = " | ".join(line["line"] for line in candidates)[
-                    :prompt_max_characters
-                ]
+                prompt = " | ".join(
+                    verbal_script_text(line["line"]) for line in candidates
+                )[:prompt_max_characters]
                 if prompt:
                     prompted_count += 1
                     prompted_cache_identity = {

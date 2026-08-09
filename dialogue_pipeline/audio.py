@@ -167,6 +167,56 @@ def quietest_pcm_boundary(
     return int(best_sample)
 
 
+def first_quiet_pcm_boundary(
+    path: Path,
+    *,
+    start_sample: int,
+    end_sample: int,
+    window_seconds: float = 0.02,
+    maximum_rms_dbfs: float = -42.0,
+) -> int | None:
+    """Return the first sufficiently quiet PCM window after a proposed cut."""
+
+    try:
+        with wave.open(str(path), "rb") as reader:
+            if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
+                return None
+            sample_rate = int(reader.getframerate())
+            channels = int(reader.getnchannels())
+            lower = max(0, int(start_sample))
+            upper = min(int(reader.getnframes()), int(end_sample))
+            window_frames = max(
+                1,
+                round(max(0.001, float(window_seconds)) * sample_rate),
+            )
+            half_window = window_frames // 2
+            first_center = lower + half_window
+            last_center = upper - (window_frames - half_window)
+            if last_center < first_center:
+                return None
+            reader.setpos(lower)
+            raw = reader.readframes(upper - lower)
+    except (EOFError, OSError, wave.Error):
+        return None
+
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    samples /= 32768.0
+    hop_frames = max(1, round(0.005 * sample_rate))
+    for center in range(first_center, last_center + 1, hop_frames):
+        local_start = center - half_window - lower
+        local_end = local_start + window_frames
+        window = samples[local_start:local_end]
+        if window.shape[0] != window_frames:
+            continue
+        rms = float(np.sqrt(np.mean(np.square(window), dtype=np.float64)))
+        rms_dbfs = 20.0 * math.log10(max(rms, 1e-12))
+        if rms_dbfs <= float(maximum_rms_dbfs):
+            return int(center)
+    return None
+
+
 def pcm_voice_bounds(
     path: Path,
     *,

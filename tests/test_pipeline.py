@@ -41,6 +41,7 @@ from dialogue_pipeline.alignment_settings import (
 )
 from dialogue_pipeline.audio import (
     cut_pcm_wav,
+    first_quiet_pcm_boundary,
     prepare_pcm_segmentation_source,
     quietest_pcm_boundary,
 )
@@ -486,6 +487,51 @@ def test_word_gap_boundary_snaps_after_release_burst(tmp_path: Path) -> None:
     assert regions[1]["speech_start"] == pytest.approx(snapped / sample_rate)
 
 
+def test_first_quiet_pcm_boundary_finds_gap_before_breath(tmp_path: Path) -> None:
+    sample_rate = 48000
+    audio_path = tmp_path / "breath-boundary.wav"
+    samples = np.full(sample_rate, 1200, dtype="<i2")
+    samples[round(0.20 * sample_rate) : round(0.32 * sample_rate)] = 5000
+    samples[round(0.32 * sample_rate) : round(0.38 * sample_rate)] = 10
+    samples[round(0.38 * sample_rate) : round(0.70 * sample_rate)] = 800
+    with wave.open(str(audio_path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(samples.tobytes())
+
+    boundary = first_quiet_pcm_boundary(
+        audio_path,
+        start_sample=round(0.20 * sample_rate),
+        end_sample=round(0.70 * sample_rate),
+    )
+
+    assert boundary is not None
+    assert round(0.32 * sample_rate) <= boundary <= round(0.38 * sample_rate)
+
+
+def test_first_quiet_pcm_boundary_rejects_tail_without_quiet_gap(
+    tmp_path: Path,
+) -> None:
+    sample_rate = 48000
+    audio_path = tmp_path / "no-quiet-boundary.wav"
+    samples = np.full(sample_rate, 1200, dtype="<i2")
+    with wave.open(str(audio_path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(samples.tobytes())
+
+    assert (
+        first_quiet_pcm_boundary(
+            audio_path,
+            start_sample=round(0.20 * sample_rate),
+            end_sample=round(0.70 * sample_rate),
+        )
+        is None
+    )
+
+
 def test_boundary_voice_trim_creates_clean_candidate_and_marks_original(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -497,6 +543,17 @@ def test_boundary_voice_trim_creates_clean_candidate_and_marks_original(
         alignment_module,
         "pcm_voice_bounds",
         lambda *_args, **_kwargs: (sample_rate, sample_rate * 9),
+    )
+    snap_calls = []
+
+    def fake_quiet_boundary(_path: Path, **kwargs) -> int:
+        snap_calls.append(kwargs)
+        return int(kwargs["start_sample"]) + round(0.03 * sample_rate)
+
+    monkeypatch.setattr(
+        alignment_module,
+        "first_quiet_pcm_boundary",
+        fake_quiet_boundary,
     )
     line_text = "Never mind, a dumb joke. I meant nothing by it."
     lines = [{"line_id": "target", "line": line_text}]
@@ -546,12 +603,15 @@ def test_boundary_voice_trim_creates_clean_candidate_and_marks_original(
     assert cleaned[0]["trim_start_sample"] == sample_rate - round(
         0.08 * sample_rate
     )
-    assert cleaned[0]["trim_end_sample"] == sample_rate * 9 + round(
-        0.12 * sample_rate
+    proposed_end = sample_rate * 9 + round(0.12 * sample_rate)
+    assert cleaned[0]["trim_end_sample"] == proposed_end + round(
+        0.03 * sample_rate
     )
+    assert snap_calls[0]["start_sample"] == proposed_end
+    assert snap_calls[0]["end_sample"] == sample_rate * 10
 
 
-def test_boundary_voice_trim_uses_strict_tail_vad_after_final_word(
+def test_boundary_voice_trim_uses_quiet_gap_after_strict_tail_vad(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -577,6 +637,12 @@ def test_boundary_voice_trim_uses_strict_tail_vad_after_final_word(
         alignment_module,
         "pcm_voice_bounds",
         fake_voice_bounds,
+    )
+    quiet_boundary = round(sample_rate * 9.25)
+    monkeypatch.setattr(
+        alignment_module,
+        "first_quiet_pcm_boundary",
+        lambda *_args, **_kwargs: quiet_boundary,
     )
     line_text = "A bet's a bet. Here's your gold."
     lines = [{"line_id": "target", "line": line_text}]
@@ -615,9 +681,7 @@ def test_boundary_voice_trim_uses_strict_tail_vad_after_final_word(
 
     assert thresholds == [0.5, 0.7]
     assert len(cleaned) == 1
-    assert cleaned[0]["trim_end_sample"] == sample_rate * 9 + round(
-        0.12 * sample_rate
-    )
+    assert cleaned[0]["trim_end_sample"] == quiet_boundary
     assert action["boundary_voice_trailing_seconds"] == pytest.approx(1.0)
 
 
@@ -722,9 +786,7 @@ def test_boundary_voice_trim_reuses_segmentation_voice_bounds(
     assert cleaned[0]["trim_start_sample"] == sample_rate - round(
         0.08 * sample_rate
     )
-    assert cleaned[0]["trim_end_sample"] == sample_rate * 9 + round(
-        0.12 * sample_rate
-    )
+    assert cleaned[0]["trim_end_sample"] == sample_rate * 10
 
 
 def test_shared_model_cache_resolution(tmp_path: Path, monkeypatch) -> None:
@@ -4570,6 +4632,53 @@ def test_review_auto_selects_best_quality_within_reliable_cluster() -> None:
 
     assert review["lines"][0]["status"] == "AUTO_OK"
     assert review["lines"][0]["selected_segment_id"] == "cleanest"
+
+
+def test_review_prefers_intact_candidate_when_boundary_trim_is_near_tied() -> None:
+    line = {
+        "line_id": "Opponent::R5",
+        "sheet": "Opponent",
+        "excel_row": 5,
+        "line": "You should've picked an easier fight.",
+        "target_filename": "easier_fight",
+    }
+    candidates = [
+        {
+            "segment_id": "trimmed",
+            "segment_file": "trimmed.wav",
+            "session_id": "session",
+            "base_indices": [3],
+            "match_score": 100.0,
+            "selection_score": 121.565,
+            "technical_score": 100.0,
+            "is_primary_match": True,
+            "reliable": True,
+            "reliability_reason": "",
+            "boundary_voice_trim": True,
+        },
+        {
+            "segment_id": "intact",
+            "segment_file": "intact.wav",
+            "session_id": "session",
+            "base_indices": [4],
+            "match_score": 100.0,
+            "selection_score": 121.549,
+            "technical_score": 100.0,
+            "is_primary_match": True,
+            "reliable": True,
+            "reliability_reason": "",
+        },
+    ]
+
+    review = build_line_review(
+        source_lines=[line],
+        candidates_by_line={line["line_id"]: candidates},
+        unmatched_segments=[],
+    )
+
+    review_line = review["lines"][0]
+    assert review_line["selected_segment_id"] == "intact"
+    assert review_line["candidates"][0]["boundary_voice_trim"] is True
 
 
 def test_review_candidates_keep_best_fragment_join_when_none_are_reliable() -> None:

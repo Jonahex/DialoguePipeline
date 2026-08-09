@@ -277,9 +277,14 @@ script includes the sound. Alignment retains the original merged span for
 review and can create a clean alternative without the boundary segment.
 
 For breath or room noise inside a textual segment, alignment composes the voice
-bounds stored during segmentation and adds a short-padded candidate. The final
-recognized word timestamp is a hard lower bound, preventing recognized dialogue
-from being trimmed.
+bounds stored during segmentation and adds a short-padded candidate. Strict
+breath VAD supplies only a proposed trailing endpoint: alignment scans forward
+and creates the trim only if it finds a sufficiently quiet PCM window. This can
+cut before a separated trailing breath while preventing VAD or imprecise ASR
+timestamps from clipping a quiet release or unvoiced final consonant. When no
+quiet separation exists, the tail is preserved. When reliable candidates are
+otherwise tied, review selection prefers an intact segment over a generated
+boundary trim.
 
 ## Exact-span candidate verification
 

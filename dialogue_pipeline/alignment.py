@@ -12,7 +12,11 @@ from typing import Any, Mapping
 from rapidfuzz import fuzz
 
 from .alignment_settings import AlignmentSettings
-from .audio import pcm_voice_bounds, quietest_pcm_boundary
+from .audio import (
+    first_quiet_pcm_boundary,
+    pcm_voice_bounds,
+    quietest_pcm_boundary,
+)
 from .cancellation import check_processing_cancelled
 from .project import load_source_data
 from .review import (
@@ -3586,7 +3590,30 @@ def _boundary_voice_trim_actions(
         if not leading_cue and leading_seconds >= minimum_edge_seconds:
             clean_start = max(raw_start, voice_start - pre_padding)
         if not trailing_cue and trailing_seconds >= minimum_edge_seconds:
-            clean_end = min(raw_end, voice_end + post_padding)
+            proposed_end = min(raw_end, voice_end + post_padding)
+            if proposed_end < raw_end:
+                # Strict VAD supplies only a proposal.  A real quiet window
+                # after it is required so an unvoiced release cannot be cut
+                # merely because VAD and ASR both ended too early.
+                quiet_end = first_quiet_pcm_boundary(
+                    audio_path,
+                    start_sample=proposed_end,
+                    end_sample=raw_end,
+                    window_seconds=float(
+                        segmentation_settings.get(
+                            "word_split_snap_window_seconds",
+                            0.02,
+                        )
+                    ),
+                    maximum_rms_dbfs=float(
+                        segmentation_settings.get(
+                            "word_split_snap_max_rms_dbfs",
+                            -42.0,
+                        )
+                    ),
+                )
+                if quiet_end is not None:
+                    clean_end = max(proposed_end, min(raw_end, quiet_end))
         if clean_end <= clean_start or (
             clean_start == raw_start and clean_end == raw_end
         ):

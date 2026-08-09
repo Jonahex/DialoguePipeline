@@ -22,6 +22,7 @@ LINE_STATUSES = {
 }
 REVIEW_CANDIDATE_SCORE_GAP = 12.0
 REVIEW_CANDIDATE_MAX_SCORE_DROP = 15.0
+REVIEW_SELECTION_SCORE_TIE = 0.05
 STRUCTURALLY_INCOMPLETE_REASONS = {
     "EXTRA_LINE_END",
     "EXTRA_LINE_START",
@@ -189,6 +190,7 @@ def _review_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "start_seconds": float(candidate.get("start_seconds", 0.0)),
         "end_seconds": float(candidate.get("end_seconds", 0.0)),
         "duration_seconds": float(candidate.get("duration_seconds", 0.0)),
+        "boundary_voice_trim": bool(candidate.get("boundary_voice_trim", False)),
     }
 
 
@@ -269,17 +271,26 @@ def build_line_review(
             for candidate in review_candidates
             if candidate["reliable"]
         ]
-        reliable_best = (
-            max(
-                reliable_candidates,
+        reliable_best = None
+        if reliable_candidates:
+            best_selection_score = max(
+                float(candidate.get("selection_score", 0.0))
+                for candidate in reliable_candidates
+            )
+            near_best_candidates = [
+                candidate
+                for candidate in reliable_candidates
+                if float(candidate.get("selection_score", 0.0))
+                >= best_selection_score - REVIEW_SELECTION_SCORE_TIE
+            ]
+            reliable_best = max(
+                near_best_candidates,
                 key=lambda candidate: (
+                    not bool(candidate.get("boundary_voice_trim", False)),
                     float(candidate.get("selection_score", 0.0)),
                     float(candidate.get("match_score", 0.0)),
                 ),
             )
-            if reliable_candidates
-            else None
-        )
 
         if line_type == "nonverbal":
             status = "REVIEW"

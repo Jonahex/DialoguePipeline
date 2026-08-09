@@ -4449,6 +4449,44 @@ def test_review_candidates_keep_primary_top_score_cluster() -> None:
     ]
 
 
+def test_structurally_incomplete_superset_does_not_hide_strict_join() -> None:
+    oversized_provisional = {
+        "segment_id": "session__m00065_00068",
+        "session_id": "session",
+        "base_indices": [64, 65, 66, 67],
+        "match_score": 88.0,
+        "selection_score": 109.5,
+        "is_primary_match": True,
+        "reliable": False,
+        "reliability_reason": "UNCERTAIN_BOUNDARY_AUDIO",
+        "missing_clause_count": 0,
+        "fragment_join": True,
+        "fragment_join_provisional": True,
+    }
+    contained_strict_join = {
+        "segment_id": "session__m00067_00068",
+        "session_id": "session",
+        "base_indices": [66, 67],
+        "match_score": 72.0,
+        "selection_score": 90.5,
+        "is_primary_match": True,
+        "reliable": False,
+        "reliability_reason": "MISSING_SENTENCE",
+        "missing_clause_count": 2,
+        "fragment_join": True,
+        "fragment_join_provisional": False,
+    }
+
+    retained = prune_line_candidates(
+        [oversized_provisional, contained_strict_join]
+    )
+
+    assert [candidate["segment_id"] for candidate in retained] == [
+        "session__m00065_00068",
+        "session__m00067_00068",
+    ]
+
+
 def test_review_auto_selects_best_quality_within_reliable_cluster() -> None:
     line = {
         "line_id": "Sheet::R3",

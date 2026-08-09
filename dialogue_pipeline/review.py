@@ -46,6 +46,14 @@ def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[float, float]:
     )
 
 
+def _is_structurally_incomplete(candidate: dict[str, Any]) -> bool:
+    return bool(
+        int(candidate.get("missing_clause_count", 0))
+        or str(candidate.get("reliability_reason") or "")
+        in STRUCTURALLY_INCOMPLETE_REASONS
+    )
+
+
 def _is_dominated_span(
     candidate: dict[str, Any],
     better_candidates: list[dict[str, Any]],
@@ -63,7 +71,7 @@ def _is_dominated_span(
             >= float(candidate.get("match_score", 0.0))
             and (
                 bool(better.get("reliable", False))
-                or not int(better.get("missing_clause_count", 0))
+                or not _is_structurally_incomplete(better)
             )
         ):
             return True
@@ -117,13 +125,18 @@ def prune_line_candidates(
         if float(candidate.get("match_score", 0.0)) >= cutoff
     ]
     if not any(candidate.get("reliable", False) for candidate in retained):
-        best_fragment_join = next(
-            (
-                candidate
-                for candidate in unique
-                if bool(candidate.get("fragment_join", False))
+        fragment_joins = [
+            candidate
+            for candidate in unique
+            if bool(candidate.get("fragment_join", False))
+        ]
+        best_fragment_join = max(
+            fragment_joins,
+            key=lambda candidate: (
+                not bool(candidate.get("fragment_join_provisional", False)),
+                *_candidate_sort_key(candidate),
             ),
-            None,
+            default=None,
         )
         if (
             best_fragment_join is not None

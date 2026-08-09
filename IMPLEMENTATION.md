@@ -173,11 +173,12 @@ when recording order is useful only as a tie-breaker.
 The candidate list in `line_review.json` is narrower than the diagnostic list
 in `alignment.json`. Review pruning:
 
-- removes lower-scoring spans contained by a better candidate;
+- removes lower-scoring spans contained by a reliable or structurally complete
+  better candidate;
 - retains candidates within 15 match-score points of the best;
 - cuts earlier when an adjacent score gap is at least 12 points;
-- preserves a useful fragment join or reliable candidate when ordinary pruning
-  would remove all of them.
+- preserves a useful strict fragment join, ahead of provisional joins, or a
+  reliable candidate when ordinary pruning would remove all of them.
 
 Manual selections are restored after regeneration even when the selected span
 falls outside the new automatic cluster.

@@ -101,13 +101,20 @@ def quietest_pcm_boundary(
     search_seconds: float = 0.20,
     window_seconds: float = 0.02,
     maximum_rms_dbfs: float = -42.0,
-) -> int:
-    """Snap a proposed PCM cut to the quietest nearby analysis window."""
+    require_quiet: bool = False,
+) -> int | None:
+    """Snap a proposed PCM cut to the quietest nearby analysis window.
+
+    When ``require_quiet`` is true, return ``None`` instead of the proposed
+    sample if no window meets ``maximum_rms_dbfs``.
+    """
+
+    fallback = None if require_quiet else int(proposed_sample)
 
     try:
         with wave.open(str(path), "rb") as reader:
             if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
-                return int(proposed_sample)
+                return fallback
             sample_rate = int(reader.getframerate())
             channels = int(reader.getnchannels())
             frame_count = int(reader.getnframes())
@@ -131,11 +138,11 @@ def quietest_pcm_boundary(
             first_center = lower + half_window
             last_center = upper - (window_frames - half_window)
             if last_center < first_center:
-                return int(proposed_sample)
+                return fallback
             reader.setpos(lower)
             raw = reader.readframes(upper - lower)
     except (EOFError, OSError, wave.Error):
-        return int(proposed_sample)
+        return fallback
 
     samples = np.frombuffer(raw, dtype="<i2").astype(np.float32)
     if channels > 1:
@@ -152,7 +159,7 @@ def quietest_pcm_boundary(
         rms = float(np.sqrt(np.mean(np.square(window), dtype=np.float64)))
         candidates.append((rms, center))
     if not candidates:
-        return int(proposed_sample)
+        return fallback
 
     best_rms, best_sample = min(
         candidates,
@@ -163,7 +170,7 @@ def quietest_pcm_boundary(
     )
     best_dbfs = 20.0 * math.log10(max(best_rms, 1e-12))
     if best_dbfs > float(maximum_rms_dbfs):
-        return int(proposed_sample)
+        return None if require_quiet else int(proposed_sample)
     return int(best_sample)
 
 

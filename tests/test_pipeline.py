@@ -488,6 +488,47 @@ def test_word_gap_boundary_snaps_after_release_burst(tmp_path: Path) -> None:
     assert regions[1]["speech_start"] == pytest.approx(snapped / sample_rate)
 
 
+def test_required_quiet_word_gap_does_not_fall_back_to_loud_midpoint(
+    tmp_path: Path,
+) -> None:
+    sample_rate = 48000
+    audio_path = tmp_path / "loud_gap.wav"
+    samples = np.full(round(1.0 * sample_rate), 4000, dtype="<i2")
+    with wave.open(str(audio_path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(samples.tobytes())
+
+    assert quietest_pcm_boundary(
+        audio_path,
+        proposed_sample=round(0.50 * sample_rate),
+        minimum_sample=round(0.30 * sample_rate),
+        maximum_sample=round(0.70 * sample_rate),
+        require_quiet=True,
+    ) is None
+    assert _word_gap_boundaries(
+        {
+            "file": audio_path.name,
+            "start_sample": 0,
+            "end_sample": samples.shape[0],
+            "start_seconds": 0.0,
+            "end_seconds": 1.0,
+            "segment_asr": {
+                "primary": {
+                    "words": [
+                        {"word": " previous", "start": 0.0, "end": 0.30},
+                        {"word": " target", "start": 0.70, "end": 1.0},
+                    ]
+                }
+            },
+        },
+        minimum_gap=0.30,
+        maximum_boundaries=1,
+        project_dir=tmp_path,
+    ) == []
+
+
 def test_first_quiet_pcm_boundary_finds_gap_before_breath(tmp_path: Path) -> None:
     sample_rate = 48000
     audio_path = tmp_path / "breath-boundary.wav"
@@ -610,6 +651,64 @@ def test_boundary_voice_trim_creates_clean_candidate_and_marks_original(
     )
     assert snap_calls[0]["start_sample"] == proposed_end
     assert snap_calls[0]["end_sample"] == sample_rate * 10
+
+
+def test_boundary_voice_trim_preserves_quiet_first_word(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_bounds",
+        lambda *_args, **_kwargs: (sample_rate, sample_rate * 10),
+    )
+    line_text = (
+        "It is a place of love first and foremost. "
+        "It should not be left broken like a widow's heart."
+    )
+    action = {
+        "type": "assigned",
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 100.0,
+        "transcript": line_text,
+        "duration_plausibility": 100.0,
+    }
+    cleaned = _boundary_voice_trim_actions(
+        [action],
+        project_dir=tmp_path,
+        session_entry={
+            "sample_rate": sample_rate,
+            "working_audio": "source.wav",
+            "audio": "source.wav",
+        },
+        lines=[{"line_id": "target", "line": line_text}],
+        base_segments=[
+            {
+                "start_sample": 0,
+                "end_sample": sample_rate * 10,
+                "start_seconds": 0.0,
+                "end_seconds": 10.0,
+                "transcript_source": "segment_asr",
+                "words": [
+                    {"word": " It", "start": 0.0, "end": 0.25},
+                    {"word": " heart", "start": 8.5, "end": 9.2},
+                ],
+            }
+        ],
+        settings={},
+        evaluator=TranscriptEvaluator(
+            [{"line_id": "target", "line": line_text}],
+            {},
+        ),
+    )
+
+    assert cleaned == []
+    assert "unclean_boundary_audio" not in action
 
 
 def test_boundary_voice_trim_uses_quiet_gap_after_strict_tail_vad(
@@ -3633,6 +3732,33 @@ def test_untranscribed_audio_in_merge_prevents_auto_acceptance() -> None:
     ) == (False, "MERGED_UNTRANSCRIBED_AUDIO")
 
 
+def test_long_disjoint_edge_hallucination_is_an_unsafe_merge() -> None:
+    unsafe = _has_unsafe_untranscribed_merge(
+        action={"start_index": 0, "count": 2},
+        base_segments=[
+            {
+                "transcript": "The bugs always go for this one's tail.",
+                "metrics": {"duration_seconds": 3.0, "rms_dbfs": -18.0},
+            },
+            {
+                "transcript": "Transcribed by subtitles service",
+                "metrics": {"duration_seconds": 10.0, "rms_dbfs": -23.0},
+            },
+        ],
+        segment={
+            "transcript": "The bugs always go for this one's tail.",
+            "metrics": {"duration_seconds": 13.0},
+            "words": [
+                {"word": "The", "start": 0.0, "end": 0.2},
+                {"word": "tail", "start": 2.0, "end": 2.4},
+            ],
+        },
+        settings={},
+    )
+
+    assert unsafe is True
+
+
 def test_quiet_boundary_padding_does_not_reject_complete_merge() -> None:
     unsafe = _has_unsafe_untranscribed_merge(
         action={
@@ -4600,6 +4726,35 @@ def test_structurally_incomplete_superset_does_not_hide_strict_join() -> None:
     assert [candidate["segment_id"] for candidate in retained] == [
         "session__m00065_00068",
         "session__m00067_00068",
+    ]
+
+
+def test_unsafe_long_merge_does_not_hide_reliable_contained_take() -> None:
+    unsafe_merge = {
+        "segment_id": "session__m00197_00200",
+        "session_id": "session",
+        "base_indices": [196, 197, 198, 199],
+        "match_score": 97.0,
+        "selection_score": 118.2,
+        "is_primary_match": True,
+        "reliable": False,
+        "reliability_reason": "MERGED_UNTRANSCRIBED_AUDIO",
+    }
+    clean_take = {
+        "segment_id": "session__m00197_00198",
+        "session_id": "session",
+        "base_indices": [196, 197],
+        "match_score": 97.0,
+        "selection_score": 118.1,
+        "is_primary_match": True,
+        "reliable": True,
+        "reliability_reason": "",
+    }
+
+    retained = prune_line_candidates([unsafe_merge, clean_take])
+
+    assert [candidate["segment_id"] for candidate in retained] == [
+        "session__m00197_00198"
     ]
 
 

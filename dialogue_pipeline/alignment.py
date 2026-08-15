@@ -1987,7 +1987,10 @@ def _word_gap_boundaries(
                             -42.0,
                         )
                     ),
+                    require_quiet=True,
                 )
+                if snapped_sample is None:
+                    continue
                 boundary = snapped_sample / sample_rate
             boundaries.append(
                 (
@@ -3081,7 +3084,10 @@ def _intra_segment_trim_actions(
                             -42.0,
                         )
                     ),
+                    require_quiet=True,
                 )
+                if snapped_sample is None:
+                    continue
                 boundary = snapped_sample / sample_rate
             gap_boundary_offsets[word_index] = boundary
 
@@ -3547,6 +3553,11 @@ def _boundary_voice_trim_actions(
             raw_start=raw_start,
             raw_end=raw_end,
         )
+        if word_bounds is not None:
+            # VAD can miss a quiet initial phoneme (for example the short
+            # vowel in "It"). Never move the leading boundary past the first
+            # independently transcribed word.
+            voice_start = min(voice_start, int(word_bounds[0]))
         if (
             not trailing_cue
             and word_bounds is not None
@@ -4263,10 +4274,24 @@ def _has_unsafe_untranscribed_merge(
         for edge_segment in edge_segments:
             edge_transcript = _segment_transcript(edge_segment)
             edge_tokens = set(_text_features(edge_transcript).tokens)
+            if not edge_tokens or not exact_tokens.isdisjoint(edge_tokens):
+                continue
+            if _is_paralinguistic_transcript(edge_transcript):
+                return True
+            edge_duration = float(
+                (edge_segment.get("metrics") or {}).get("duration_seconds")
+                or (
+                    float(edge_segment.get("end_seconds", 0.0))
+                    - float(edge_segment.get("start_seconds", 0.0))
+                )
+            )
+            edge_rms = (edge_segment.get("metrics") or {}).get("rms_dbfs")
+            # Exact-span Whisper can omit a long audible tail while an
+            # independent base decode hallucinates nonempty text for it. Such
+            # a segment is just as unsafe as one with an empty transcript.
             if (
-                _is_paralinguistic_transcript(edge_transcript)
-                and edge_tokens
-                and exact_tokens.isdisjoint(edge_tokens)
+                edge_duration >= max(2.0, minimum_seconds * 3.0)
+                and (edge_rms is None or float(edge_rms) >= minimum_rms)
             ):
                 return True
     if (

@@ -90,6 +90,7 @@ from dialogue_pipeline.transcription import (
 from dialogue_pipeline.ui import (
     DialogueReviewApp,
     _candidate_selection_display,
+    _context_display_text,
     _initial_segment_window,
     _panned_sample_window,
     _project_settings_from_values,
@@ -4307,6 +4308,19 @@ def test_selected_line_ids_mark_shared_nonverbal_candidates() -> None:
     )
     assert selection_text == "In use (2)"
     assert tags == ("selected_elsewhere",)
+
+
+def test_context_display_removes_duplicate_multiple_context_headings() -> None:
+    context = (
+        "Used in multiple contexts:\n"
+        "At the market.\n"
+        "  USED IN MULTIPLE CONTEXTS:  \n"
+        "Inside the inn."
+    )
+
+    assert _context_display_text(context) == (
+        "Used in multiple contexts:\nAt the market.\nInside the inn."
+    )
 
 
 def test_finalize_omits_unselected_lines(tmp_path: Path) -> None:

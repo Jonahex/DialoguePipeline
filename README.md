@@ -85,9 +85,12 @@ selected line on the right.
 
 - Filter lines by status or click a line-column heading to sort.
 - Use the play controls to audition a selected take or any candidate.
+- Click a candidate row to inspect its waveform. The read-only waveform uses
+  the same mouse-wheel zoom and right-drag navigation as Copy/Edit.
 - Select or unselect candidates. Changes are saved immediately to
   `line_review.json`.
 - Review the line context, full text, and acting note above the candidates.
+  Long contexts stay in a compact scrollable field.
 - For nonverbal lines, choose from the shared pool of unmatched audible
   segments. Amber candidates are already selected for another line.
 - Select **Mark for retake** to clear the current selection and assign `RETAKE`

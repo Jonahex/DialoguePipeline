@@ -65,6 +65,23 @@ STATUS_COLORS = {
     "RETAKE": "#fce7f3",
 }
 
+MULTIPLE_CONTEXTS_HEADER = "used in multiple contexts:"
+
+
+def _context_display_text(value: Any) -> str:
+    """Remove repeated multi-context headings while preserving context text."""
+
+    lines: list[str] = []
+    header_seen = False
+    for line in str(value or "").strip().splitlines():
+        normalized = " ".join(line.strip().casefold().split())
+        if normalized == MULTIPLE_CONTEXTS_HEADER:
+            if header_seen:
+                continue
+            header_seen = True
+        lines.append(line.rstrip())
+    return "\n".join(lines).strip()
+
 
 def _uses_unmatched_candidates(line: dict[str, Any]) -> bool:
     return bool(
@@ -362,6 +379,7 @@ class SegmentEditorDialog:
         self._temporary_dir = tempfile.TemporaryDirectory(
             prefix="dialogue-va-segment-editor-"
         )
+        self.playback_error_title = "Cannot play edited segment"
         self.saved = False
 
         self.window = tk.Toplevel(parent)
@@ -746,7 +764,7 @@ class SegmentEditorDialog:
         except Exception as error:
             self._playback_active = False
             messagebox.showerror(
-                "Cannot play edited segment",
+                self.playback_error_title,
                 str(error),
                 parent=self.window,
             )
@@ -798,6 +816,177 @@ class SegmentEditorDialog:
         with contextlib.suppress(tk.TclError):
             self.window.grab_release()
         self.window.destroy()
+        with contextlib.suppress(OSError):
+            self._temporary_dir.cleanup()
+
+
+class CandidateWaveformView(SegmentEditorDialog):
+    """Embedded, read-only version of the copy/edit waveform."""
+
+    def __init__(
+        self,
+        *,
+        parent: ttk.Frame,
+        player: AudioPlayer,
+    ) -> None:
+        self.player = player
+        self.audio_path = Path()
+        self.sample_rate = 1
+        self.source_frames = 1
+        self.start_sample = 0
+        self.end_sample = 1
+        self.context_start = 0
+        self.context_end = 1
+        self.view_start = 0
+        self.view_end = 1
+        self._envelope_min = np.zeros(1)
+        self._envelope_max = np.zeros(1)
+        self._pan_start_x: int | None = None
+        self._pan_view_start = 0
+        self._pan_view_end = 1
+        self._pan_render_after_id: str | None = None
+        self._playback_active = False
+        self._playback_after_id: str | None = None
+        self._temporary_dir = tempfile.TemporaryDirectory(
+            prefix="dialogue-va-candidate-preview-"
+        )
+        self.playback_error_title = "Cannot play candidate"
+        self._loaded = False
+        self._disposed = False
+
+        self.frame = ttk.Labelframe(
+            parent,
+            text="Selected candidate waveform",
+            padding=8,
+        )
+        # Shared waveform methods schedule redraws against ``window``.
+        self.window = self.frame
+        ttk.Label(
+            self.frame,
+            text="Mouse wheel: zoom. Right-drag: move along the timeline.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(0, 6))
+        self.canvas = tk.Canvas(
+            self.frame,
+            height=190,
+            background="#f8fafc",
+            highlightthickness=1,
+            highlightbackground="#94a3b8",
+        )
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", self._canvas_resized)
+        self.canvas.bind("<Button-3>", self._pan_started)
+        self.canvas.bind("<B3-Motion>", self._pan_moved)
+        self.canvas.bind("<ButtonRelease-3>", self._pan_finished)
+        self.canvas.bind("<Motion>", self._canvas_motion)
+        self.canvas.bind("<MouseWheel>", self._mouse_wheel)
+        self.canvas.bind("<Button-4>", self._mouse_wheel_up)
+        self.canvas.bind("<Button-5>", self._mouse_wheel_down)
+
+        controls = ttk.Frame(self.frame, padding=(0, 8, 0, 0))
+        controls.pack(fill="x")
+        self.play_button = ttk.Button(
+            controls,
+            text="\u25b6 Play",
+            command=self.play,
+            state="disabled",
+        )
+        self.play_button.pack(side="left")
+        self.bounds_text = tk.StringVar(value="Select a candidate to view it.")
+        ttk.Label(
+            controls,
+            textvariable=self.bounds_text,
+            style="Muted.TLabel",
+        ).pack(side="left", padx=16)
+        self.frame.after_idle(self._redraw)
+
+    def show_segment(
+        self,
+        *,
+        audio_path: Path,
+        sample_rate: int,
+        source_frames: int,
+        start_sample: int,
+        end_sample: int,
+    ) -> None:
+        self._cancel_pan_refresh()
+        self._cancel_playback_timer()
+        self.player.stop()
+        if not 0 <= start_sample < end_sample <= source_frames:
+            raise ValueError("The candidate has invalid source sample boundaries.")
+        self.audio_path = audio_path
+        self.sample_rate = sample_rate
+        self.source_frames = source_frames
+        self.start_sample = start_sample
+        self.end_sample = end_sample
+        context_frames = int(round(self.CONTEXT_SECONDS * sample_rate))
+        self.context_start = max(0, start_sample - context_frames)
+        self.context_end = min(source_frames, end_sample + context_frames)
+        self.view_start, self.view_end = _initial_segment_window(
+            context_start=self.context_start,
+            context_end=self.context_end,
+            selection_start=start_sample,
+            selection_end=end_sample,
+            sample_rate=sample_rate,
+        )
+        self._envelope_min, self._envelope_max = self._read_waveform()
+        self._loaded = True
+        self.play_button.configure(state="normal")
+        self._update_bounds_text()
+        self._redraw()
+
+    def clear(self, message: str = "Select a candidate to view it.") -> None:
+        if self._disposed:
+            return
+        self._cancel_pan_refresh()
+        self._cancel_playback_timer()
+        self._playback_active = False
+        self.player.stop()
+        self._loaded = False
+        self._pan_start_x = None
+        self.play_button.configure(state="disabled")
+        self.bounds_text.set(message)
+        self._redraw()
+
+    def _redraw(self) -> None:
+        if self._disposed or not self.frame.winfo_exists():
+            return
+        if self._loaded:
+            super()._redraw()
+            return
+        self.canvas.delete("all")
+        self.canvas.create_text(
+            max(1, self.canvas.winfo_width()) / 2.0,
+            max(1, self.canvas.winfo_height()) / 2.0,
+            text=self.bounds_text.get(),
+            fill="#64748b",
+            font=("Segoe UI", 10),
+        )
+
+    def _change_time_scale(self, x: float, zoom_factor: float) -> None:
+        if self._loaded:
+            super()._change_time_scale(x, zoom_factor)
+
+    def _pan_started(self, event: tk.Event[Any]) -> str:
+        if not self._loaded:
+            return "break"
+        return super()._pan_started(event)
+
+    def _canvas_motion(self, _event: tk.Event[Any]) -> None:
+        self.canvas.configure(cursor="fleur" if self._pan_start_x is not None else "")
+
+    def play(self) -> None:
+        if self._loaded:
+            super().play()
+
+    def dispose(self) -> None:
+        if self._disposed:
+            return
+        self._cancel_pan_refresh()
+        self._cancel_playback_timer()
+        self._playback_active = False
+        self.player.stop()
+        self._disposed = True
         with contextlib.suppress(OSError):
             self._temporary_dir.cleanup()
 
@@ -1312,6 +1501,9 @@ class DialogueReviewApp:
         self._cancel_status: tk.StringVar | None = None
         self._worker_thread: threading.Thread | None = None
         self._candidate_transcription_runtime: dict[str, Any] = {}
+        self.selected_candidate_id: str | None = None
+        self._candidate_line_id: str | None = None
+        self.candidate_waveform: CandidateWaveformView | None = None
 
         self._configure_styles()
         self.show_start()
@@ -1330,11 +1522,17 @@ class DialogueReviewApp:
     def close(self) -> None:
         if self._cancel_event is not None:
             self._cancel_event.set()
+        if self.candidate_waveform is not None:
+            self.candidate_waveform.dispose()
+            self.candidate_waveform = None
         self.player.stop()
         self.root.destroy()
 
     def _clear(self) -> None:
         self.player.stop()
+        if self.candidate_waveform is not None:
+            self.candidate_waveform.dispose()
+            self.candidate_waveform = None
         for child in self.root.winfo_children():
             child.destroy()
         self._log_text = None
@@ -1349,6 +1547,8 @@ class DialogueReviewApp:
         self.review_path = None
         self.review_data = None
         self.selected_line_id = None
+        self.selected_candidate_id = None
+        self._candidate_line_id = None
 
         outer = ttk.Frame(self.root, padding=40)
         outer.pack(fill="both", expand=True)
@@ -1812,6 +2012,8 @@ class DialogueReviewApp:
         assert self.review_data is not None
         assert self.project_dir is not None
         self._clear()
+        self.selected_candidate_id = None
+        self._candidate_line_id = None
 
         toolbar = ttk.Frame(self.root, padding=(16, 12))
         toolbar.pack(fill="x")
@@ -1939,7 +2141,7 @@ class DialogueReviewApp:
         selected_details.grid(row=0, column=0, columnspan=2, sticky="ew")
         selected_details.grid_columnconfigure(1, weight=1)
         detail_fields = [
-            ("Context", "selected_context_label"),
+            ("Context", "selected_context_text"),
             ("Line", "selected_line_label"),
             ("Acting note", "selected_acting_note_label"),
         ]
@@ -1950,6 +2152,33 @@ class DialogueReviewApp:
                 style="FieldName.TLabel",
                 anchor="nw",
             ).grid(row=row, column=0, sticky="nw", padx=(0, 10), pady=2)
+            if title == "Context":
+                context_field = ttk.Frame(selected_details)
+                context_field.grid(row=row, column=1, sticky="ew", pady=2)
+                context_field.grid_columnconfigure(0, weight=1)
+                value_text = tk.Text(
+                    context_field,
+                    height=3,
+                    wrap="word",
+                    relief="solid",
+                    borderwidth=1,
+                    padx=4,
+                    pady=3,
+                    font=("Segoe UI", 9),
+                    background="#ffffff",
+                    foreground="#1f2937",
+                    state="disabled",
+                )
+                context_scrollbar = ttk.Scrollbar(
+                    context_field,
+                    orient="vertical",
+                    command=value_text.yview,
+                )
+                value_text.configure(yscrollcommand=context_scrollbar.set)
+                value_text.grid(row=0, column=0, sticky="ew")
+                context_scrollbar.grid(row=0, column=1, sticky="ns")
+                setattr(self, attribute, value_text)
+                continue
             value_label = ttk.Label(
                 selected_details,
                 text="—",
@@ -2000,7 +2229,7 @@ class DialogueReviewApp:
             right,
             columns=candidate_columns,
             show="headings",
-            selectmode="none",
+            selectmode="browse",
         )
         candidate_headings = {
             "segment": ("Segment", 210, "w"),
@@ -2037,7 +2266,8 @@ class DialogueReviewApp:
             yscrollcommand=self.candidate_vertical_scrollbar.set,
             xscrollcommand=self.candidate_horizontal_scrollbar.set,
         )
-        right.grid_rowconfigure(3, weight=1)
+        right.grid_rowconfigure(3, weight=3)
+        right.grid_rowconfigure(5, weight=2)
         right.grid_columnconfigure(0, weight=1)
         self.candidate_tree.grid(row=3, column=0, sticky="nsew")
         self.candidate_vertical_scrollbar.grid(row=3, column=1, sticky="ns")
@@ -2048,6 +2278,21 @@ class DialogueReviewApp:
         )
         self.candidate_tree.bind("<ButtonRelease-1>", self._candidate_table_clicked)
         self.candidate_tree.bind("<Motion>", self._candidate_table_motion)
+        self.candidate_tree.bind(
+            "<<TreeviewSelect>>",
+            self._candidate_tree_selected,
+        )
+        self.candidate_waveform = CandidateWaveformView(
+            parent=right,
+            player=self.player,
+        )
+        self.candidate_waveform.frame.grid(
+            row=5,
+            column=0,
+            columnspan=2,
+            sticky="nsew",
+            pady=(8, 0),
+        )
         self.render_lines()
         self.render_candidates()
 
@@ -2207,6 +2452,14 @@ class DialogueReviewApp:
             cursor="hand2" if is_audio and has_audio else ""
         )
 
+    def _set_context_display(self, value: Any) -> None:
+        text = _context_display_text(value) or "\u2014"
+        self.selected_context_text.configure(state="normal")
+        self.selected_context_text.delete("1.0", "end")
+        self.selected_context_text.insert("1.0", text)
+        self.selected_context_text.configure(state="disabled")
+        self.selected_context_text.yview_moveto(0.0)
+
     def render_candidates(self) -> None:
         assert self.review_data is not None
         children = self.candidate_tree.get_children()
@@ -2214,19 +2467,27 @@ class DialogueReviewApp:
             self.candidate_tree.delete(*children)
         line = self._selected_line()
         if line is None:
+            self.selected_candidate_id = None
+            self._candidate_line_id = None
             self.mark_retake_button.configure(state="disabled")
-            self.selected_context_label.configure(text="—")
+            self._set_context_display("")
             self.selected_line_label.configure(text="—")
             self.selected_acting_note_label.configure(text="—")
             self.candidate_description.configure(
                 text="Select a line to review its candidates."
             )
+            if self.candidate_waveform is not None:
+                self.candidate_waveform.clear()
             return
 
+        line_id = str(line["line_id"])
+        if self._candidate_line_id != line_id:
+            self.selected_candidate_id = None
+        self._candidate_line_id = line_id
         self.mark_retake_button.configure(
             state=("disabled" if line["status"] == "RETAKE" else "normal")
         )
-        self.selected_context_label.configure(text=line.get("context") or "—")
+        self._set_context_display(line.get("context"))
         self.selected_line_label.configure(text=line["line_text"] or "—")
         self.selected_acting_note_label.configure(
             text=line.get("acting_note") or "—"
@@ -2274,12 +2535,15 @@ class DialogueReviewApp:
                 reverse=True,
             )
         if not candidates:
+            self.selected_candidate_id = None
             self.candidate_description.configure(
                 text=(
                     f"{description}\n\n" if description else ""
                 )
                 + "No candidate segments are available."
             )
+            if self.candidate_waveform is not None:
+                self.candidate_waveform.clear("No candidate waveform is available.")
             return
 
         selected_line_ids = _selected_line_ids_by_segment(self.review_data)
@@ -2326,6 +2590,55 @@ class DialogueReviewApp:
                 ),
                 tags=tags,
             )
+
+        candidate_ids = [str(candidate["segment_id"]) for candidate in candidates]
+        preferred_id = self.selected_candidate_id
+        if preferred_id not in candidate_ids:
+            preferred_id = next(
+                (
+                    str(candidate_id)
+                    for candidate_id in (
+                        line.get("selected_segment_id"),
+                        line.get("suggested_segment_id"),
+                    )
+                    if candidate_id and str(candidate_id) in candidate_ids
+                ),
+                candidate_ids[0],
+            )
+        self.selected_candidate_id = preferred_id
+        self.candidate_tree.selection_set(preferred_id)
+        self.candidate_tree.focus(preferred_id)
+        self.candidate_tree.see(preferred_id)
+        self._show_candidate_waveform(preferred_id)
+
+    def _candidate_tree_selected(self, _event: tk.Event[Any]) -> None:
+        selected = self.candidate_tree.selection()
+        if not selected:
+            return
+        segment_id = str(selected[0])
+        if segment_id == self.selected_candidate_id:
+            return
+        self.selected_candidate_id = segment_id
+        self._show_candidate_waveform(segment_id)
+
+    def _show_candidate_waveform(self, segment_id: str) -> None:
+        if self.candidate_waveform is None or self.project_dir is None:
+            return
+        try:
+            source = segment_edit_source(
+                project_dir=self.project_dir,
+                segment_id=segment_id,
+            )
+            segment = source["segment"]
+            self.candidate_waveform.show_segment(
+                audio_path=source["audio_path"],
+                sample_rate=int(source["sample_rate"]),
+                source_frames=int(source["source_frames"]),
+                start_sample=int(segment["start_sample"]),
+                end_sample=int(segment["end_sample"]),
+            )
+        except Exception as error:
+            self.candidate_waveform.clear(f"Waveform unavailable: {error}")
 
     def _candidate_table_clicked(self, event: tk.Event[Any]) -> None:
         segment_id = self.candidate_tree.identify_row(event.y)

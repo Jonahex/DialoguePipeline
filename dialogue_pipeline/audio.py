@@ -224,19 +224,19 @@ def first_quiet_pcm_boundary(
     return None
 
 
-def pcm_voice_bounds(
+def pcm_voice_regions(
     path: Path,
     *,
     start_sample: int,
     end_sample: int,
     threshold: float = 0.5,
-) -> tuple[int, int] | None:
-    """Return absolute PCM bounds classified as speech by Silero VAD."""
+) -> list[tuple[int, int]]:
+    """Return absolute PCM regions classified as speech by Silero VAD."""
 
     try:
         with wave.open(str(path), "rb") as reader:
             if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
-                return None
+                return []
             sample_rate = int(reader.getframerate())
             channels = int(reader.getnchannels())
             frame_count = int(reader.getnframes())
@@ -246,11 +246,11 @@ def pcm_voice_bounds(
                 min(int(end_sample), frame_count),
             )
             if end_sample <= start_sample:
-                return None
+                return []
             reader.setpos(start_sample)
             raw = reader.readframes(end_sample - start_sample)
     except (EOFError, OSError, wave.Error):
-        return None
+        return []
 
     samples = np.frombuffer(raw, dtype="<i2").astype(np.float32)
     if channels > 1:
@@ -284,16 +284,39 @@ def pcm_voice_bounds(
             speech_pad_ms=0,
         ),
     )
-    if not timestamps:
-        return None
-    first = int(timestamps[0]["start"])
-    last = int(timestamps[-1]["end"])
-    voiced_start = start_sample + round(first * sample_rate / vad_rate)
-    voiced_end = start_sample + round(last * sample_rate / vad_rate)
-    return (
-        max(start_sample, min(voiced_start, end_sample)),
-        max(start_sample, min(voiced_end, end_sample)),
+    regions = []
+    for timestamp in timestamps:
+        voiced_start = start_sample + round(
+            int(timestamp["start"]) * sample_rate / vad_rate
+        )
+        voiced_end = start_sample + round(
+            int(timestamp["end"]) * sample_rate / vad_rate
+        )
+        bounded_start = max(start_sample, min(voiced_start, end_sample))
+        bounded_end = max(start_sample, min(voiced_end, end_sample))
+        if bounded_end > bounded_start:
+            regions.append((bounded_start, bounded_end))
+    return regions
+
+
+def pcm_voice_bounds(
+    path: Path,
+    *,
+    start_sample: int,
+    end_sample: int,
+    threshold: float = 0.5,
+) -> tuple[int, int] | None:
+    """Return the outer absolute PCM bounds classified as speech."""
+
+    regions = pcm_voice_regions(
+        path,
+        start_sample=start_sample,
+        end_sample=end_sample,
+        threshold=threshold,
     )
+    if not regions:
+        return None
+    return regions[0][0], regions[-1][1]
 
 
 def prepare_pcm_segmentation_source(

@@ -711,6 +711,146 @@ def test_boundary_voice_trim_preserves_quiet_first_word(
     assert "unclean_boundary_audio" not in action
 
 
+def test_boundary_voice_trim_ignores_zero_clamped_stretched_first_word(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_bounds",
+        lambda *_args, **_kwargs: (
+            round(0.93 * sample_rate),
+            round(3.10 * sample_rate),
+        ),
+    )
+    line_text = "What now, milk-drinker?"
+    line = {"line_id": "target", "line": line_text}
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 100.0,
+        "transcript": line_text,
+        "duration_plausibility": 50.0,
+    }
+    cleaned = _boundary_voice_trim_actions(
+        [action],
+        project_dir=tmp_path,
+        session_entry={
+            "sample_rate": sample_rate,
+            "working_audio": "source.wav",
+            "audio": "source.wav",
+        },
+        lines=[line],
+        base_segments=[
+            {
+                "start_sample": 0,
+                "end_sample": round(3.68 * sample_rate),
+                "start_seconds": 0.0,
+                "end_seconds": 3.68,
+                "segment_asr": {
+                    "primary": {
+                        "words": [
+                            {"word": " What", "start": 0.0, "end": 1.04},
+                            {
+                                "word": " drinker",
+                                "start": 2.25,
+                                "end": 2.92,
+                            },
+                        ]
+                    }
+                },
+            }
+        ],
+        settings={},
+        evaluator=TranscriptEvaluator([line], {}),
+    )
+
+    assert cleaned[0]["trim_start_sample"] == round(0.85 * sample_rate)
+
+
+def test_boundary_voice_trim_recovers_detached_failed_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    line_text = (
+        "I could, but I'd have to import them from Cyrodiil. "
+        "They're not too common around here."
+    )
+    line = {"line_id": "target", "line": line_text}
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_bounds",
+        lambda *_args, **_kwargs: (
+            round(0.22 * sample_rate),
+            round(7.17 * sample_rate),
+        ),
+    )
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_regions",
+        lambda *_args, **_kwargs: [
+            (round(0.22 * sample_rate), round(1.60 * sample_rate)),
+            (round(2.14 * sample_rate), round(5.57 * sample_rate)),
+            (round(5.76 * sample_rate), round(7.17 * sample_rate)),
+        ],
+    )
+    monkeypatch.setattr(
+        alignment_module,
+        "first_quiet_pcm_boundary",
+        lambda _path, **kwargs: int(kwargs["start_sample"]),
+    )
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 100.0,
+        "transcript": line_text,
+        "duration_plausibility": 79.0,
+    }
+    cleaned = _boundary_voice_trim_actions(
+        [action],
+        project_dir=tmp_path,
+        session_entry={
+            "sample_rate": sample_rate,
+            "working_audio": "source.wav",
+            "audio": "source.wav",
+        },
+        lines=[line],
+        base_segments=[
+            {
+                "start_sample": 0,
+                "end_sample": round(8.90 * sample_rate),
+                "start_seconds": 0.0,
+                "end_seconds": 8.90,
+                "segment_asr": {
+                    "primary": {
+                        "words": [
+                            {"word": " I", "start": 0.0, "end": 0.26},
+                            {"word": " here", "start": 6.68, "end": 6.94},
+                        ]
+                    }
+                },
+            }
+        ],
+        settings={},
+        evaluator=TranscriptEvaluator([line], {}),
+    )
+
+    detached = next(
+        item for item in cleaned if item["detached_leading_voice_trim"]
+    )
+    assert detached["trim_start_sample"] == round(2.06 * sample_rate)
+    assert detached["unclean_boundary_audio"] is False
+    assert action["detached_edge_speech"] is True
+
+
 def test_boundary_voice_trim_uses_quiet_gap_after_strict_tail_vad(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2481,6 +2621,92 @@ def test_trim_recovery_splits_adjacent_repeated_line_without_word_gap() -> None:
     assert second["trim_start_sample"] == expected_boundary
     assert second["trim_end_sample"] == segment["end_sample"]
     assert all(item["match_score"] == 100.0 for item in trimmed)
+
+
+def test_repeated_take_trim_uses_ordered_vad_gaps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    line_text = "See you later."
+    words = [
+        {"word": " See", "start": 0.0, "end": 0.35},
+        {"word": " you", "start": 0.35, "end": 0.46},
+        {"word": " later", "start": 0.46, "end": 0.76},
+        {"word": " See", "start": 0.90, "end": 1.82},
+        {"word": " you", "start": 1.82, "end": 2.0},
+        {"word": " later", "start": 2.0, "end": 2.32},
+        {"word": " See", "start": 2.46, "end": 3.22},
+        {"word": " you", "start": 3.22, "end": 3.36},
+        {"word": " later", "start": 3.36, "end": 3.64},
+    ]
+    segment = {
+        "segment_id": "session__s00001",
+        "file": "segment.wav",
+        "start_sample": 0,
+        "end_sample": round(4.2 * sample_rate),
+        "start_seconds": 0.0,
+        "end_seconds": 4.2,
+        "transcript": "See you later See you later See you later",
+        "segment_asr": {
+            "primary": {
+                "transcript": "See you later See you later See you later",
+                "words": words,
+            }
+        },
+    }
+    monkeypatch.setattr(
+        alignment_module,
+        "_segment_voice_regions_for_trimming",
+        lambda *_args, **_kwargs: [
+            (round(0.25 * sample_rate), round(1.02 * sample_rate)),
+            (round(1.79 * sample_rate), round(2.53 * sample_rate)),
+            (round(3.17 * sample_rate), round(3.84 * sample_rate)),
+        ],
+    )
+    monkeypatch.setattr(
+        alignment_module,
+        "quietest_pcm_boundary",
+        lambda _path, **kwargs: int(kwargs["proposed_sample"]),
+    )
+    line = {"line_id": "target", "line": line_text}
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 60.0,
+        "transcript": segment["transcript"],
+        "duration_plausibility": 30.0,
+        "top_matches": [],
+    }
+
+    trimmed = _intra_segment_trim_actions(
+        [action],
+        lines=[line],
+        base_segments=[segment],
+        sample_rate=sample_rate,
+        settings={},
+        evaluator=TranscriptEvaluator([line], {}),
+        project_dir=tmp_path,
+    )
+
+    expected_boundaries = {
+        round(((1.02 + 1.79) / 2.0) * sample_rate),
+        round(((2.53 + 3.17) / 2.0) * sample_rate),
+    }
+    actual_boundaries = {
+        int(item["trim_start_sample"])
+        for item in trimmed
+        if int(item["trim_start_sample"]) > 0
+    } | {
+        int(item["trim_end_sample"])
+        for item in trimmed
+        if int(item["trim_end_sample"]) < int(segment["end_sample"])
+    }
+    assert actual_boundaries == expected_boundaries
+    assert all(item["repeated_take_trim"] for item in trimmed)
 
 
 def test_fragment_join_can_trim_shared_take_boundary_segment() -> None:
@@ -6450,20 +6676,20 @@ def test_segmentation_and_alignment_integration(
 ) -> None:
     import dialogue_pipeline.segmentation as segmentation_module
 
-    def fake_voice_bounds(
+    def fake_voice_regions(
         _path: Path,
         *,
         start_sample: int,
         end_sample: int,
         threshold: float,
-    ) -> tuple[int, int]:
+    ) -> list[tuple[int, int]]:
         inset = 2400 if threshold < 0.7 else 3600
-        return start_sample + inset, end_sample - inset
+        return [(start_sample + inset, end_sample - inset)]
 
     monkeypatch.setattr(
         segmentation_module,
-        "pcm_voice_bounds",
-        fake_voice_bounds,
+        "pcm_voice_regions",
+        fake_voice_regions,
     )
     source = tmp_path / "source.wav"
     _write_pattern(source)

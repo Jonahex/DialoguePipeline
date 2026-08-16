@@ -9,7 +9,7 @@ from .audio import (
     acoustic_regions,
     cut_pcm_wav,
     detect_silences,
-    pcm_voice_bounds,
+    pcm_voice_regions,
     prepare_pcm_segmentation_source,
     probe_audio,
     quietest_pcm_boundary,
@@ -198,13 +198,13 @@ def _segment_voice_bounds(
 ) -> dict[str, Any] | None:
     if not bool(settings.get("enabled", True)):
         return None
-    speech_bounds = pcm_voice_bounds(
+    speech_regions = pcm_voice_regions(
         audio_path,
         start_sample=start_sample,
         end_sample=end_sample,
         threshold=float(settings.get("vad_threshold", 0.50)),
     )
-    breath_bounds = pcm_voice_bounds(
+    breath_regions = pcm_voice_regions(
         audio_path,
         start_sample=start_sample,
         end_sample=end_sample,
@@ -212,20 +212,28 @@ def _segment_voice_bounds(
     )
     return {
         "source": "silero_vad",
+        "speech_regions": [
+            {"start_sample": start, "end_sample": end}
+            for start, end in speech_regions
+        ],
+        "strict_speech_regions": [
+            {"start_sample": start, "end_sample": end}
+            for start, end in breath_regions
+        ],
         "speech": (
             {
-                "start_sample": speech_bounds[0],
-                "end_sample": speech_bounds[1],
+                "start_sample": speech_regions[0][0],
+                "end_sample": speech_regions[-1][1],
             }
-            if speech_bounds is not None
+            if speech_regions
             else None
         ),
         "strict_speech": (
             {
-                "start_sample": breath_bounds[0],
-                "end_sample": breath_bounds[1],
+                "start_sample": breath_regions[0][0],
+                "end_sample": breath_regions[-1][1],
             }
-            if breath_bounds is not None
+            if breath_regions
             else None
         ),
     }

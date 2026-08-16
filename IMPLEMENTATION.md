@@ -126,8 +126,9 @@ window within its word gap. Relevant settings are:
 ```
 
 Every padded base segment is analyzed with normal and strict Silero VAD
-thresholds. Absolute `voice_bounds` are stored without destructively shortening
-the base WAV. Alignment later decides whether and how to use those bounds.
+thresholds. Absolute outer `voice_bounds` and the individual speech regions are
+stored without destructively shortening the base WAV. Alignment later decides
+whether and how to use those bounds.
 
 ## Independent segment transcription
 
@@ -255,7 +256,8 @@ Repeated takes are blocked from `AUTO_OK` by token precision, detection of
 voiced but untranscribed merged pieces (`MERGED_UNTRANSCRIBED_AUDIO`), and
 `reliable_min_duration_plausibility` (`POSSIBLE_REPEATED_TAKES`). Repetition can
 also supply a split point when Whisper stretches a boundary word across a pause;
-both halves are then transcribed independently.
+the split is accepted only when ordered Silero VAD regions provide a matching
+acoustic gap, and both resulting spans are then transcribed independently.
 
 ## Vocalizations and non-speech boundaries
 
@@ -284,7 +286,15 @@ cut before a separated trailing breath while preventing VAD or imprecise ASR
 timestamps from clipping a quiet release or unvoiced final consonant. When no
 quiet separation exists, the tail is preserved. When reliable candidates are
 otherwise tied, review selection prefers an intact segment over a generated
-boundary trim.
+boundary trim. A zero-clamped Whisper word timestamp protects a quiet leading
+word only when that word ends before the VAD region; it cannot preserve a long
+room-tone prefix by itself.
+
+For a complete line with implausible duration, alignment also checks for a
+short, detached leading speech region separated by a clear VAD gap. It creates
+a conservatively padded suffix candidate and forces the untrimmed alternative
+to review. Exact-span ASR must still verify the suffix before it can become
+`AUTO_OK`; this catches failed starts that Whisper silently collapses.
 
 ## Exact-span candidate verification
 
@@ -379,7 +389,13 @@ The grouped configuration written for new projects is:
         "trim_non_speech_edges": true,
         "minimum_edge_seconds": 0.3,
         "pre_padding_seconds": 0.08,
-        "post_padding_seconds": 0.12
+        "post_padding_seconds": 0.12,
+        "trim_detached_edge_speech": true,
+        "detached_minimum_gap_seconds": 0.3,
+        "detached_maximum_prefix_seconds": 2.0,
+        "detached_maximum_removed_fraction": 0.4,
+        "detached_maximum_duration_plausibility": 90.0,
+        "detached_minimum_script_words": 4
       },
       "edge_cues": {
         "extend_adjacent_segments": true,

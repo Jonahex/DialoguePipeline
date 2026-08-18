@@ -61,6 +61,10 @@ _INTERNAL_DEFAULTS: dict[str, Any] = {
     "intra_segment_trim_min_token_coverage": 0.85,
     "intra_segment_trim_min_token_precision": 0.85,
     "intra_segment_trim_min_ordered_score": 70.0,
+    "acoustic_take_trim_enabled": True,
+    "acoustic_take_trim_max_actions_per_line": 8,
+    "acoustic_take_trim_max_full_duration_plausibility": 70.0,
+    "acoustic_take_trim_min_duration_plausibility": 45.0,
     "edge_trim_min_gap_seconds": 0.30,
     "edge_trim_fallback_min_gap_seconds": 0.10,
     "boundary_noise_cleanup_enabled": True,
@@ -70,12 +74,17 @@ _INTERNAL_DEFAULTS: dict[str, Any] = {
     "boundary_voice_trim_min_edge_seconds": 0.30,
     "boundary_voice_trim_pre_padding_seconds": 0.08,
     "boundary_voice_trim_post_padding_seconds": 0.12,
+    "boundary_voice_trim_weak_vad_threshold": 0.30,
+    "boundary_voice_trim_sibilant_lookback_seconds": 0.50,
+    "boundary_voice_trim_max_release_seconds": 0.35,
+    "boundary_voice_trim_incomplete_min_edge_seconds": 0.50,
     "detached_edge_voice_trim_enabled": True,
     "detached_edge_voice_min_gap_seconds": 0.30,
     "detached_edge_voice_max_prefix_seconds": 2.0,
     "detached_edge_voice_max_removed_fraction": 0.40,
     "detached_edge_voice_max_duration_plausibility": 90.0,
     "detached_edge_voice_min_script_words": 4,
+    "detached_edge_voice_max_tail_seconds": 0.50,
     "edge_cue_extension_enabled": True,
     "edge_cue_extension_max_gap_seconds": 0.40,
     "edge_cue_extension_max_segment_seconds": 5.0,
@@ -240,6 +249,16 @@ _GROUPED_KEYS: dict[tuple[str, ...], str] = {
     ("recovery", "trim_minimum_ordered_score"): (
         "intra_segment_trim_min_ordered_score"
     ),
+    ("recovery", "acoustic_take_splitting"): "acoustic_take_trim_enabled",
+    ("recovery", "acoustic_take_candidates_per_line"): (
+        "acoustic_take_trim_max_actions_per_line"
+    ),
+    ("recovery", "acoustic_take_maximum_full_duration_plausibility"): (
+        "acoustic_take_trim_max_full_duration_plausibility"
+    ),
+    ("recovery", "acoustic_take_minimum_duration_plausibility"): (
+        "acoustic_take_trim_min_duration_plausibility"
+    ),
     ("recovery", "edge_trim_minimum_gap_seconds"): (
         "edge_trim_min_gap_seconds"
     ),
@@ -267,6 +286,18 @@ _GROUPED_KEYS: dict[tuple[str, ...], str] = {
     ("recovery", "audio_boundaries", "post_padding_seconds"): (
         "boundary_voice_trim_post_padding_seconds"
     ),
+    ("recovery", "audio_boundaries", "weak_vad_threshold"): (
+        "boundary_voice_trim_weak_vad_threshold"
+    ),
+    ("recovery", "audio_boundaries", "sibilant_lookback_seconds"): (
+        "boundary_voice_trim_sibilant_lookback_seconds"
+    ),
+    ("recovery", "audio_boundaries", "maximum_release_seconds"): (
+        "boundary_voice_trim_max_release_seconds"
+    ),
+    ("recovery", "audio_boundaries", "incomplete_minimum_edge_seconds"): (
+        "boundary_voice_trim_incomplete_min_edge_seconds"
+    ),
     ("recovery", "audio_boundaries", "trim_detached_edge_speech"): (
         "detached_edge_voice_trim_enabled"
     ),
@@ -290,6 +321,9 @@ _GROUPED_KEYS: dict[tuple[str, ...], str] = {
     ): "detached_edge_voice_max_duration_plausibility",
     ("recovery", "audio_boundaries", "detached_minimum_script_words"): (
         "detached_edge_voice_min_script_words"
+    ),
+    ("recovery", "audio_boundaries", "detached_maximum_tail_seconds"): (
+        "detached_edge_voice_max_tail_seconds"
     ),
     ("recovery", "edge_cues", "extend_adjacent_segments"): (
         "edge_cue_extension_enabled"
@@ -411,6 +445,7 @@ class AlignmentSettings(Mapping[str, Any]):
             "fragment_join_fallback_max_actions",
             "intra_segment_trim_max_actions_per_line",
             "intra_segment_trim_max_actions_per_segment",
+            "acoustic_take_trim_max_actions_per_line",
         ):
             if int(values[key]) < 0:
                 raise ValueError(f"alignment.{key} cannot be negative")
@@ -424,8 +459,12 @@ class AlignmentSettings(Mapping[str, Any]):
             "boundary_voice_trim_min_edge_seconds",
             "boundary_voice_trim_pre_padding_seconds",
             "boundary_voice_trim_post_padding_seconds",
+            "boundary_voice_trim_sibilant_lookback_seconds",
+            "boundary_voice_trim_max_release_seconds",
+            "boundary_voice_trim_incomplete_min_edge_seconds",
             "detached_edge_voice_min_gap_seconds",
             "detached_edge_voice_max_prefix_seconds",
+            "detached_edge_voice_max_tail_seconds",
             "edge_cue_extension_max_gap_seconds",
             "edge_cue_extension_max_segment_seconds",
             "untranscribed_merge_min_seconds",
@@ -448,6 +487,8 @@ class AlignmentSettings(Mapping[str, Any]):
             "boundary_clause_consensus_min_support_score",
             "auto_min_technical_score",
             "detached_edge_voice_max_duration_plausibility",
+            "acoustic_take_trim_max_full_duration_plausibility",
+            "acoustic_take_trim_min_duration_plausibility",
         ):
             if not 0.0 <= float(values[key]) <= 100.0:
                 raise ValueError(f"alignment.{key} must be between 0 and 100")
@@ -463,6 +504,7 @@ class AlignmentSettings(Mapping[str, Any]):
             "intra_segment_trim_min_token_coverage",
             "intra_segment_trim_min_token_precision",
             "detached_edge_voice_max_removed_fraction",
+            "boundary_voice_trim_weak_vad_threshold",
         ):
             if not 0.0 <= float(values[key]) <= 1.0:
                 raise ValueError(f"alignment.{key} must be between 0 and 1")

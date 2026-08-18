@@ -22,7 +22,10 @@ LINE_STATUSES = {
 }
 REVIEW_CANDIDATE_SCORE_GAP = 12.0
 REVIEW_CANDIDATE_MAX_SCORE_DROP = 15.0
-REVIEW_SELECTION_SCORE_TIE = 0.05
+# Exact-ASR candidates often differ by only model-confidence noise. Within a
+# quarter point, acoustic duration plausibility is a more useful take-quality
+# discriminator than the raw selection score.
+REVIEW_SELECTION_SCORE_TIE = 0.25
 STRUCTURALLY_INCOMPLETE_REASONS = {
     "EXTRA_LINE_END",
     "EXTRA_LINE_START",
@@ -192,7 +195,18 @@ def _review_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "start_seconds": float(candidate.get("start_seconds", 0.0)),
         "end_seconds": float(candidate.get("end_seconds", 0.0)),
         "duration_seconds": float(candidate.get("duration_seconds", 0.0)),
+        "duration_plausibility": float(
+            candidate.get("duration_plausibility", 0.0)
+        ),
         "boundary_voice_trim": bool(candidate.get("boundary_voice_trim", False)),
+        "repeated_take_trim": bool(candidate.get("repeated_take_trim", False)),
+        "acoustic_take_trim": bool(candidate.get("acoustic_take_trim", False)),
+        "detached_leading_voice_trim": bool(
+            candidate.get("detached_leading_voice_trim", False)
+        ),
+        "detached_trailing_voice_trim": bool(
+            candidate.get("detached_trailing_voice_trim", False)
+        ),
     }
 
 
@@ -288,7 +302,8 @@ def build_line_review(
             reliable_best = max(
                 near_best_candidates,
                 key=lambda candidate: (
-                    not bool(candidate.get("boundary_voice_trim", False)),
+                    float(candidate.get("duration_plausibility", 0.0)),
+                    bool(candidate.get("boundary_voice_trim", False)),
                     float(candidate.get("selection_score", 0.0)),
                     float(candidate.get("match_score", 0.0)),
                 ),

@@ -15,6 +15,7 @@ from .alignment_settings import AlignmentSettings
 from .audio import (
     first_quiet_pcm_boundary,
     pcm_voice_bounds,
+    pcm_leading_sibilant_start,
     pcm_voice_regions,
     quietest_pcm_boundary,
 )
@@ -2967,6 +2968,7 @@ def _segment_voice_regions_for_trimming(
     *,
     project_dir: Path,
     threshold: float,
+    stored_key: str = "speech_regions",
 ) -> list[tuple[int, int]]:
     """Return segment-local speech regions, reusing stored VAD when possible."""
 
@@ -2974,7 +2976,7 @@ def _segment_voice_regions_for_trimming(
     base_end = int(segment.get("end_sample") or base_start)
     metadata = segment.get("voice_bounds")
     if isinstance(metadata, Mapping):
-        stored = metadata.get("speech_regions")
+        stored = metadata.get(stored_key)
         if isinstance(stored, list):
             regions = []
             for region in stored:
@@ -3021,8 +3023,12 @@ def _snap_repeated_boundaries_to_voice_gaps(
         segment,
         project_dir=project_dir,
         threshold=float(
-            segmentation_settings.get("voice_boundary_vad_threshold", 0.50)
+            segmentation_settings.get(
+                "voice_boundary_breath_vad_threshold",
+                0.70,
+            )
         ),
+        stored_key="strict_speech_regions",
     )
     minimum_voice_gap = max(0.10, min(float(minimum_gap), 0.30))
     gaps = [
@@ -3076,6 +3082,174 @@ def _snap_repeated_boundaries_to_voice_gaps(
         )
         snapped[word_index] = quiet_sample / sample_rate
     return snapped
+
+
+def _acoustic_take_trim_proposals(
+    *,
+    source_action: Mapping[str, Any],
+    segment: Mapping[str, Any],
+    base_index: int,
+    line_index: int,
+    line: dict[str, Any],
+    sample_rate: int,
+    settings: AlignmentSettings,
+    evaluator: TranscriptEvaluator,
+    project_dir: Path,
+    segmentation_settings: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Propose take-sized windows when ASR collapses repeated delivery.
+
+    Whisper sometimes returns only one copy of a line even when the recording
+    contains several takes.  In that case word repetition cannot supply split
+    points.  Strict VAD gaps provide bounded acoustic hypotheses; the normal
+    exact-span ASR stage must still independently verify every proposal.
+    """
+
+    if not bool(settings.get("acoustic_take_trim_enabled", True)):
+        return []
+    transcript = str(
+        ((segment.get("segment_asr") or {}).get("primary") or {}).get(
+            "transcript"
+        )
+        or segment.get("transcript")
+        or source_action.get("transcript")
+        or ""
+    )
+    full = evaluator.evaluate(line_index, transcript)
+    if (
+        full.match_score
+        < float(settings.get("intra_segment_trim_min_match_score", 85.0))
+        or float(full.fidelity["token_coverage"]) < 0.85
+        or float(full.fidelity["token_precision"]) < 0.85
+        or int(full.sentence["missing_clause_count"]) > 0
+        or not bool(full.sentence["clauses_in_order"])
+    ):
+        return []
+
+    base_start = int(segment["start_sample"])
+    base_end = int(segment["end_sample"])
+    full_duration_score = _duration_plausibility(
+        line,
+        {
+            "start_seconds": base_start / sample_rate,
+            "end_seconds": base_end / sample_rate,
+        },
+        expected_word_count=evaluator.line_features[line_index].word_count,
+    )
+    if full_duration_score > float(
+        settings.get("acoustic_take_trim_max_full_duration_plausibility", 70.0)
+    ):
+        return []
+
+    regions = _segment_voice_regions_for_trimming(
+        segment,
+        project_dir=project_dir,
+        threshold=float(
+            segmentation_settings.get(
+                "voice_boundary_breath_vad_threshold",
+                0.70,
+            )
+        ),
+        stored_key="strict_speech_regions",
+    )
+    minimum_gap_samples = round(
+        float(settings.get("intra_segment_trim_min_gap_seconds", 0.40))
+        * sample_rate
+    )
+    gaps = [
+        (left_end, right_start)
+        for (_, left_end), (right_start, _) in zip(regions, regions[1:])
+        if right_start - left_end >= minimum_gap_samples
+    ]
+    if len(gaps) < 2:
+        return []
+
+    audio_path = resolve_project_path(project_dir, str(segment["file"]))
+    boundaries = []
+    for gap_start, gap_end in gaps:
+        proposed = (gap_start + gap_end) // 2
+        quiet = quietest_pcm_boundary(
+            audio_path,
+            proposed_sample=proposed,
+            minimum_sample=gap_start,
+            maximum_sample=gap_end,
+            search_seconds=(gap_end - gap_start) / (2.0 * sample_rate),
+            window_seconds=float(
+                segmentation_settings.get(
+                    "word_split_snap_window_seconds",
+                    0.02,
+                )
+            ),
+            maximum_rms_dbfs=float(
+                segmentation_settings.get(
+                    "word_split_snap_max_rms_dbfs",
+                    -42.0,
+                )
+            ),
+            require_quiet=False,
+        )
+        boundaries.append(int(quiet))
+
+    points = [0, *boundaries, base_end - base_start]
+    leading_cue, trailing_cue = _script_edge_performance_cues(str(line["line"]))
+    proposals = []
+    minimum_window_score = float(
+        settings.get("acoustic_take_trim_min_duration_plausibility", 45.0)
+    )
+    for first in range(len(points) - 1):
+        for last in range(first + 1, len(points)):
+            if first == 0 and last == len(points) - 1:
+                continue
+            if (leading_cue and first > 0) or (
+                trailing_cue and last < len(points) - 1
+            ):
+                continue
+            start_sample = base_start + points[first]
+            end_sample = base_start + points[last]
+            duration_score = _duration_plausibility(
+                line,
+                {
+                    "start_seconds": start_sample / sample_rate,
+                    "end_seconds": end_sample / sample_rate,
+                },
+                expected_word_count=evaluator.line_features[line_index].word_count,
+            )
+            if duration_score < minimum_window_score:
+                continue
+            proposals.append(
+                {
+                    "type": "assigned",
+                    "start_index": base_index,
+                    "count": 1,
+                    "line_index": line_index,
+                    "match_score": full.match_score,
+                    "confidence_margin": float(
+                        source_action.get("confidence_margin", 0.0)
+                    ),
+                    "transcript": str(line["line"]),
+                    "transcript_source": "acoustic_take_trim_preview",
+                    "duration_plausibility": duration_score,
+                    "order_hint": float(source_action.get("order_hint", 0.0)),
+                    "top_matches": [],
+                    "trim_start_sample": start_sample,
+                    "trim_end_sample": end_sample,
+                    "intra_segment_trim": True,
+                    "repeated_take_trim": True,
+                    "acoustic_take_trim": True,
+                    "is_primary_match": True,
+                    "segment_match_rank": 1,
+                }
+            )
+    proposals.sort(
+        key=lambda action: (
+            float(action["duration_plausibility"]),
+            -(int(action["trim_end_sample"]) - int(action["trim_start_sample"])),
+        ),
+        reverse=True,
+    )
+    return proposals[
+        : max(1, int(settings.get("acoustic_take_trim_max_actions_per_line", 8)))
+    ]
 
 
 def _intra_segment_trim_actions(
@@ -3239,6 +3413,28 @@ def _intra_segment_trim_actions(
                     segmentation_settings=segmentation_settings,
                 )
             boundary_offsets.update(repeated_boundaries)
+            if project_dir is not None:
+                for acoustic in _acoustic_take_trim_proposals(
+                    source_action=source_action,
+                    segment=segment,
+                    base_index=base_index,
+                    line_index=line_index,
+                    line=line,
+                    sample_rate=sample_rate,
+                    settings=settings,
+                    evaluator=evaluator,
+                    project_dir=project_dir,
+                    segmentation_settings=segmentation_settings,
+                ):
+                    acoustic_key = (
+                        line_index,
+                        base_index,
+                        int(acoustic["trim_start_sample"]),
+                        int(acoustic["trim_end_sample"]),
+                    )
+                    if acoustic_key not in seen:
+                        seen.add(acoustic_key)
+                        proposals.append(acoustic)
             if not boundary_offsets:
                 continue
             ordered_boundaries = sorted(boundary_offsets)
@@ -3410,6 +3606,7 @@ def _intra_segment_trim_actions(
                     str(action["transcript"]),
                 ).fidelity["token_precision"]
             ),
+            float(action["duration_plausibility"]),
             -(
                 int(action["trim_end_sample"])
                 - int(action["trim_start_sample"])
@@ -3423,8 +3620,16 @@ def _intra_segment_trim_actions(
     for action in proposals:
         line_index = int(action["line_index"])
         base_index = int(action["start_index"])
+        line_limit = (
+            max(
+                maximum_per_line,
+                int(settings.get("acoustic_take_trim_max_actions_per_line", 8)),
+            )
+            if action.get("acoustic_take_trim")
+            else maximum_per_line
+        )
         if (
-            line_counts[line_index] >= maximum_per_line
+            line_counts[line_index] >= line_limit
             or segment_counts[base_index] >= maximum_per_segment
         ):
             continue
@@ -3448,12 +3653,12 @@ def _action_word_sample_bounds(
     sample_rate: int,
     raw_start: int,
     raw_end: int,
-) -> tuple[int, int, int, int] | None:
+) -> tuple[int, int, int, int, bool] | None:
     """Return outer and edge-word ASR bounds inside an action's PCM span."""
 
     start_index = int(source_action["start_index"])
     end_index = start_index + int(source_action["count"])
-    word_bounds = []
+    word_bounds: list[tuple[int, int, bool]] = []
     for segment in base_segments[start_index:end_index]:
         primary_words = (
             ((segment.get("segment_asr") or {}).get("primary") or {}).get(
@@ -3478,6 +3683,7 @@ def _action_word_sample_bounds(
                 (
                     max(raw_start, word_start),
                     min(raw_end, word_end),
+                    word_start < raw_start,
                 )
             )
     if not word_bounds:
@@ -3485,9 +3691,10 @@ def _action_word_sample_bounds(
     word_bounds.sort()
     return (
         word_bounds[0][0],
-        max(end for _, end in word_bounds),
+        max(end for _, end, _ in word_bounds),
         word_bounds[0][1],
         max(word_bounds, key=lambda item: item[1])[0],
+        word_bounds[0][2],
     )
 
 
@@ -3595,6 +3802,9 @@ def _boundary_voice_trim_actions(
     voice_cache: dict[tuple[int, int], tuple[int, int] | None] = {}
     breath_voice_cache: dict[tuple[int, int], tuple[int, int] | None] = {}
     voice_region_cache: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    strict_voice_region_cache: dict[
+        tuple[int, int], list[tuple[int, int]]
+    ] = {}
     stored_detection = session_entry.get("voice_boundary_detection")
     stored_detection_current = bool(
         isinstance(stored_detection, Mapping)
@@ -3618,8 +3828,36 @@ def _boundary_voice_trim_actions(
         )
         for action in actions
     }
+    source_variants = []
+    for root_action in actions:
+        source_variants.append((root_action, root_action))
+        primary_line_index = int(root_action["line_index"])
+        for match in root_action.get("top_matches") or []:
+            alternate_line_index = int(match["line_index"])
+            if (
+                alternate_line_index == primary_line_index
+                or float(match.get("match_score", 0.0))
+                < float(settings.get("candidate_min_score", 45.0))
+            ):
+                continue
+            alternate = dict(root_action)
+            alternate.update(
+                {
+                    "line_index": alternate_line_index,
+                    "match_score": float(match.get("match_score", 0.0)),
+                    "confidence_margin": float(
+                        match.get(
+                            "confidence_margin",
+                            root_action.get("confidence_margin", 0.0),
+                        )
+                    ),
+                    "top_matches": [dict(match)],
+                }
+            )
+            source_variants.append((alternate, root_action))
+
     recovered = []
-    for source_action in actions:
+    for source_action, root_action in source_variants:
         check_processing_cancelled()
         line_index = int(source_action["line_index"])
         line = lines[line_index]
@@ -3631,14 +3869,21 @@ def _boundary_voice_trim_actions(
         )
         fidelity = evaluation.fidelity
         sentence = evaluation.sentence
-        if (
-            evaluation.match_score < minimum_match
-            or float(fidelity["token_coverage"]) < 0.85
-            or float(fidelity["token_precision"]) < 0.85
-            or int(fidelity["leading_extra_token_count"]) > 0
-            or int(fidelity["trailing_extra_token_count"]) > 0
-            or int(sentence["missing_clause_count"]) > 0
-            or not bool(sentence["clauses_in_order"])
+        complete_match = bool(
+            evaluation.match_score >= minimum_match
+            and float(fidelity["token_coverage"]) >= 0.85
+            and float(fidelity["token_precision"]) >= 0.85
+            and int(fidelity["leading_extra_token_count"]) == 0
+            and int(fidelity["trailing_extra_token_count"]) == 0
+            and int(sentence["missing_clause_count"]) == 0
+            and bool(sentence["clauses_in_order"])
+        )
+        # Basic VAD edge cleanup is text-independent. Keep a lower-scoring
+        # action alive so exact-span ASR can reroute its cleaned audio to the
+        # correct secondary line later. More invasive detached-speech recovery
+        # still requires a complete textual match below.
+        if evaluation.match_score < float(
+            settings.get("candidate_min_score", 45.0)
         ):
             continue
 
@@ -3681,10 +3926,13 @@ def _boundary_voice_trim_actions(
         if voice_bounds is None:
             continue
 
-        leading_cue, trailing_cue = _script_edge_performance_cues(
-            str(line["line"])
+        leading_cue, trailing_cue = (
+            _script_edge_performance_cues(str(line["line"]))
+            if complete_match
+            else (False, False)
         )
         voice_start, voice_end = voice_bounds
+        detected_voice_start = voice_start
         word_bounds = _action_word_sample_bounds(
             source_action=source_action,
             base_segments=base_segments,
@@ -3693,17 +3941,47 @@ def _boundary_voice_trim_actions(
             raw_end=raw_end,
         )
         if word_bounds is not None:
-            # VAD can miss a quiet initial phoneme (for example the short
-            # vowel in "It"). Preserve a first word that is wholly before the
-            # VAD region, or a trustworthy nonzero word start. A Whisper word
-            # timestamp clamped to zero and stretched into the VAD region is
-            # not evidence that nearly a second of leading room tone belongs
-            # to the word.
+            # Preserve a complete quiet first word only when a more permissive
+            # VAD pass independently finds speech in its timestamp interval.
+            # Whisper can otherwise stretch a word far back into room tone.
             if (
-                int(word_bounds[0]) > raw_start
-                or int(word_bounds[2]) <= voice_start
+                int(word_bounds[2]) <= detected_voice_start
+                and not bool(word_bounds[4])
             ):
-                voice_start = min(voice_start, int(word_bounds[0]))
+                weak_bounds = pcm_voice_bounds(
+                    audio_path,
+                    start_sample=max(raw_start, int(word_bounds[0])),
+                    end_sample=detected_voice_start,
+                    threshold=float(
+                        settings.get(
+                            "boundary_voice_trim_weak_vad_threshold",
+                            0.30,
+                        )
+                    ),
+                )
+                if (
+                    weak_bounds is not None
+                    and int(weak_bounds[0]) < detected_voice_start
+                    and int(weak_bounds[1]) > int(word_bounds[0])
+                ):
+                    voice_start = min(
+                        voice_start,
+                        int(weak_bounds[0]),
+                        int(word_bounds[0]),
+                    )
+        sibilant_start = pcm_leading_sibilant_start(
+            audio_path,
+            start_sample=raw_start,
+            voice_start_sample=detected_voice_start,
+            maximum_lookback_seconds=float(
+                settings.get(
+                    "boundary_voice_trim_sibilant_lookback_seconds",
+                    0.50,
+                )
+            ),
+        )
+        if sibilant_start is not None:
+            voice_start = min(voice_start, sibilant_start)
         if (
             not trailing_cue
             and word_bounds is not None
@@ -3740,8 +4018,62 @@ def _boundary_voice_trim_actions(
                     >= round(minimum_edge_seconds * sample_rate)
                 ):
                     voice_end = min(voice_end, guarded_breath_end)
+        detached_trailing = False
+        if (
+            bool(settings.get("detached_edge_voice_trim_enabled", True))
+            and not trailing_cue
+            and word_bounds is not None
+        ):
+            if raw_key not in strict_voice_region_cache:
+                strict_voice_region_cache[raw_key] = pcm_voice_regions(
+                    audio_path,
+                    start_sample=raw_start,
+                    end_sample=raw_end,
+                    threshold=breath_threshold,
+                )
+            strict_regions = strict_voice_region_cache[raw_key]
+            if len(strict_regions) >= 2:
+                previous_end = int(strict_regions[-2][1])
+                tail_start, tail_end = map(int, strict_regions[-1])
+                minimum_detached_gap = round(
+                    float(
+                        settings.get(
+                            "detached_edge_voice_min_gap_seconds",
+                            0.30,
+                        )
+                    )
+                    * sample_rate
+                )
+                maximum_tail = round(
+                    float(
+                        settings.get(
+                            "detached_edge_voice_max_tail_seconds",
+                            0.50,
+                        )
+                    )
+                    * sample_rate
+                )
+                if (
+                    tail_start - previous_end >= minimum_detached_gap
+                    and tail_end - tail_start <= maximum_tail
+                    and int(word_bounds[1]) <= previous_end
+                ):
+                    voice_end = min(voice_end, previous_end)
+                    detached_trailing = True
+
         leading_seconds = (voice_start - raw_start) / sample_rate
         trailing_seconds = (raw_end - voice_end) / sample_rate
+        if (
+            not complete_match
+            and max(leading_seconds, trailing_seconds)
+            < float(
+                settings.get(
+                    "boundary_voice_trim_incomplete_min_edge_seconds",
+                    0.50,
+                )
+            )
+        ):
+            continue
         clean_start = raw_start
         clean_end = raw_end
         if not leading_cue and leading_seconds >= minimum_edge_seconds:
@@ -3752,10 +4084,23 @@ def _boundary_voice_trim_actions(
                 # Strict VAD supplies only a proposal.  A real quiet window
                 # after it is required so an unvoiced release cannot be cut
                 # merely because VAD and ASR both ended too early.
+                maximum_release_end = min(
+                    raw_end,
+                    voice_end
+                    + round(
+                        float(
+                            settings.get(
+                                "boundary_voice_trim_max_release_seconds",
+                                0.35,
+                            )
+                        )
+                        * sample_rate
+                    ),
+                )
                 quiet_end = first_quiet_pcm_boundary(
                     audio_path,
                     start_sample=proposed_end,
-                    end_sample=raw_end,
+                    end_sample=maximum_release_end,
                     window_seconds=float(
                         segmentation_settings.get(
                             "word_split_snap_window_seconds",
@@ -3770,10 +4115,19 @@ def _boundary_voice_trim_actions(
                     ),
                 )
                 if quiet_end is not None:
-                    clean_end = max(proposed_end, min(raw_end, quiet_end))
+                    clean_end = max(
+                        proposed_end,
+                        min(maximum_release_end, quiet_end),
+                    )
+                else:
+                    # Processed room tone may never cross the absolute quiet
+                    # threshold.  Keep a bounded release allowance instead of
+                    # retaining the entire noisy tail.
+                    clean_end = maximum_release_end
         detached_start = None
         if (
             bool(settings.get("detached_edge_voice_trim_enabled", True))
+            and complete_match
             and not leading_cue
             and source_action.get("trim_start_sample") is None
             and source_action.get("trim_end_sample") is None
@@ -3851,11 +4205,13 @@ def _boundary_voice_trim_actions(
         if not variants:
             continue
 
-        source_action["unclean_boundary_audio"] = True
-        source_action["boundary_voice_leading_seconds"] = leading_seconds
-        source_action["boundary_voice_trailing_seconds"] = trailing_seconds
+        root_action["unclean_boundary_audio"] = True
+        root_action["boundary_voice_leading_seconds"] = leading_seconds
+        root_action["boundary_voice_trailing_seconds"] = trailing_seconds
         if detached_start is not None:
-            source_action["detached_edge_speech"] = True
+            root_action["detached_edge_speech"] = True
+        if detached_trailing:
+            root_action["detached_trailing_speech"] = True
 
         for variant_start, variant_end, detached in variants:
             clean_key = (
@@ -3879,6 +4235,7 @@ def _boundary_voice_trim_actions(
                         detached_start is not None and not detached
                     ),
                     "detached_leading_voice_trim": detached,
+                    "detached_trailing_voice_trim": detached_trailing,
                     "duration_plausibility": _duration_plausibility(
                         line,
                         {
@@ -5133,6 +5490,9 @@ def align_project(
                 "repeated_take_trim": bool(
                     action.get("repeated_take_trim", False)
                 ),
+                "acoustic_take_trim": bool(
+                    action.get("acoustic_take_trim", False)
+                ),
                 "trimmed_edge_join": bool(
                     action.get("trimmed_edge_join", False)
                 ),
@@ -5150,6 +5510,9 @@ def align_project(
                 ),
                 "detached_leading_voice_trim": bool(
                     action.get("detached_leading_voice_trim", False)
+                ),
+                "detached_trailing_voice_trim": bool(
+                    action.get("detached_trailing_voice_trim", False)
                 ),
                 "unclean_boundary_audio": bool(
                     action.get("unclean_boundary_audio", False)

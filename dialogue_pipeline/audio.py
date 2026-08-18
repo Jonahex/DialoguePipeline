@@ -319,6 +319,82 @@ def pcm_voice_bounds(
     return regions[0][0], regions[-1][1]
 
 
+def pcm_leading_sibilant_start(
+    path: Path,
+    *,
+    start_sample: int,
+    voice_start_sample: int,
+    maximum_lookback_seconds: float = 0.50,
+    frame_seconds: float = 0.02,
+    minimum_rms_dbfs: float = -55.0,
+    minimum_high_frequency_fraction: float = 0.55,
+    minimum_frames: int = 2,
+) -> int | None:
+    """Return the onset of sustained high-frequency energy before VAD speech.
+
+    Silero VAD commonly starts after an initial /s/ or /sh/.  Those sounds are
+    easy to distinguish from room tone by their sustained high-frequency
+    energy, so retain them without trusting Whisper's loose word timestamps.
+    Returned samples use the source WAV's absolute coordinate system.
+    """
+
+    try:
+        with wave.open(str(path), "rb") as reader:
+            if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
+                return None
+            sample_rate = int(reader.getframerate())
+            channels = int(reader.getnchannels())
+            frame_count = int(reader.getnframes())
+            voice_start = max(
+                0,
+                min(int(voice_start_sample), frame_count),
+            )
+            search_start = max(
+                int(start_sample),
+                voice_start - round(maximum_lookback_seconds * sample_rate),
+            )
+            if voice_start <= search_start:
+                return None
+            reader.setpos(search_start)
+            raw = reader.readframes(voice_start - search_start)
+    except (EOFError, OSError, wave.Error):
+        return None
+
+    samples = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    frame_size = max(32, round(frame_seconds * sample_rate))
+    if samples.shape[0] < frame_size * minimum_frames:
+        return None
+    window = np.hanning(frame_size).astype(np.float32)
+    frequencies = np.fft.rfftfreq(frame_size, d=1.0 / sample_rate)
+    high_frequency = frequencies >= 4000.0
+    qualifying = []
+    for offset in range(0, samples.shape[0] - frame_size + 1, frame_size):
+        frame = samples[offset : offset + frame_size] * window
+        rms = float(np.sqrt(np.mean(frame * frame)))
+        rms_dbfs = 20.0 * math.log10(max(rms, 1.0) / 32768.0)
+        spectrum = np.abs(np.fft.rfft(frame)) ** 2
+        total_energy = float(spectrum.sum())
+        high_fraction = (
+            float(spectrum[high_frequency].sum()) / total_energy
+            if total_energy > 0.0
+            else 0.0
+        )
+        qualifying.append(
+            rms_dbfs >= minimum_rms_dbfs
+            and high_fraction >= minimum_high_frequency_fraction
+        )
+
+    run = 0
+    for index, active in enumerate(qualifying):
+        run = run + 1 if active else 0
+        if run >= minimum_frames:
+            first_index = index - run + 1
+            return search_start + first_index * frame_size
+    return None
+
+
 def prepare_pcm_segmentation_source(
     source: Path,
     destination: Path,

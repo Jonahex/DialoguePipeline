@@ -650,7 +650,7 @@ def test_boundary_voice_trim_creates_clean_candidate_and_marks_original(
         0.03 * sample_rate
     )
     assert snap_calls[0]["start_sample"] == proposed_end
-    assert snap_calls[0]["end_sample"] == sample_rate * 10
+    assert snap_calls[0]["end_sample"] == round(9.35 * sample_rate)
 
 
 def test_boundary_voice_trim_preserves_quiet_first_word(
@@ -660,10 +660,15 @@ def test_boundary_voice_trim_preserves_quiet_first_word(
     import dialogue_pipeline.alignment as alignment_module
 
     sample_rate = 48000
+    def fake_voice_bounds(*_args, **kwargs):
+        if float(kwargs.get("threshold", 0.5)) < 0.5:
+            return (0, round(0.25 * sample_rate))
+        return (sample_rate, sample_rate * 10)
+
     monkeypatch.setattr(
         alignment_module,
         "pcm_voice_bounds",
-        lambda *_args, **_kwargs: (sample_rate, sample_rate * 10),
+        fake_voice_bounds,
     )
     line_text = (
         "It is a place of love first and foremost. "
@@ -770,6 +775,349 @@ def test_boundary_voice_trim_ignores_zero_clamped_stretched_first_word(
     )
 
     assert cleaned[0]["trim_start_sample"] == round(0.85 * sample_rate)
+
+
+def test_boundary_voice_trim_does_not_trust_shifted_asr_word_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_bounds",
+        lambda *_args, **_kwargs: (
+            round(0.70 * sample_rate),
+            round(3.0 * sample_rate),
+        ),
+    )
+    line_text = "Am I going crazy?"
+    line = {"line_id": "target", "line": line_text}
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 100.0,
+        "transcript": line_text,
+        "duration_plausibility": 100.0,
+    }
+    cleaned = _boundary_voice_trim_actions(
+        [action],
+        project_dir=tmp_path,
+        session_entry={
+            "sample_rate": sample_rate,
+            "working_audio": "source.wav",
+            "audio": "source.wav",
+        },
+        lines=[line],
+        base_segments=[
+            {
+                "start_sample": 0,
+                "end_sample": round(3.0 * sample_rate),
+                "start_seconds": 0.0,
+                "end_seconds": 3.0,
+                "segment_asr": {
+                    "primary": {
+                        "words": [
+                            {"word": " Am", "start": 0.24, "end": 0.76},
+                            {"word": " crazy", "start": 2.5, "end": 3.0},
+                        ]
+                    }
+                },
+            }
+        ],
+        settings={},
+        evaluator=TranscriptEvaluator([line], {}),
+    )
+
+    assert cleaned[0]["trim_start_sample"] == round(0.62 * sample_rate)
+
+
+def test_boundary_voice_trim_ignores_word_crossing_derived_cut(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    raw_start = sample_rate
+    raw_end = sample_rate * 4
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_bounds",
+        lambda *_args, **_kwargs: (
+            raw_start + round(0.60 * sample_rate),
+            raw_end,
+        ),
+    )
+    line_text = "Yeah, yeah."
+    line = {"line_id": "target", "line": line_text}
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 100.0,
+        "transcript": line_text,
+        "duration_plausibility": 100.0,
+        "trim_start_sample": raw_start,
+        "trim_end_sample": raw_end,
+    }
+    cleaned = _boundary_voice_trim_actions(
+        [action],
+        project_dir=tmp_path,
+        session_entry={
+            "sample_rate": sample_rate,
+            "working_audio": "source.wav",
+            "audio": "source.wav",
+        },
+        lines=[line],
+        base_segments=[
+            {
+                "start_sample": 0,
+                "end_sample": raw_end,
+                "start_seconds": 0.0,
+                "end_seconds": 4.0,
+                "segment_asr": {
+                    "primary": {
+                        "words": [
+                            {"word": " yeah", "start": 0.8, "end": 1.05},
+                            {"word": " yeah", "start": 1.7, "end": 2.1},
+                        ]
+                    }
+                },
+            }
+        ],
+        settings={},
+        evaluator=TranscriptEvaluator([line], {}),
+    )
+
+    assert cleaned[0]["trim_start_sample"] == raw_start + round(
+        0.52 * sample_rate
+    )
+
+
+def test_boundary_voice_trim_preserves_initial_sibilant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_bounds",
+        lambda *_args, **_kwargs: (
+            round(0.70 * sample_rate),
+            round(2.80 * sample_rate),
+        ),
+    )
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_leading_sibilant_start",
+        lambda *_args, **_kwargs: round(0.42 * sample_rate),
+    )
+    line = {"line_id": "target", "line": "Speak, I haven't got all day."}
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 100.0,
+        "transcript": line["line"],
+        "duration_plausibility": 100.0,
+    }
+    cleaned = _boundary_voice_trim_actions(
+        [action],
+        project_dir=tmp_path,
+        session_entry={
+            "sample_rate": sample_rate,
+            "working_audio": "source.wav",
+            "audio": "source.wav",
+        },
+        lines=[line],
+        base_segments=[
+            {
+                "start_sample": 0,
+                "end_sample": sample_rate * 3,
+                "start_seconds": 0.0,
+                "end_seconds": 3.0,
+            }
+        ],
+        settings={},
+        evaluator=TranscriptEvaluator([line], {}),
+    )
+
+    assert cleaned[0]["trim_start_sample"] == round(0.34 * sample_rate)
+
+
+def test_boundary_voice_trim_cleans_secondary_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_bounds",
+        lambda *_args, **_kwargs: (sample_rate, sample_rate * 4),
+    )
+    primary = {"line_id": "other", "line": "Entirely different words."}
+    target = {"line_id": "target", "line": "Has to be. Look at her!"}
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 20.0,
+        "transcript": target["line"],
+        "duration_plausibility": 100.0,
+        "top_matches": [
+            {
+                "line_index": 1,
+                "match_score": 100.0,
+                "confidence_margin": 50.0,
+            }
+        ],
+    }
+    cleaned = _boundary_voice_trim_actions(
+        [action],
+        project_dir=tmp_path,
+        session_entry={
+            "sample_rate": sample_rate,
+            "working_audio": "source.wav",
+            "audio": "source.wav",
+        },
+        lines=[primary, target],
+        base_segments=[
+            {
+                "start_sample": 0,
+                "end_sample": sample_rate * 5,
+                "start_seconds": 0.0,
+                "end_seconds": 5.0,
+            }
+        ],
+        settings={},
+        evaluator=TranscriptEvaluator([primary, target], {}),
+    )
+
+    assert action["unclean_boundary_audio"] is True
+    assert len(cleaned) == 1
+    assert cleaned[0]["line_index"] == 1
+    assert cleaned[0]["trim_start_sample"] == round(0.92 * sample_rate)
+
+
+def test_boundary_voice_trim_bounds_incomplete_match_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_bounds",
+        lambda *_args, **_kwargs: (
+            round(0.60 * sample_rate),
+            round(4.0 * sample_rate),
+        ),
+    )
+    line = {"line_id": "target", "line": "Has to be. Look at her!"}
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 60.0,
+        "transcript": "Has to be.",
+        "duration_plausibility": 100.0,
+    }
+    cleaned = _boundary_voice_trim_actions(
+        [action],
+        project_dir=tmp_path,
+        session_entry={
+            "sample_rate": sample_rate,
+            "working_audio": "source.wav",
+            "audio": "source.wav",
+        },
+        lines=[line],
+        base_segments=[
+            {
+                "start_sample": 0,
+                "end_sample": sample_rate * 4,
+                "start_seconds": 0.0,
+                "end_seconds": 4.0,
+            }
+        ],
+        settings={},
+        evaluator=TranscriptEvaluator([line], {}),
+    )
+
+    assert len(cleaned) == 1
+    assert cleaned[0]["trim_start_sample"] == round(0.52 * sample_rate)
+
+
+def test_boundary_voice_trim_removes_detached_short_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_bounds",
+        lambda *_args, **_kwargs: (
+            round(0.20 * sample_rate),
+            round(9.20 * sample_rate),
+        ),
+    )
+    monkeypatch.setattr(
+        alignment_module,
+        "pcm_voice_regions",
+        lambda *_args, **_kwargs: [
+            (round(0.20 * sample_rate), round(8.0 * sample_rate)),
+            (round(9.0 * sample_rate), round(9.20 * sample_rate)),
+        ],
+    )
+    line = {"line_id": "target", "line": "Ancient artists left many clues."}
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 100.0,
+        "transcript": line["line"],
+        "duration_plausibility": 100.0,
+    }
+    cleaned = _boundary_voice_trim_actions(
+        [action],
+        project_dir=tmp_path,
+        session_entry={
+            "sample_rate": sample_rate,
+            "working_audio": "source.wav",
+            "audio": "source.wav",
+        },
+        lines=[line],
+        base_segments=[
+            {
+                "start_sample": 0,
+                "end_sample": sample_rate * 10,
+                "start_seconds": 0.0,
+                "end_seconds": 10.0,
+                "segment_asr": {
+                    "primary": {
+                        "words": [
+                            {"word": " Ancient", "start": 0.2, "end": 0.8},
+                            {"word": " clues.", "start": 7.2, "end": 7.7},
+                        ]
+                    }
+                },
+            }
+        ],
+        settings={},
+        evaluator=TranscriptEvaluator([line], {}),
+    )
+
+    assert cleaned[0]["detached_trailing_voice_trim"] is True
+    assert cleaned[0]["trim_end_sample"] <= round(8.35 * sample_rate)
 
 
 def test_boundary_voice_trim_recovers_detached_failed_prefix(
@@ -1026,7 +1374,7 @@ def test_boundary_voice_trim_reuses_segmentation_voice_bounds(
     assert cleaned[0]["trim_start_sample"] == sample_rate - round(
         0.08 * sample_rate
     )
-    assert cleaned[0]["trim_end_sample"] == sample_rate * 10
+    assert cleaned[0]["trim_end_sample"] == round(9.35 * sample_rate)
 
 
 def test_shared_model_cache_resolution(tmp_path: Path, monkeypatch) -> None:
@@ -2707,6 +3055,82 @@ def test_repeated_take_trim_uses_ordered_vad_gaps(
     }
     assert actual_boundaries == expected_boundaries
     assert all(item["repeated_take_trim"] for item in trimmed)
+
+
+def test_acoustic_take_trim_recovers_asr_collapsed_repetitions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.alignment as alignment_module
+
+    sample_rate = 48000
+    line_text = "Seems like they're fighting over something."
+    line = {"line_id": "target", "line": line_text}
+    segment = {
+        "segment_id": "session__s00001",
+        "file": "segment.wav",
+        "start_sample": 0,
+        "end_sample": 12 * sample_rate,
+        "start_seconds": 0.0,
+        "end_seconds": 12.0,
+        # ASR collapsed three audible takes into one transcript and one word
+        # sequence, so textual repetition detection has no split points.
+        "transcript": line_text,
+        "segment_asr": {
+            "primary": {
+                "transcript": line_text,
+                "words": [
+                    {"word": " Seems", "start": 0.2, "end": 0.6},
+                    {"word": " like", "start": 0.6, "end": 0.9},
+                    {"word": " they're", "start": 0.9, "end": 1.2},
+                    {"word": " fighting", "start": 1.2, "end": 1.7},
+                    {"word": " over", "start": 1.7, "end": 2.0},
+                    {"word": " something", "start": 2.0, "end": 2.6},
+                ],
+            }
+        },
+    }
+    monkeypatch.setattr(
+        alignment_module,
+        "_segment_voice_regions_for_trimming",
+        lambda *_args, **_kwargs: [
+            (round(0.3 * sample_rate), round(3.0 * sample_rate)),
+            (round(4.2 * sample_rate), round(7.0 * sample_rate)),
+            (round(8.2 * sample_rate), round(11.0 * sample_rate)),
+        ],
+    )
+    monkeypatch.setattr(
+        alignment_module,
+        "quietest_pcm_boundary",
+        lambda _path, **kwargs: int(kwargs["proposed_sample"]),
+    )
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": 100.0,
+        "transcript": line_text,
+        "duration_plausibility": 25.0,
+        "top_matches": [],
+    }
+
+    trimmed = _intra_segment_trim_actions(
+        [action],
+        lines=[line],
+        base_segments=[segment],
+        sample_rate=sample_rate,
+        settings={},
+        evaluator=TranscriptEvaluator([line], {}),
+        project_dir=tmp_path,
+    )
+
+    acoustic = [item for item in trimmed if item.get("acoustic_take_trim")]
+    assert len(acoustic) >= 3
+    assert all(item["repeated_take_trim"] for item in acoustic)
+    assert all(
+        item["transcript_source"] == "acoustic_take_trim_preview"
+        for item in acoustic
+    )
 
 
 def test_fragment_join_can_trim_shared_take_boundary_segment() -> None:
@@ -5029,7 +5453,7 @@ def test_review_auto_selects_best_quality_within_reliable_cluster() -> None:
     assert review["lines"][0]["selected_segment_id"] == "cleanest"
 
 
-def test_review_prefers_intact_candidate_when_boundary_trim_is_near_tied() -> None:
+def test_review_prefers_verified_boundary_trim_when_near_tied() -> None:
     line = {
         "line_id": "Opponent::R5",
         "sheet": "Opponent",
@@ -5072,8 +5496,58 @@ def test_review_prefers_intact_candidate_when_boundary_trim_is_near_tied() -> No
     )
 
     review_line = review["lines"][0]
-    assert review_line["selected_segment_id"] == "intact"
+    assert review_line["selected_segment_id"] == "trimmed"
     assert review_line["candidates"][0]["boundary_voice_trim"] is True
+
+
+def test_review_prefers_take_sized_candidate_when_near_tied() -> None:
+    line = {
+        "line_id": "Hjorik::R27",
+        "sheet": "Hjorik",
+        "excel_row": 27,
+        "line": "A complete line with several words in it.",
+        "target_filename": "take_sized",
+    }
+    common = {
+        "session_id": "session",
+        "base_indices": [0],
+        "match_score": 100.0,
+        "technical_score": 100.0,
+        "is_primary_match": True,
+        "reliable": True,
+        "reliability_reason": "",
+        "boundary_voice_trim": True,
+    }
+    candidates = [
+        {
+            **common,
+            "segment_id": "merged",
+            "segment_file": "merged.wav",
+            "selection_score": 121.86,
+            "duration_plausibility": 48.0,
+            "start_seconds": 0.0,
+            "end_seconds": 19.6,
+            "duration_seconds": 19.6,
+        },
+        {
+            **common,
+            "segment_id": "single_take",
+            "segment_file": "single_take.wav",
+            "selection_score": 121.80,
+            "duration_plausibility": 88.0,
+            "start_seconds": 10.0,
+            "end_seconds": 19.3,
+            "duration_seconds": 9.3,
+        },
+    ]
+
+    review = build_line_review(
+        source_lines=[line],
+        candidates_by_line={line["line_id"]: candidates},
+        unmatched_segments=[],
+    )
+
+    assert review["lines"][0]["selected_segment_id"] == "single_take"
 
 
 def test_review_candidates_keep_best_fragment_join_when_none_are_reliable() -> None:

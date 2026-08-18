@@ -258,6 +258,11 @@ voiced but untranscribed merged pieces (`MERGED_UNTRANSCRIBED_AUDIO`), and
 also supply a split point when Whisper stretches a boundary word across a pause;
 the split is accepted only when ordered Silero VAD regions provide a matching
 acoustic gap, and both resulting spans are then transcribed independently.
+If Whisper collapses several audible deliveries into one word sequence, an
+additional fallback proposes take-sized windows between at least two substantial
+strict-VAD gaps. It runs only on implausibly long spans, keeps a bounded number
+of duration-plausible hypotheses, and still requires independent exact-span ASR
+before any proposal can become reliable.
 
 ## Vocalizations and non-speech boundaries
 
@@ -280,15 +285,25 @@ review and can create a clean alternative without the boundary segment.
 
 For breath or room noise inside a textual segment, alignment composes the voice
 bounds stored during segmentation and adds a short-padded candidate. Strict
-breath VAD supplies only a proposed trailing endpoint: alignment scans forward
-and creates the trim only if it finds a sufficiently quiet PCM window. This can
-cut before a separated trailing breath while preventing VAD or imprecise ASR
-timestamps from clipping a quiet release or unvoiced final consonant. When no
-quiet separation exists, the tail is preserved. When reliable candidates are
-otherwise tied, review selection prefers an intact segment over a generated
-boundary trim. A zero-clamped Whisper word timestamp protects a quiet leading
-word only when that word ends before the VAD region; it cannot preserve a long
-room-tone prefix by itself.
+breath VAD supplies the proposed trailing endpoint. Alignment scans forward for
+a quiet PCM window, but processed room tone cannot retain the whole tail: a
+bounded release allowance preserves an unvoiced final consonant when no absolute
+quiet window exists. A short isolated speech/noise island after the final ASR
+word can be removed as detached boundary audio.
+
+A base-ASR word protects a quiet leading word only when a permissive VAD pass
+independently corroborates speech in its timestamp interval and it does not
+cross in from before a derived cut. A zero or nonzero ASR start timestamp cannot
+preserve a long room-tone prefix by itself. Sustained high-frequency energy is
+detected separately before normal VAD so an initial `/s/` or `/sh/` is retained
+without trusting a stretched Whisper timestamp. Basic cleanup also covers spans
+that exact ASR later reroutes to a secondary line, but an incomplete preliminary
+match must expose at least a 0.5-second edge so this fallback stays bounded.
+
+Among reliable candidates whose selection scores differ by no more than 0.25,
+review selection prefers duration plausibility and then an exact-ASR-verified
+boundary-cleaned variant. This prevents a merged multi-take span from winning on
+a negligible ASR-confidence difference.
 
 For a complete line with implausible duration, alignment also checks for a
 short, detached leading speech region separated by a clear VAD gap. It creates
@@ -380,6 +395,10 @@ The grouped configuration written for new projects is:
       "trim_oversized_segments": true,
       "trim_candidates_per_line": 2,
       "trim_minimum_gap_seconds": 0.4,
+      "acoustic_take_splitting": true,
+      "acoustic_take_candidates_per_line": 8,
+      "acoustic_take_maximum_full_duration_plausibility": 70.0,
+      "acoustic_take_minimum_duration_plausibility": 45.0,
       "edge_trim_minimum_gap_seconds": 0.3,
       "edge_trim_fallback_minimum_gap_seconds": 0.1,
       "recover_complete_subspans": true,
@@ -390,12 +409,17 @@ The grouped configuration written for new projects is:
         "minimum_edge_seconds": 0.3,
         "pre_padding_seconds": 0.08,
         "post_padding_seconds": 0.12,
+        "weak_vad_threshold": 0.3,
+        "sibilant_lookback_seconds": 0.5,
+        "maximum_release_seconds": 0.35,
+        "incomplete_minimum_edge_seconds": 0.5,
         "trim_detached_edge_speech": true,
         "detached_minimum_gap_seconds": 0.3,
         "detached_maximum_prefix_seconds": 2.0,
         "detached_maximum_removed_fraction": 0.4,
         "detached_maximum_duration_plausibility": 90.0,
-        "detached_minimum_script_words": 4
+        "detached_minimum_script_words": 4,
+        "detached_maximum_tail_seconds": 0.5
       },
       "edge_cues": {
         "extend_adjacent_segments": true,

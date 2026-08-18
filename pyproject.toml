@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=1.26,<3",
     "openpyxl>=3.1,<4",
     "rapidfuzz>=3.10,<4",
+    "sounddevice>=0.5.5,<0.6",
 ]
 
 [project.optional-dependencies]

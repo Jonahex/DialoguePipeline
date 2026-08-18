@@ -16,8 +16,8 @@ design, see [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 - Windows.
 - Python 3.11 or newer.
-- `ffmpeg`, `ffprobe`, and `ffplay` installed and available on `PATH`.
-  **FFmpeg is required**: setup is not complete until all three commands are
+- `ffmpeg` and `ffprobe` installed and available on `PATH`.
+  **FFmpeg is required**: setup is not complete until both commands are
   available.
 - Enough disk space for normalized recordings, temporary segments,
   transcription caches, and final WAV files.
@@ -42,7 +42,7 @@ Verify Python packages and the required FFmpeg tools:
 .\run_pipeline.ps1 doctor
 ```
 
-If `doctor` cannot find `ffmpeg`, `ffprobe`, or `ffplay`, add the FFmpeg `bin`
+If `doctor` cannot find `ffmpeg` or `ffprobe`, add the FFmpeg `bin`
 directory to `PATH` and run the check again.
 
 ## Desktop usage

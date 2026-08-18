@@ -23,7 +23,13 @@ def run_doctor() -> tuple[list[dict[str, Any]], bool]:
     if sys.version_info < (3, 11):
         ok = False
 
-    for package in ("numpy", "openpyxl", "rapidfuzz", "faster_whisper"):
+    for package in (
+        "numpy",
+        "openpyxl",
+        "rapidfuzz",
+        "faster_whisper",
+        "sounddevice",
+    ):
         try:
             module = importlib.import_module(package)
             version = getattr(module, "__version__", "installed")
@@ -40,7 +46,7 @@ def run_doctor() -> tuple[list[dict[str, Any]], bool]:
                 }
             )
 
-    for executable in ("ffmpeg", "ffprobe", "ffplay"):
+    for executable in ("ffmpeg", "ffprobe"):
         path = shutil.which(executable)
         if path:
             checks.append(

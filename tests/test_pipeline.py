@@ -88,14 +88,18 @@ from dialogue_pipeline.transcription import (
     transcribe_segments_project,
 )
 from dialogue_pipeline.ui import (
+    AudioPlayer,
     DialogueReviewApp,
     _candidate_selection_display,
     _context_display_text,
     _initial_segment_window,
     _panned_sample_window,
+    _playback_samples,
     _project_settings_from_values,
+    _read_pcm_wav,
     _selected_segment_score,
     _selected_line_ids_by_segment,
+    _sounddevice_output_options,
     _uses_unmatched_candidates,
     _zoomed_sample_window,
 )
@@ -128,6 +132,140 @@ def _write_tone(
         writer.setsampwidth(2)
         writer.setframerate(sample_rate)
         writer.writeframes(samples.tobytes())
+
+
+def test_audio_player_uses_in_process_shared_wasapi_playback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "candidate.wav"
+    _write_tone(audio_path, duration_seconds=0.01)
+    settings_calls: list[dict[str, Any]] = []
+    shared_settings = object()
+    stream_calls: list[dict[str, Any]] = []
+
+    class FakeStream:
+        started = False
+        stopped = False
+        closed = False
+
+        def start(self) -> None:
+            self.started = True
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = FakeStream()
+
+    monkeypatch.setattr(
+        "dialogue_pipeline.ui.sys",
+        SimpleNamespace(platform="win32"),
+    )
+    monkeypatch.setattr(
+        "dialogue_pipeline.ui.sd.query_hostapis",
+        lambda: (
+            {
+                "name": "MME",
+                "default_output_device": 5,
+            },
+            {
+                "name": "Windows WASAPI",
+                "default_output_device": 15,
+            },
+        ),
+    )
+
+    def fake_wasapi_settings(**kwargs: Any) -> object:
+        settings_calls.append(kwargs)
+        return shared_settings
+
+    monkeypatch.setattr(
+        "dialogue_pipeline.ui.sd.WasapiSettings",
+        fake_wasapi_settings,
+    )
+    monkeypatch.setattr(
+        "dialogue_pipeline.ui.sd.OutputStream",
+        lambda **kwargs: (stream_calls.append(kwargs), stream)[1],
+    )
+    player = AudioPlayer()
+
+    player.play(audio_path)
+
+    assert stream.started is True
+    assert len(stream_calls) == 1
+    assert stream_calls[0] == {
+        "samplerate": 48000,
+        "channels": 1,
+        "dtype": "float32",
+        "callback": player._fill_output,
+        "device": 15,
+        "extra_settings": shared_settings,
+    }
+    assert settings_calls == [{"exclusive": False, "auto_convert": True}]
+
+    output = np.zeros((480, 1), dtype=np.float32)
+    player._fill_output(output, 480, None, None)
+    assert np.any(output != 0)
+
+    player.stop()
+    output.fill(1)
+    player._fill_output(output, 480, None, None)
+    assert np.all(output == 0)
+
+    player.close()
+    assert stream.stopped is True
+    assert stream.closed is True
+
+
+def test_sounddevice_output_options_requires_wasapi_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "dialogue_pipeline.ui.sys",
+        SimpleNamespace(platform="win32"),
+    )
+    monkeypatch.setattr(
+        "dialogue_pipeline.ui.sd.query_hostapis",
+        lambda: ({"name": "MME", "default_output_device": 5},),
+    )
+
+    with pytest.raises(RuntimeError, match="No default Windows WASAPI"):
+        _sounddevice_output_options()
+
+
+def test_read_pcm_wav_supports_unsigned_8_bit_samples(tmp_path: Path) -> None:
+    audio_path = tmp_path / "eight_bit.wav"
+    with wave.open(str(audio_path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(1)
+        writer.setframerate(48000)
+        writer.writeframes(b"\x80")
+
+    samples, sample_rate = _read_pcm_wav(audio_path)
+
+    assert samples.dtype == np.uint8
+    assert samples.tolist() == [128]
+    assert sample_rate == 48000
+
+
+def test_playback_samples_downmixes_and_resamples() -> None:
+    stereo = np.array(
+        [
+            [-32768, 32767],
+            [16384, 16384],
+        ],
+        dtype=np.int16,
+    )
+
+    result = _playback_samples(stereo, 24000, output_sample_rate=48000)
+
+    assert result.dtype == np.float32
+    assert result.shape == (4,)
+    assert result[0] == pytest.approx(-1 / 65536)
+    assert result[-1] == pytest.approx(0.5)
 
 
 def test_refresh_project_audio_recuts_existing_spans_without_reprocessing(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import queue
-import subprocess
 import sys
 import tempfile
 import threading
@@ -12,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+import sounddevice as sd
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -148,47 +148,137 @@ def _candidate_selection_display(
     return "Select", ()
 
 
+def _read_pcm_wav(path: Path) -> tuple[np.ndarray, int]:
+    with wave.open(str(path), "rb") as reader:
+        if reader.getcomptype() != "NONE":
+            raise ValueError(f"Unsupported compressed WAV: {path}")
+        channels = reader.getnchannels()
+        sample_width = reader.getsampwidth()
+        sample_rate = reader.getframerate()
+        frames = reader.readframes(reader.getnframes())
+
+    if sample_width == 1:
+        samples = np.frombuffer(frames, dtype=np.uint8)
+    elif sample_width == 2:
+        samples = np.frombuffer(frames, dtype="<i2")
+    elif sample_width == 3:
+        packed = np.frombuffer(frames, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+        samples = packed[:, 0] | (packed[:, 1] << 8) | (packed[:, 2] << 16)
+        samples = ((samples ^ 0x800000) - 0x800000) << 8
+    elif sample_width == 4:
+        samples = np.frombuffer(frames, dtype="<i4")
+    else:
+        raise ValueError(f"Unsupported {sample_width * 8}-bit WAV: {path}")
+
+    if channels > 1:
+        samples = samples.reshape(-1, channels)
+    return samples, sample_rate
+
+
+def _sounddevice_output_options() -> dict[str, Any]:
+    if sys.platform != "win32":
+        return {}
+    for host_api in sd.query_hostapis():
+        if host_api["name"] != "Windows WASAPI":
+            continue
+        device = int(host_api["default_output_device"])
+        if device < 0:
+            break
+        return {
+            "device": device,
+            "extra_settings": sd.WasapiSettings(
+                exclusive=False,
+                auto_convert=True,
+            ),
+        }
+    raise RuntimeError("No default Windows WASAPI output device is available.")
+
+
+def _playback_samples(
+    samples: np.ndarray,
+    sample_rate: int,
+    *,
+    output_sample_rate: int,
+) -> np.ndarray:
+    if samples.dtype == np.uint8:
+        samples = (samples.astype(np.float32) - 128.0) / 128.0
+    elif samples.dtype == np.int16:
+        samples = samples.astype(np.float32) / 32768.0
+    elif samples.dtype == np.int32:
+        samples = samples.astype(np.float32) / 2147483648.0
+    else:
+        samples = samples.astype(np.float32)
+    if samples.ndim > 1:
+        samples = samples.mean(axis=1)
+
+    if sample_rate == output_sample_rate or samples.size == 0:
+        return np.asarray(samples, dtype=np.float32)
+    output_length = max(1, round(samples.size * output_sample_rate / sample_rate))
+    source_positions = np.arange(samples.size, dtype=np.float64)
+    output_positions = (
+        np.arange(output_length, dtype=np.float64) * sample_rate / output_sample_rate
+    )
+    return np.interp(output_positions, source_positions, samples).astype(np.float32)
+
+
 class AudioPlayer:
+    sample_rate = 48000
+
     def __init__(self) -> None:
-        self._process: subprocess.Popen[bytes] | None = None
+        self._lock = threading.Lock()
+        self._samples = np.empty(0, dtype=np.float32)
+        self._position = 0
+        self._stream = sd.OutputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="float32",
+            callback=self._fill_output,
+            **_sounddevice_output_options(),
+        )
+        self._stream.start()
+
+    def _fill_output(
+        self,
+        output: np.ndarray,
+        frames: int,
+        _time: Any,
+        _status: Any,
+    ) -> None:
+        output.fill(0)
+        with self._lock:
+            remaining = self._samples.size - self._position
+            copy_count = min(frames, max(0, remaining))
+            if copy_count:
+                output[:copy_count, 0] = self._samples[
+                    self._position : self._position + copy_count
+                ]
+                self._position += copy_count
+            if self._position >= self._samples.size:
+                self._samples = np.empty(0, dtype=np.float32)
+                self._position = 0
 
     def stop(self) -> None:
-        if sys.platform == "win32":
-            try:
-                import winsound
+        with self._lock:
+            self._samples = np.empty(0, dtype=np.float32)
+            self._position = 0
 
-                winsound.PlaySound(None, 0)
-            except (ImportError, RuntimeError):
-                pass
-        if self._process is not None:
-            if self._process.poll() is None:
-                self._process.terminate()
-            self._process = None
+    def close(self) -> None:
+        self.stop()
+        self._stream.stop()
+        self._stream.close()
 
     def play(self, path: Path) -> None:
         if not path.is_file():
             raise FileNotFoundError(path)
-        self.stop()
-        if sys.platform == "win32":
-            import winsound
-
-            winsound.PlaySound(
-                str(path),
-                winsound.SND_FILENAME | winsound.SND_ASYNC,
-            )
-            return
-        self._process = subprocess.Popen(
-            [
-                "ffplay",
-                "-nodisp",
-                "-autoexit",
-                "-loglevel",
-                "quiet",
-                str(path),
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        samples, sample_rate = _read_pcm_wav(path)
+        playback = _playback_samples(
+            samples,
+            sample_rate,
+            output_sample_rate=self.sample_rate,
         )
+        with self._lock:
+            self._samples = playback
+            self._position = 0
 
 
 def _clock_time(sample: int, sample_rate: int) -> str:
@@ -1525,7 +1615,7 @@ class DialogueReviewApp:
         if self.candidate_waveform is not None:
             self.candidate_waveform.dispose()
             self.candidate_waveform = None
-        self.player.stop()
+        self.player.close()
         self.root.destroy()
 
     def _clear(self) -> None:

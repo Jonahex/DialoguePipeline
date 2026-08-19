@@ -477,6 +477,14 @@ their greatest acoustic overlap. A manual edit follows its
 `edited_from_segment_id` to retain the source take's group even when its new
 bounds overlap a different take or set of base segments.
 
+For verbal lines, the review UI also exposes every manifest base segment in a
+second tab. Candidate coverage is derived from `(session_id, base_indices)`, so
+full base candidates, partial cuts, and merged spans mark all contributing base
+rows. Current-line coverage is green and other-line coverage is yellow. Adding
+an uncovered row creates a `manually_added_base_segment` candidate for the full
+base WAV without changing the selected take. These manual additions are
+preserved during review regeneration just like copy/edit candidates.
+
 Selecting a candidate changes status to `MANUALLY_REVIEWED`. Unselecting changes
 it to `REVIEW`, or `MISSING` for a normal line without candidates. `RETAKE`
 cannot contain a selected segment and survives later alignment runs.

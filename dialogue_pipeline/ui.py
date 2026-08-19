@@ -33,6 +33,7 @@ from .project import (
 )
 from .retakes import export_retake_script
 from .review import (
+    add_base_segment_candidate,
     delete_edited_candidate,
     LINE_STATUSES,
     REVIEW_FILE_NAME,
@@ -152,6 +153,67 @@ def _candidate_selection_display(
     if line["type"] == "nonverbal" and other_selection_count:
         return f"In use ({other_selection_count})", ("selected_elsewhere",)
     return "Select", ()
+
+
+def _candidate_base_segment_keys(
+    candidate: dict[str, Any],
+) -> set[tuple[str, int]]:
+    """Return every base segment represented by a candidate span."""
+
+    session_id = str(candidate.get("session_id") or "")
+    base_indices = candidate.get("base_indices") or []
+    if session_id and base_indices:
+        return {(session_id, int(base_index)) for base_index in base_indices}
+    match = re.fullmatch(r"(.+)__s(\d+)", str(candidate.get("segment_id") or ""))
+    if match:
+        return {(session_id or match.group(1), int(match.group(2)) - 1)}
+    return set()
+
+
+def _base_segment_candidate_usage(
+    review_data: dict[str, Any],
+    line_id: str,
+) -> tuple[set[tuple[str, int]], set[tuple[str, int]]]:
+    """Return base keys used by this line and by every other line."""
+
+    current: set[tuple[str, int]] = set()
+    other: set[tuple[str, int]] = set()
+    for line in review_data["lines"]:
+        destination = current if str(line["line_id"]) == line_id else other
+        for candidate in line.get("candidates") or []:
+            destination.update(_candidate_base_segment_keys(candidate))
+    return current, other
+
+
+def _first_line_base_segment_key(
+    line: dict[str, Any],
+) -> tuple[str, int] | None:
+    """Choose the first base segment of the earliest candidate in time."""
+
+    def candidate_time(candidate: dict[str, Any], field: str) -> float:
+        try:
+            return float(candidate[field])
+        except (KeyError, TypeError, ValueError):
+            return float("inf")
+
+    candidates = sorted(
+        line.get("candidates") or [],
+        key=lambda candidate: (
+            candidate_time(candidate, "start_seconds"),
+            candidate_time(candidate, "end_seconds"),
+            str(candidate.get("session_id") or ""),
+            min(
+                (int(value) for value in candidate.get("base_indices") or []),
+                default=sys.maxsize,
+            ),
+            str(candidate.get("segment_id") or ""),
+        ),
+    )
+    for candidate in candidates:
+        keys = _candidate_base_segment_keys(candidate)
+        if keys:
+            return min(keys, key=lambda key: key[1])
+    return None
 
 
 def _candidate_take_source(
@@ -2155,6 +2217,7 @@ class DialogueReviewApp:
         self._worker_thread: threading.Thread | None = None
         self._candidate_transcription_runtime: dict[str, Any] = {}
         self.selected_candidate_id: str | None = None
+        self.selected_base_segment_id: str | None = None
         self._candidate_line_id: str | None = None
         self.candidate_waveform: CandidateWaveformView | None = None
         self._open_candidate_roots: set[str] = set()
@@ -2203,6 +2266,7 @@ class DialogueReviewApp:
         self.base_segments_by_session = {}
         self.selected_line_id = None
         self.selected_candidate_id = None
+        self.selected_base_segment_id = None
         self._candidate_line_id = None
 
         outer = ttk.Frame(self.root, padding=40)
@@ -2677,6 +2741,7 @@ class DialogueReviewApp:
         assert self.project_dir is not None
         self._clear()
         self.selected_candidate_id = None
+        self.selected_base_segment_id = None
         self._candidate_line_id = None
 
         toolbar = ttk.Frame(self.root, padding=(16, 12))
@@ -2879,6 +2944,19 @@ class DialogueReviewApp:
             command=self.mark_for_retake,
         )
         self.mark_retake_button.pack(side="left")
+        self.review_tabs = ttk.Notebook(right)
+        self.review_tabs.grid(
+            row=3,
+            column=0,
+            columnspan=2,
+            sticky="nsew",
+        )
+        self.candidates_tab = ttk.Frame(self.review_tabs)
+        self.base_segments_tab = ttk.Frame(self.review_tabs)
+        self.review_tabs.add(self.candidates_tab, text="Candidates")
+        self.review_tabs.add(self.base_segments_tab, text="Base segments")
+        self.review_tabs.bind("<<NotebookTabChanged>>", self._review_tab_changed)
+
         candidate_columns = (
             "segment",
             "transcript",
@@ -2890,7 +2968,7 @@ class DialogueReviewApp:
             "delete",
         )
         self.candidate_tree = ttk.Treeview(
-            right,
+            self.candidates_tab,
             columns=candidate_columns,
             show="tree headings",
             selectmode="browse",
@@ -2925,12 +3003,12 @@ class DialogueReviewApp:
         self.candidate_tree.tag_configure("selected", background="#bbf7d0")
         self.candidate_tree.tag_configure("selected_elsewhere", background="#fde68a")
         self.candidate_vertical_scrollbar = ttk.Scrollbar(
-            right,
+            self.candidates_tab,
             orient="vertical",
             command=self.candidate_tree.yview,
         )
         self.candidate_horizontal_scrollbar = ttk.Scrollbar(
-            right,
+            self.candidates_tab,
             orient="horizontal",
             command=self.candidate_tree.xview,
         )
@@ -2938,16 +3016,92 @@ class DialogueReviewApp:
             yscrollcommand=self.candidate_vertical_scrollbar.set,
             xscrollcommand=self.candidate_horizontal_scrollbar.set,
         )
+        self.candidates_tab.grid_rowconfigure(0, weight=1)
+        self.candidates_tab.grid_columnconfigure(0, weight=1)
+        self.candidate_tree.grid(row=0, column=0, sticky="nsew")
+        self.candidate_vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.candidate_horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+
+        ttk.Label(
+            self.base_segments_tab,
+            text=(
+                "Green segments already contribute to this line; yellow segments "
+                "contribute to another line."
+            ),
+            style="Muted.TLabel",
+            padding=(4, 5, 4, 7),
+        ).grid(row=0, column=0, columnspan=2, sticky="ew")
+        base_columns = (
+            "session",
+            "segment",
+            "transcript",
+            "duration",
+            "audio",
+            "add",
+        )
+        self.base_segment_tree = ttk.Treeview(
+            self.base_segments_tab,
+            columns=base_columns,
+            show="headings",
+            selectmode="browse",
+        )
+        base_headings = {
+            "session": ("Session", 125, "w"),
+            "segment": ("Segment", 210, "w"),
+            "transcript": ("Transcript", 470, "w"),
+            "duration": ("Duration", 75, "center"),
+            "audio": ("", 48, "center"),
+            "add": ("Add", 65, "center"),
+        }
+        for column, (heading, width, anchor) in base_headings.items():
+            self.base_segment_tree.heading(column, text=heading)
+            self.base_segment_tree.column(
+                column,
+                width=width,
+                minwidth=40,
+                stretch=False,
+                anchor=anchor,
+            )
+        self.base_segment_tree.tag_configure(
+            "candidate_for_line",
+            background="#bbf7d0",
+        )
+        self.base_segment_tree.tag_configure(
+            "candidate_for_other_line",
+            background="#fde68a",
+        )
+        self.base_segment_vertical_scrollbar = ttk.Scrollbar(
+            self.base_segments_tab,
+            orient="vertical",
+            command=self.base_segment_tree.yview,
+        )
+        self.base_segment_horizontal_scrollbar = ttk.Scrollbar(
+            self.base_segments_tab,
+            orient="horizontal",
+            command=self.base_segment_tree.xview,
+        )
+        self.base_segment_tree.configure(
+            yscrollcommand=self.base_segment_vertical_scrollbar.set,
+            xscrollcommand=self.base_segment_horizontal_scrollbar.set,
+        )
+        self.base_segments_tab.grid_rowconfigure(1, weight=1)
+        self.base_segments_tab.grid_columnconfigure(0, weight=1)
+        self.base_segment_tree.grid(row=1, column=0, sticky="nsew")
+        self.base_segment_vertical_scrollbar.grid(row=1, column=1, sticky="ns")
+        self.base_segment_horizontal_scrollbar.grid(row=2, column=0, sticky="ew")
+        self.base_segment_tree.bind(
+            "<ButtonRelease-1>",
+            self._base_segment_table_clicked,
+        )
+        self.base_segment_tree.bind("<Motion>", self._base_segment_table_motion)
+        self.base_segment_tree.bind(
+            "<<TreeviewSelect>>",
+            self._base_segment_tree_selected,
+        )
+
         right.grid_rowconfigure(3, weight=3)
         right.grid_rowconfigure(5, weight=2)
         right.grid_columnconfigure(0, weight=1)
-        self.candidate_tree.grid(row=3, column=0, sticky="nsew")
-        self.candidate_vertical_scrollbar.grid(row=3, column=1, sticky="ns")
-        self.candidate_horizontal_scrollbar.grid(
-            row=4,
-            column=0,
-            sticky="ew",
-        )
         self.candidate_tree.bind("<ButtonRelease-1>", self._candidate_table_clicked)
         self.candidate_tree.bind("<Motion>", self._candidate_table_motion)
         self.candidate_tree.bind(
@@ -3150,7 +3304,13 @@ class DialogueReviewApp:
         line = self._selected_line()
         if line is None:
             self.selected_candidate_id = None
+            self.selected_base_segment_id = None
             self._candidate_line_id = None
+            base_children = self.base_segment_tree.get_children()
+            if base_children:
+                self.base_segment_tree.delete(*base_children)
+            self.review_tabs.tab(self.base_segments_tab, state="disabled")
+            self.review_tabs.select(self.candidates_tab)
             self.mark_retake_button.configure(state="disabled")
             self._set_context_display("")
             self.selected_line_label.configure(text="—")
@@ -3163,9 +3323,25 @@ class DialogueReviewApp:
             return
 
         line_id = str(line["line_id"])
-        if self._candidate_line_id != line_id:
+        line_changed = self._candidate_line_id != line_id
+        if line_changed:
             self.selected_candidate_id = None
+            self.selected_base_segment_id = None
         self._candidate_line_id = line_id
+        is_verbal = line["type"] == "normal"
+        self.review_tabs.tab(
+            self.base_segments_tab,
+            state="normal" if is_verbal else "disabled",
+        )
+        if not is_verbal and self._base_segments_tab_active():
+            self.review_tabs.select(self.candidates_tab)
+        if is_verbal:
+            self._render_base_segments(line, reset_focus=line_changed)
+        else:
+            base_children = self.base_segment_tree.get_children()
+            if base_children:
+                self.base_segment_tree.delete(*base_children)
+            self.selected_base_segment_id = None
         self.mark_retake_button.configure(
             state=("disabled" if line["status"] == "RETAKE" else "normal")
         )
@@ -3224,7 +3400,9 @@ class DialogueReviewApp:
                 )
                 + "No candidate segments are available."
             )
-            if self.candidate_waveform is not None:
+            if self._base_segments_tab_active():
+                self._show_selected_base_segment_waveform()
+            elif self.candidate_waveform is not None:
                 self.candidate_waveform.clear("No candidate waveform is available.")
             return
 
@@ -3254,6 +3432,11 @@ class DialogueReviewApp:
                     else "[No transcript]"
                 )
             segment_id = str(candidate["segment_id"])
+            score_text = (
+                ""
+                if candidate.get("manually_added_base_segment")
+                else f"{float(candidate.get('score', 0.0)):.1f}"
+            )
             selection_text, tags = _candidate_selection_display(
                 line=line,
                 segment_id=segment_id,
@@ -3268,7 +3451,7 @@ class DialogueReviewApp:
                 values=(
                     segment_id,
                     transcript,
-                    f"{float(candidate.get('score', 0.0)):.1f}",
+                    score_text,
                     "▶",
                     selection_text,
                     "\u2398 \u270e",
@@ -3294,6 +3477,8 @@ class DialogueReviewApp:
                 root_label += f" ({len(group)} versions)"
             elif root_candidate.get("manual_edit"):
                 root_label += " · Custom"
+            elif root_candidate.get("manually_added_base_segment"):
+                root_label += " · Added"
             insert_candidate(
                 root_candidate,
                 parent="",
@@ -3329,7 +3514,161 @@ class DialogueReviewApp:
         self.candidate_tree.selection_set(preferred_id)
         self.candidate_tree.focus(preferred_id)
         self.candidate_tree.see(preferred_id)
-        self._show_candidate_waveform(preferred_id)
+        if self._base_segments_tab_active():
+            self._show_selected_base_segment_waveform()
+        else:
+            self._show_candidate_waveform(preferred_id)
+
+    def _base_segments_tab_active(self) -> bool:
+        return str(self.review_tabs.select()) == str(self.base_segments_tab)
+
+    def _render_base_segments(
+        self,
+        line: dict[str, Any],
+        *,
+        reset_focus: bool,
+    ) -> None:
+        assert self.review_data is not None
+        children = self.base_segment_tree.get_children()
+        if children:
+            self.base_segment_tree.delete(*children)
+
+        current_keys, other_keys = _base_segment_candidate_usage(
+            self.review_data,
+            str(line["line_id"]),
+        )
+        segment_id_by_key: dict[tuple[str, int], str] = {}
+        segment_ids: list[str] = []
+        for session_id, segments in self.base_segments_by_session.items():
+            for position, segment in enumerate(segments):
+                base_indices = segment.get("base_indices") or [position]
+                base_index = int(base_indices[0])
+                key = (session_id, base_index)
+                segment_id = str(segment["segment_id"])
+                segment_ids.append(segment_id)
+                segment_id_by_key[key] = segment_id
+                if key in current_keys:
+                    tags = ("candidate_for_line",)
+                    add_text = ""
+                elif key in other_keys:
+                    tags = ("candidate_for_other_line",)
+                    add_text = "Add"
+                else:
+                    tags = ()
+                    add_text = "Add"
+                transcript = str(segment.get("transcript") or "").strip()
+                duration = float(
+                    (segment.get("metrics") or {}).get(
+                        "duration_seconds",
+                        float(segment.get("end_seconds", 0.0))
+                        - float(segment.get("start_seconds", 0.0)),
+                    )
+                )
+                self.base_segment_tree.insert(
+                    "",
+                    "end",
+                    iid=segment_id,
+                    values=(
+                        session_id,
+                        segment_id,
+                        transcript or "[No transcript]",
+                        f"{duration:.2f}s",
+                        "▶",
+                        add_text,
+                    ),
+                    tags=tags,
+                )
+
+        preferred_id = None if reset_focus else self.selected_base_segment_id
+        if preferred_id not in segment_ids:
+            focus_key = _first_line_base_segment_key(line)
+            preferred_id = segment_id_by_key.get(focus_key) if focus_key else None
+        if preferred_id not in segment_ids:
+            preferred_id = segment_ids[0] if segment_ids else None
+        self.selected_base_segment_id = preferred_id
+        if preferred_id is not None:
+            self.base_segment_tree.selection_set(preferred_id)
+            self.base_segment_tree.focus(preferred_id)
+            self.base_segment_tree.see(preferred_id)
+
+    def _review_tab_changed(self, _event: tk.Event[Any]) -> None:
+        if self._base_segments_tab_active():
+            self._show_selected_base_segment_waveform()
+        elif self.selected_candidate_id:
+            self._show_candidate_waveform(self.selected_candidate_id)
+        elif self.candidate_waveform is not None:
+            self.candidate_waveform.clear("No candidate waveform is available.")
+
+    def _base_segment_tree_selected(self, _event: tk.Event[Any]) -> None:
+        selected = self.base_segment_tree.selection()
+        if not selected:
+            return
+        segment_id = str(selected[0])
+        changed = segment_id != self.selected_base_segment_id
+        self.selected_base_segment_id = segment_id
+        if changed and self._base_segments_tab_active():
+            self._show_candidate_waveform(segment_id)
+
+    def _show_selected_base_segment_waveform(self) -> None:
+        if self.selected_base_segment_id:
+            self._show_candidate_waveform(self.selected_base_segment_id)
+        elif self.candidate_waveform is not None:
+            self.candidate_waveform.clear("No base-segment waveform is available.")
+
+    def _base_segment_table_clicked(self, event: tk.Event[Any]) -> None:
+        segment_id = self.base_segment_tree.identify_row(event.y)
+        if not segment_id:
+            return
+        column = self.base_segment_tree.identify_column(event.x)
+        if column == "#5":
+            self.selected_base_segment_id = segment_id
+            self.base_segment_tree.selection_set(segment_id)
+            self.base_segment_tree.focus(segment_id)
+            self._show_candidate_waveform(segment_id)
+            if self.candidate_waveform is not None and self.candidate_waveform._loaded:
+                self.candidate_waveform.restart_playback()
+        elif column == "#6" and self.base_segment_tree.set(segment_id, "add"):
+            self.add_base_segment_as_candidate(segment_id)
+
+    def _base_segment_table_motion(self, event: tk.Event[Any]) -> None:
+        segment_id = self.base_segment_tree.identify_row(event.y)
+        column = self.base_segment_tree.identify_column(event.x)
+        is_action = bool(
+            segment_id
+            and (
+                column == "#5"
+                or (
+                    column == "#6"
+                    and self.base_segment_tree.set(segment_id, "add")
+                )
+            )
+        )
+        self.base_segment_tree.configure(cursor="hand2" if is_action else "")
+
+    def add_base_segment_as_candidate(self, segment_id: str) -> None:
+        assert self.project_dir is not None
+        assert self.review_path is not None
+        assert self.review_data is not None
+        line = self._selected_line()
+        if line is None:
+            return
+        try:
+            add_base_segment_candidate(
+                project_dir=self.project_dir,
+                review_path=self.review_path,
+                review_data=self.review_data,
+                line_id=str(line["line_id"]),
+                segment_id=segment_id,
+            )
+        except Exception as error:
+            messagebox.showerror(
+                "Cannot add base segment",
+                str(error),
+                parent=self.root,
+            )
+            return
+        self.render_lines()
+        self.render_candidates()
 
     def _candidate_tree_selected(self, _event: tk.Event[Any]) -> None:
         selected = self.candidate_tree.selection()
@@ -3339,7 +3678,8 @@ class DialogueReviewApp:
         if segment_id == self.selected_candidate_id:
             return
         self.selected_candidate_id = segment_id
-        self._show_candidate_waveform(segment_id)
+        if not self._base_segments_tab_active():
+            self._show_candidate_waveform(segment_id)
 
     def _show_candidate_waveform(self, segment_id: str) -> None:
         if self.candidate_waveform is None or self.project_dir is None:

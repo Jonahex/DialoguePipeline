@@ -473,6 +473,111 @@ def save_line_review(path: Path, data: dict[str, Any]) -> None:
     write_json(path, data)
 
 
+def add_base_segment_candidate(
+    *,
+    project_dir: Path,
+    review_path: Path,
+    review_data: dict[str, Any],
+    line_id: str,
+    segment_id: str,
+) -> dict[str, Any]:
+    """Attach one full base segment to a verbal line as a manual candidate."""
+
+    validate_line_review(review_data)
+    manifest_path = project_dir / "segments_manifest.json"
+    manifest = read_json(manifest_path)
+    matches = [
+        (session, base_index, segment)
+        for session in manifest.get("sessions", [])
+        for base_index, segment in enumerate(session.get("segments") or [])
+        if str(segment.get("segment_id") or "") == segment_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected one base segment with ID {segment_id}, found {len(matches)}."
+        )
+    session, base_index, segment = matches[0]
+    if str(segment.get("kind") or "base") != "base":
+        raise ValueError(f"Segment is not a base segment: {segment_id}")
+
+    updated_review = copy.deepcopy(review_data)
+    line = next(
+        (
+            item
+            for item in updated_review["lines"]
+            if str(item["line_id"]) == line_id
+        ),
+        None,
+    )
+    if line is None:
+        raise KeyError(f"Review line is not present: {line_id}")
+    if line["type"] != "normal":
+        raise ValueError("Base segments can be added only to verbal lines.")
+
+    session_id = str(segment.get("session_id") or session.get("session_id") or "")
+    segment_base_indices = [
+        int(value) for value in segment.get("base_indices") or [base_index]
+    ]
+    target_key = (session_id, segment_base_indices[0])
+    covered_keys = {
+        (str(candidate.get("session_id") or ""), int(candidate_base_index))
+        for candidate in line["candidates"]
+        for candidate_base_index in candidate.get("base_indices") or []
+    }
+    if target_key in covered_keys or any(
+        str(candidate.get("segment_id") or "") == segment_id
+        for candidate in line["candidates"]
+    ):
+        raise ValueError(
+            "This base segment is already represented by a candidate for the line."
+        )
+
+    duration_seconds = float(
+        (segment.get("metrics") or {}).get(
+            "duration_seconds",
+            float(segment.get("end_seconds", 0.0))
+            - float(segment.get("start_seconds", 0.0)),
+        )
+    )
+    candidate = {
+        "rank": 0,
+        "segment_id": str(segment["segment_id"]),
+        "segment_file": str(segment["file"]),
+        "session_id": session_id,
+        "base_indices": segment_base_indices,
+        "transcript": str(segment.get("transcript") or ""),
+        "score": 0.0,
+        "match_score": 0.0,
+        "selection_score": 0.0,
+        "reliable": False,
+        "reliability_reason": "MANUALLY_ADDED_BASE_SEGMENT",
+        "technical_score": 0.0,
+        "confidence_margin": 0.0,
+        "source_audio": str(segment.get("source_audio") or session.get("audio") or ""),
+        "start_seconds": float(segment.get("start_seconds", 0.0)),
+        "end_seconds": float(segment.get("end_seconds", 0.0)),
+        "duration_seconds": duration_seconds,
+        "duration_plausibility": 0.0,
+        "manually_added_base_segment": True,
+    }
+    line["candidates"].append(candidate)
+    line["candidates"].sort(
+        key=lambda item: float(item.get("score", 0.0)),
+        reverse=True,
+    )
+    for rank, item in enumerate(line["candidates"], start=1):
+        item["rank"] = rank
+    if not line.get("suggested_segment_id"):
+        line["suggested_segment_id"] = candidate["segment_id"]
+    if line["status"] == "MISSING":
+        line["status"] = "REVIEW"
+
+    save_line_review(review_path, updated_review)
+    review_data.clear()
+    review_data.update(updated_review)
+    return candidate
+
+
 def segment_edit_source(
     *,
     project_dir: Path,
@@ -841,7 +946,10 @@ def preserve_manual_selections(
         }
         for candidate in previous_line["candidates"]:
             if (
-                bool(candidate.get("manual_edit"))
+                bool(
+                    candidate.get("manual_edit")
+                    or candidate.get("manually_added_base_segment")
+                )
                 and str(candidate["segment_id"]) not in existing_candidate_ids
             ):
                 new_line["candidates"].append(candidate)

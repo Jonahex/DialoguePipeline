@@ -80,8 +80,9 @@ and retake marks are retained when the project is reprocessed.
 
 ### Review candidates
 
-The review screen shows script lines on the left and candidates for the
-selected line on the right.
+The review screen shows script lines on the left and review audio for the
+selected line on the right. Verbal lines have **Candidates** and **Base
+segments** tabs.
 
 - Filter lines by status or click a line-column heading to sort.
 - Use the play controls to audition a selected take or any candidate.
@@ -94,6 +95,12 @@ selected line on the right.
 - Candidates cut from the same base segment or base-segment sequence are shown
   as one take. The best-scoring version is the take row, and other cuts can be
   expanded beneath it. Custom edits remain with the take they were copied from.
+- The **Base segments** tab lists every base segment and initially scrolls to
+  the first segment represented by the line's earliest candidate in time.
+  Green rows already contribute to a candidate for the current line, including
+  partial cuts and merged spans. Yellow rows contribute to another line.
+  Choose **Add** on any other row to attach the full base segment to the current
+  line as a new take.
 - Select or unselect candidates. Changes are saved immediately to
   `line_review.json`.
 - Review the line context, full text, and acting note above the candidates.

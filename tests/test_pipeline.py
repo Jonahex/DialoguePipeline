@@ -62,6 +62,7 @@ from dialogue_pipeline.project import (
 )
 from dialogue_pipeline.retakes import export_retake_script
 from dialogue_pipeline.review import (
+    add_base_segment_candidate,
     build_line_review,
     delete_edited_candidate,
     load_line_review,
@@ -93,9 +94,11 @@ from dialogue_pipeline.transcription import (
 from dialogue_pipeline.ui import (
     AudioPlayer,
     DialogueReviewApp,
+    _base_segment_candidate_usage,
     _candidate_selection_display,
     _candidate_take_groups,
     _context_display_text,
+    _first_line_base_segment_key,
     _initial_segment_window,
     _panned_sample_window,
     _playback_samples,
@@ -545,6 +548,157 @@ def test_manual_only_normal_line_keeps_unmatched_take_pool_visible() -> None:
     }
 
     assert _uses_unmatched_candidates(line) is True
+
+
+def test_base_segment_usage_marks_partial_and_merged_candidates() -> None:
+    review_data = {
+        "lines": [
+            {
+                "line_id": "current",
+                "candidates": [
+                    {
+                        "segment_id": "session__partial",
+                        "session_id": "session",
+                        "base_indices": [2],
+                    },
+                    {
+                        "segment_id": "session__merged",
+                        "session_id": "session",
+                        "base_indices": [4, 5],
+                    },
+                ],
+            },
+            {
+                "line_id": "other",
+                "candidates": [
+                    {
+                        "segment_id": "session__s00002",
+                        "session_id": "session",
+                        "base_indices": [1],
+                    },
+                    {
+                        "segment_id": "session__overlap",
+                        "session_id": "session",
+                        "base_indices": [5, 6],
+                    },
+                ],
+            },
+        ]
+    }
+
+    current, other = _base_segment_candidate_usage(review_data, "current")
+
+    assert current == {("session", 2), ("session", 4), ("session", 5)}
+    assert other == {("session", 1), ("session", 5), ("session", 6)}
+
+
+def test_first_line_base_segment_prefers_earliest_candidate_by_time() -> None:
+    line = {
+        "selected_segment_id": "selected",
+        "suggested_segment_id": "suggested",
+        "candidates": [
+            {
+                "segment_id": "suggested",
+                "session_id": "session",
+                "base_indices": [8],
+                "start_seconds": 12.0,
+                "score": 70.0,
+            },
+            {
+                "segment_id": "selected",
+                "session_id": "session",
+                "base_indices": [4, 5],
+                "start_seconds": 20.0,
+                "score": 99.0,
+            },
+            {
+                "segment_id": "earliest",
+                "session_id": "session",
+                "base_indices": [2, 3],
+                "start_seconds": 5.0,
+                "score": 50.0,
+            },
+        ],
+    }
+
+    assert _first_line_base_segment_key(line) == ("session", 2)
+
+
+def test_add_base_segment_candidate_persists_and_survives_reprocessing(
+    tmp_path: Path,
+) -> None:
+    source_line = {
+        "line_id": "Sheet::R3",
+        "sheet": "Sheet",
+        "sheet_index": 0,
+        "excel_row": 3,
+        "line": "A manually added take.",
+        "target_filename": "manual_take",
+    }
+    review_path = tmp_path / "line_review.json"
+    review = build_line_review(
+        source_lines=[source_line],
+        candidates_by_line={},
+        unmatched_segments=[],
+    )
+    save_line_review(review_path, review)
+    write_json(
+        tmp_path / "segments_manifest.json",
+        {
+            "sessions": [
+                {
+                    "session_id": "session",
+                    "audio": "source.wav",
+                    "segments": [
+                        {
+                            "segment_id": "session__s00001",
+                            "kind": "base",
+                            "session_id": "session",
+                            "source_audio": "source.wav",
+                            "base_indices": [0],
+                            "start_seconds": 1.0,
+                            "end_seconds": 2.25,
+                            "file": "segments/session/session__s00001.wav",
+                            "transcript": "A manually added take.",
+                            "metrics": {"duration_seconds": 1.25},
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+
+    candidate = add_base_segment_candidate(
+        project_dir=tmp_path,
+        review_path=review_path,
+        review_data=review,
+        line_id=source_line["line_id"],
+        segment_id="session__s00001",
+    )
+
+    assert candidate["manually_added_base_segment"] is True
+    assert candidate["base_indices"] == [0]
+    assert review["lines"][0]["status"] == "REVIEW"
+    assert load_line_review(review_path)["lines"][0]["candidates"] == [candidate]
+
+    regenerated = build_line_review(
+        source_lines=[source_line],
+        candidates_by_line={},
+        unmatched_segments=[],
+    )
+    preserved = preserve_manual_selections(regenerated, review)
+    assert preserved["lines"][0]["candidates"][0]["segment_id"] == (
+        "session__s00001"
+    )
+
+    with pytest.raises(ValueError, match="already represented"):
+        add_base_segment_candidate(
+            project_dir=tmp_path,
+            review_path=review_path,
+            review_data=review,
+            line_id=source_line["line_id"],
+            segment_id="session__s00001",
+        )
 
 
 def test_refresh_project_audio_recuts_existing_spans_without_reprocessing(

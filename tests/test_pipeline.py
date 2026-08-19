@@ -2179,9 +2179,100 @@ def test_order_independent_alignment_handles_reordered_lines_and_takes() -> None
     )
 
 
-def test_text_similarity_handles_reordered_and_repeated_take_text() -> None:
-    assert text_similarity("Good afternoon.", "Afternoon Good") > 88
-    assert text_similarity("Take this!", "This Take This") > 88
+def test_ordered_scoring_separates_consecutive_multiclause_takes() -> None:
+    line_text = (
+        "Ugh, you reek. How long have you been trudging along through the mud "
+        "without a proper bath? This is exactly why I miss Leyawiin."
+    )
+    transcripts = [
+        "Huh?",
+        "You reek.",
+        "Ugh!",
+        "How long have you been trudging along through the mud without a "
+        "proper bath?",
+        "This.",
+        "is exactly why I miss Leowin.",
+        "Whoa",
+        "You're weak!",
+        "How long have you been trudging along through the mud without a "
+        "proper bath?",
+        "This",
+        "is exactly why I miss Leowin.",
+        "Ugh, you reek.",
+        "mmm",
+        "How long have you been trudging along through the mud without a "
+        "proper bath?",
+        "This is exactly why I miss Leowin.",
+    ]
+    durations = [
+        0.6,
+        1.7,
+        1.2,
+        5.2,
+        1.1,
+        3.1,
+        1.0,
+        1.5,
+        5.4,
+        1.0,
+        3.0,
+        2.6,
+        1.6,
+        5.3,
+        3.0,
+    ]
+    segments = []
+    cursor = 0.0
+    for transcript, duration in zip(transcripts, durations):
+        segments.append(
+            {
+                "start_seconds": cursor,
+                "end_seconds": cursor + duration,
+                "transcript": transcript,
+                "asr_probability": 0.95,
+            }
+        )
+        cursor += duration + 0.1
+
+    actions = order_independent_align(
+        segments,
+        [{"line_id": "line", "line": line_text}],
+        _alignment_settings(
+            span_search={
+                "max_segments": 8,
+                "max_gap_seconds": 2.5,
+                "max_duration_seconds": 35.0,
+                "minimum_score": 45.0,
+            },
+            ranking={
+                "noise_penalty": 2.2,
+                "duration_hint_weight": 1.0,
+                "order_hint_weight": 0.0,
+            },
+        ),
+    )
+
+    assert [
+        (action["start_index"], action["count"])
+        for action in actions
+    ] == [(0, 6), (6, 5), (11, 4)]
+
+
+def test_text_similarity_penalizes_reordered_take_text() -> None:
+    expected = (
+        "Ugh, you reek. How long have you been trudging along through the "
+        "mud without a proper bath? This is exactly why I miss Leyawiin."
+    )
+    reordered = (
+        "How long have you been trudging along through the mud without a "
+        "proper bath? This is exactly why I miss Leyawiin. Ugh, you reek."
+    )
+
+    assert text_similarity(expected, expected) > 99
+    assert text_similarity(expected, reordered) < 90
+
+
+def test_text_similarity_handles_repeated_compound_words() -> None:
     assert text_similarity("Run away! Run away!", "Runaway Runaway") >= 72
 
 
@@ -2629,17 +2720,17 @@ def test_short_line_auto_reliability_requires_order_and_no_extra_words() -> None
     )
     line = {"line": "Not... remember..."}
 
-    assert text_similarity(line["line"], "Remember Not") >= 88.0
+    assert text_similarity(line["line"], "Remember Not") < 88.0
     assert _candidate_reliability(
         line=line,
-        match_score=text_similarity(line["line"], "Remember Not"),
+        match_score=95.0,
         margin=40.0,
         settings=settings,
         observed="Remember Not",
     ) == (False, "SHORT_LINE_ORDER_MISMATCH")
     assert _candidate_reliability(
         line=line,
-        match_score=text_similarity(line["line"], "Not remember not"),
+        match_score=95.0,
         margin=40.0,
         settings=settings,
         observed="Not remember not",
@@ -2706,7 +2797,7 @@ def test_transcribed_repeated_takes_prevent_auto_acceptance(
     )
 
     assert reliable is False
-    assert reason == "EXCESS_TRANSCRIPT_WORDS"
+    assert reason == "LOW_MATCH_SCORE"
 
 
 def test_transcript_fidelity_tolerates_minor_asr_spelling_errors() -> None:
@@ -3002,7 +3093,10 @@ def test_fragment_join_keeps_bounded_high_score_fallbacks() -> None:
                 "max_gap_seconds": 1.0,
                 "max_duration_seconds": 10.0,
             },
-            recovery={"fallback_candidates_per_line": 2},
+            recovery={
+                "fallback_candidates_per_line": 2,
+                "fallback_minimum_score": 89.0,
+            },
         ),
         transcription=transcription,
     )
@@ -3017,7 +3111,7 @@ def test_fragment_join_keeps_bounded_high_score_fallbacks() -> None:
         if action["start_index"] == 1 and action["count"] == 3
     )
     assert restored["fragment_join_fallback"] is True
-    assert restored["match_score"] >= 90.0
+    assert restored["match_score"] >= 89.0
     assert (
         sum(
             bool(action.get("fragment_join_fallback"))
@@ -4617,6 +4711,65 @@ def test_fragment_join_skips_line_with_complete_contraction_variant() -> None:
     assert joined == []
 
 
+def test_fragment_join_recovers_later_takes_when_line_has_complete_take() -> None:
+    line_text = (
+        "This place is nothing but a rest stop for eccentrics and recluses."
+    )
+    lines = [{"line_id": "line", "line": line_text}]
+    transcripts = [
+        f"Thanks for watching! {line_text}",
+        "This place",
+        "It's nothing but a rest stop for eccentrics and recluses",
+        "This place",
+        "It's nothing but a rest stop for eccentrics and recluses",
+    ]
+    segments = [
+        {
+            "start_seconds": index * 6.0,
+            "end_seconds": index * 6.0 + 5.0,
+            "transcript": transcript,
+            "asr_probability": 0.95,
+        }
+        for index, transcript in enumerate(transcripts)
+    ]
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": index,
+            "count": 1,
+            "line_index": 0,
+            "match_score": text_similarity(line_text, transcript),
+            "transcript": transcript,
+            "duration_plausibility": 80.0,
+            "order_hint": 0.0,
+            "top_matches": [],
+        }
+        for index, transcript in enumerate(transcripts)
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings=_alignment_settings(
+            span_search={
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 12.0,
+            }
+        ),
+    )
+
+    assert any(
+        action["start_index"] == 1 and action["count"] == 2
+        for action in joined
+    )
+    assert any(
+        action["start_index"] == 3 and action["count"] == 2
+        for action in joined
+    )
+    assert all(action["start_index"] > 0 for action in joined)
+
+
 def test_unordered_alignment_does_not_merge_empty_boundary_segment() -> None:
     lines = [
         {
@@ -5715,6 +5868,38 @@ def test_unsafe_long_merge_does_not_hide_reliable_contained_take() -> None:
 
     assert [candidate["segment_id"] for candidate in retained] == [
         "session__m00197_00198"
+    ]
+
+
+def test_structurally_incomplete_disjoint_take_remains_reviewable() -> None:
+    reliable_take = {
+        "segment_id": "session__m00004_00005",
+        "session_id": "session",
+        "base_indices": [3, 4],
+        "match_score": 97.6,
+        "selection_score": 119.0,
+        "is_primary_match": True,
+        "reliable": True,
+        "reliability_reason": "",
+    }
+    disjoint_take = {
+        "segment_id": "session__m00006_00007",
+        "session_id": "session",
+        "base_indices": [5, 6],
+        "match_score": 92.4,
+        "selection_score": 114.1,
+        "is_primary_match": True,
+        "reliable": False,
+        "reliability_reason": "MISSING_LINE_END",
+        "fragment_join": True,
+        "fragment_join_provisional": True,
+    }
+
+    retained = prune_line_candidates([reliable_take, disjoint_take])
+
+    assert [candidate["segment_id"] for candidate in retained] == [
+        "session__m00004_00005",
+        "session__m00006_00007",
     ]
 
 

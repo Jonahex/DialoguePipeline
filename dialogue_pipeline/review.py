@@ -84,6 +84,17 @@ def _is_dominated_span(
     return False
 
 
+def _overlaps_candidate_span(
+    candidate: dict[str, Any],
+    other: dict[str, Any],
+) -> bool:
+    if candidate.get("session_id") != other.get("session_id"):
+        return False
+    base_indices = set(candidate.get("base_indices") or [])
+    other_indices = set(other.get("base_indices") or [])
+    return bool(base_indices and other_indices and base_indices & other_indices)
+
+
 def prune_line_candidates(
     candidates: list[dict[str, Any]],
     *,
@@ -157,7 +168,12 @@ def prune_line_candidates(
         if reliable_best is not None:
             retained.append(reliable_best)
 
-    if any(candidate.get("reliable", False) for candidate in retained):
+    reliable_retained = [
+        candidate
+        for candidate in retained
+        if bool(candidate.get("reliable", False))
+    ]
+    if reliable_retained:
         retained = [
             candidate
             for candidate in retained
@@ -165,6 +181,10 @@ def prune_line_candidates(
                 candidate.get("reliable", False)
                 or str(candidate.get("reliability_reason") or "")
                 not in STRUCTURALLY_INCOMPLETE_REASONS
+                or not any(
+                    _overlaps_candidate_span(candidate, reliable)
+                    for reliable in reliable_retained
+                )
             )
         ]
     return sorted(

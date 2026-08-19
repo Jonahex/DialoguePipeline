@@ -53,8 +53,6 @@ from .workbook_io import lines_for_session
 class TextFeatures:
     normalized: str
     tokens: tuple[str, ...]
-    counts: Counter[str]
-    compact: str
 
 
 @dataclass(frozen=True)
@@ -174,8 +172,6 @@ def _text_features(
     return TextFeatures(
         normalized=normalized,
         tokens=tokens,
-        counts=Counter(tokens),
-        compact=normalized.replace(" ", "").replace("'", ""),
     )
 
 
@@ -185,56 +181,11 @@ def _text_similarity_features(
 ) -> float:
     if not expected.normalized or not observed.normalized:
         return 0.0
-    expected_tokens = expected.tokens
-    observed_tokens = observed.tokens
-    covered = sum(
-        min(count, observed.counts.get(token, 0))
-        for token, count in expected.counts.items()
-    )
-    coverage = 100.0 * covered / max(1, len(expected_tokens))
-    ratio = fuzz.ratio(expected.normalized, observed.normalized)
-    weighted = fuzz.WRatio(expected.normalized, observed.normalized)
-    partial = fuzz.partial_ratio(expected.normalized, observed.normalized)
-    token_sort = fuzz.token_sort_ratio(
-        expected.normalized,
-        observed.normalized,
-    )
-    token_set = fuzz.token_set_ratio(
-        expected.normalized,
-        observed.normalized,
-    )
-    compact_ratio = fuzz.ratio(expected.compact, observed.compact)
-
-    if len(expected_tokens) <= 3:
-        score = 0.55 * ratio + 0.25 * weighted + 0.20 * coverage
-    else:
-        score = (
-            0.40 * ratio
-            + 0.30 * weighted
-            + 0.15 * partial
-            + 0.15 * coverage
-        )
-
-    length_ratio = len(observed_tokens) / max(1, len(expected_tokens))
-    if length_ratio < 0.45:
-        score *= 0.72
-    elif length_ratio < 0.70:
-        score *= 0.88
-    if length_ratio > 2.2:
-        score *= 0.85
-
-    order_insensitive = max(
-        0.50 * token_sort + 0.30 * token_set + 0.20 * compact_ratio,
-        0.60 * token_set + 0.40 * compact_ratio,
-    )
-    if compact_ratio < 98.0 and length_ratio < 0.45:
-        order_insensitive *= 0.80
-    elif compact_ratio < 98.0 and length_ratio < 0.70:
-        order_insensitive *= 0.97
-    if length_ratio > 2.2:
-        order_insensitive *= 0.92
-    score = max(score, order_insensitive)
-    return max(0.0, min(100.0, score))
+    # Keep candidate scoring sensitive to the spoken order within a line.
+    # Workbook lines are still matched in arbitrary recording order by the
+    # aligner, but a suffix followed by the next take's prefix must not look
+    # like a complete delivery merely because it contains the same token set.
+    return float(fuzz.ratio(expected.normalized, observed.normalized))
 
 
 def text_similarity(expected: str, observed: str) -> float:
@@ -2435,7 +2386,19 @@ def _multisentence_fragment_join_actions(
             )
         )
 
-    complete_line_indexes = set()
+    def has_complete_script_coverage(fidelity: dict[str, Any]) -> bool:
+        """Allow boundary extras while requiring every scripted edge token."""
+
+        return bool(
+            float(fidelity["token_coverage"]) >= 1.0
+            and int(fidelity["leading_missing_token_count"]) == 0
+            and int(fidelity["leading_substitution_count"]) == 0
+            and int(fidelity["trailing_missing_token_count"]) == 0
+            and int(fidelity["trailing_substitution_count"]) == 0
+        )
+
+    complete_action_keys: set[tuple[int, int, int]] = set()
+    complete_action_ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
     if only_incomplete_lines:
         minimum_complete_match = float(
             settings.get("fragment_join_complete_min_match_score", 72.0)
@@ -2454,8 +2417,6 @@ def _multisentence_fragment_join_actions(
         )
         for action in ordered_actions:
             line_index = int(action["line_index"])
-            if line_index in complete_line_indexes:
-                continue
             scored = score_preview(
                 line_index,
                 {"transcript": str(action.get("transcript") or "")},
@@ -2469,37 +2430,38 @@ def _multisentence_fragment_join_actions(
                 normalize_spoken_text(observed_text).split()
             )
             length_ratio = observed_words / expected_words
-            expected_counts = Counter(
-                evaluator.line_features[line_index].text.tokens
-            )
-            observed_counts = Counter(
-                evaluator.observed_features(observed_text).tokens
-            )
-            repeated_excess = any(
-                count >= 2 and count > expected_counts.get(token, 0)
-                for token, count in observed_counts.items()
-            )
             if (
                 float(scored["match"]) >= minimum_complete_match
                 and float(scored["fidelity"]["ordered_similarity"])
                 >= minimum_complete_ordered
                 and int(scored["sentence"]["missing_clause_count"]) == 0
                 and bool(scored["sentence"]["clauses_in_order"])
-                and has_complete_boundaries(scored["fidelity"])
+                and has_complete_script_coverage(scored["fidelity"])
                 and minimum_length_ratio
                 <= length_ratio
                 <= maximum_length_ratio
-                and not repeated_excess
             ):
-                complete_line_indexes.add(line_index)
+                action_start = int(action["start_index"])
+                action_count = int(action["count"])
+                complete_action_keys.add(
+                    (line_index, action_start, action_count)
+                )
+                complete_action_ranges[line_index].append(
+                    (action_start, action_start + action_count - 1)
+                )
 
     for seed_action in ordered_actions:
         check_processing_cancelled()
         line_index = int(seed_action["line_index"])
         line = lines[line_index]
+        seed_key = (
+            line_index,
+            int(seed_action["start_index"]),
+            int(seed_action["count"]),
+        )
         if (
             is_vocalization_script(line["line"])
-            or line_index in complete_line_indexes
+            or seed_key in complete_action_keys
         ):
             continue
         seed_start = int(seed_action["start_index"])
@@ -2515,6 +2477,15 @@ def _multisentence_fragment_join_actions(
                 end_index = start_index + count - 1
                 if end_index >= len(base_segments):
                     break
+                if any(
+                    start_index <= complete_end
+                    and end_index >= complete_start
+                    for complete_start, complete_end in complete_action_ranges.get(
+                        line_index,
+                        [],
+                    )
+                ):
+                    continue
                 if (
                     end_index < seed_start - neighbor_radius
                     or start_index > seed_end + neighbor_radius

@@ -183,15 +183,20 @@ in `alignment.json`. Review pruning:
 - retains candidates within 15 match-score points of the best;
 - cuts earlier when an adjacent score gap is at least 12 points;
 - preserves a useful strict fragment join, ahead of provisional joins, or a
-  reliable candidate when ordinary pruning would remove all of them.
+  reliable candidate when ordinary pruning would remove all of them;
+- removes structurally incomplete alternatives when they overlap a retained
+  reliable take, while keeping disjoint spans as separate reviewable takes.
 
 Manual selections are restored after regeneration even when the selected span
 falls outside the new automatic cluster.
 
 ## Reliability and transcript fidelity
 
-Candidate discovery is deliberately tolerant; `AUTO_OK` uses stricter,
-separate gates. Diagnostics include:
+Candidate discovery compares every audio span with every eligible script line,
+so workbook and recording order remain independent. Similarity within an
+individual line is order-sensitive: token-set similarity cannot promote a
+suffix followed by the next take's prefix into a high-scoring complete line.
+`AUTO_OK` uses additional, stricter gates. Diagnostics include:
 
 - ordered similarity;
 - fuzzy-token coverage and precision;
@@ -244,6 +249,10 @@ order, and precision. A provisional path admits spans that clearly improve an
 incomplete fragment. A bounded number of promising alternatives are exact-WAV
 transcribed before reliability is decided. Secondary matches can seed recovery;
 `fragment_join_secondary_seed_min_match_score` defaults to `80`.
+Recovery is take-local: a complete take does not suppress recovery of later
+incomplete actions for the same script line, but complete takes act as barriers
+that candidate joins cannot cross. This retains repeated split takes without
+creating spans that combine neighboring deliveries.
 When a short boundary clause is audible but ASR cannot identify it reliably,
 the span remains reviewable with `UNCERTAIN_BOUNDARY_AUDIO`.
 

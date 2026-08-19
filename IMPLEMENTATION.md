@@ -182,8 +182,9 @@ in `alignment.json`. Review pruning:
   better candidate;
 - retains candidates within 15 match-score points of the best;
 - cuts earlier when an adjacent score gap is at least 12 points;
-- preserves a useful strict fragment join, ahead of provisional joins, or a
-  reliable candidate when ordinary pruning would remove all of them;
+- preserves a useful strict fragment join, ahead of provisional joins, and the
+  best reliable representative of every disjoint take even when it falls below
+  the global score cutoff;
 - removes structurally incomplete alternatives when they overlap a retained
   reliable take, while keeping disjoint spans as separate reviewable takes.
 

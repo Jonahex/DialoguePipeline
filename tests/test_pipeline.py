@@ -6221,6 +6221,69 @@ def test_review_candidates_keep_primary_top_score_cluster() -> None:
     ]
 
 
+def test_review_candidates_keep_reliable_disjoint_take_below_score_cutoff() -> None:
+    retained = prune_line_candidates(
+        [
+            {
+                "segment_id": "session__s00126",
+                "session_id": "session",
+                "base_indices": [125],
+                "match_score": 100.0,
+                "selection_score": 121.0,
+                "is_primary_match": True,
+                "reliable": True,
+                "reliability_reason": "",
+            },
+            {
+                "segment_id": "session__s00123",
+                "session_id": "session",
+                "base_indices": [122],
+                "match_score": 86.27450980392157,
+                "selection_score": 107.45633353439032,
+                "is_primary_match": True,
+                "reliable": True,
+                "reliability_reason": "",
+            },
+        ]
+    )
+
+    assert [candidate["segment_id"] for candidate in retained] == [
+        "session__s00126",
+        "session__s00123",
+    ]
+
+
+def test_review_candidates_drop_reliable_overlapping_variant_below_cutoff() -> None:
+    retained = prune_line_candidates(
+        [
+            {
+                "segment_id": "session__best",
+                "session_id": "session",
+                "base_indices": [122],
+                "match_score": 100.0,
+                "selection_score": 121.0,
+                "is_primary_match": True,
+                "reliable": True,
+                "reliability_reason": "",
+            },
+            {
+                "segment_id": "session__alternate",
+                "session_id": "session",
+                "base_indices": [122],
+                "match_score": 86.0,
+                "selection_score": 107.0,
+                "is_primary_match": True,
+                "reliable": True,
+                "reliability_reason": "",
+            },
+        ]
+    )
+
+    assert [candidate["segment_id"] for candidate in retained] == [
+        "session__best"
+    ]
+
+
 def test_structurally_incomplete_superset_does_not_hide_strict_join() -> None:
     oversized_provisional = {
         "segment_id": "session__m00065_00068",

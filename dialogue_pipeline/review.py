@@ -168,11 +168,29 @@ def prune_line_candidates(
         if reliable_best is not None:
             retained.append(reliable_best)
 
+    # Score clustering ranks alternative versions of the same take well, but a
+    # line can have several valid takes whose transcript scores differ greatly.
+    # Keep the best reliable representative of every disjoint take even when it
+    # falls below the global score cutoff.  Since ``unique`` is score-sorted,
+    # overlapping lower-scoring variants remain pruned.
     reliable_retained = [
         candidate
         for candidate in retained
         if bool(candidate.get("reliable", False))
     ]
+    for candidate in unique:
+        if not bool(candidate.get("reliable", False)):
+            continue
+        if candidate in retained:
+            continue
+        if any(
+            _overlaps_candidate_span(candidate, reliable)
+            for reliable in reliable_retained
+        ):
+            continue
+        retained.append(candidate)
+        reliable_retained.append(candidate)
+
     if reliable_retained:
         retained = [
             candidate

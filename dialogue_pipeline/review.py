@@ -226,6 +226,18 @@ def _unmatched_candidate(segment: dict[str, Any]) -> dict[str, Any]:
     return {
         "segment_id": str(segment["segment_id"]),
         "segment_file": str(segment["segment_file"]),
+        "session_id": str(segment.get("session_id") or ""),
+        "base_indices": [
+            int(value)
+            for value in (
+                segment.get("base_indices")
+                or (
+                    [segment["base_index"]]
+                    if segment.get("base_index") is not None
+                    else []
+                )
+            )
+        ],
         "transcript": str(segment.get("transcript") or ""),
         "score": float(technical_score),
         "technical_score": float(technical_score),

@@ -85,8 +85,15 @@ selected line on the right.
 
 - Filter lines by status or click a line-column heading to sort.
 - Use the play controls to audition a selected take or any candidate.
+- The waveform Play button changes to Pause during playback and Resume while
+  paused.
 - Click a candidate row to inspect its waveform. The read-only waveform uses
-  the same mouse-wheel zoom and right-drag navigation as Copy/Edit.
+  the same mouse-wheel zoom and right-drag navigation as Copy/Edit. During
+  playback, a blue line follows the current position; drag it to seek. Playback
+  pauses while dragging and resumes at the released position.
+- Candidates cut from the same base segment or base-segment sequence are shown
+  as one take. The best-scoring version is the take row, and other cuts can be
+  expanded beneath it. Custom edits remain with the take they were copied from.
 - Select or unselect candidates. Changes are saved immediately to
   `line_review.json`.
 - Review the line context, full text, and acting note above the candidates.
@@ -111,7 +118,9 @@ Use **Copy/Edit** on a candidate to create a custom segment:
 1. Adjust the start and end markers in the waveform view.
 2. Use the mouse wheel over the waveform to zoom around the pointer.
 3. Hold the right mouse button and drag to pan through the surrounding audio.
-4. Preview the current range and save it.
+4. Preview the current range. Drag the blue playback line to seek; playback
+   pauses during the drag and resumes from the released position.
+5. Save the edited range.
 
 Saving is sample-accurate and does not run transcription, so it completes
 quickly. The new row is marked **Custom segment - not transcribed**.

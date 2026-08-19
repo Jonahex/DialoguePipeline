@@ -4,11 +4,11 @@ import csv
 import os
 import shutil
 import tempfile
-import wave
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from .audio import open_pcm_wav
 from .review import load_line_review
 from .util import read_json, resolve_project_path
 
@@ -43,7 +43,7 @@ def _segment_lookup(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def _probe_wave(path: Path) -> dict[str, int]:
-    with wave.open(str(path), "rb") as reader:
+    with open_pcm_wav(path) as reader:
         return {
             "sample_rate": reader.getframerate(),
             "channels": reader.getnchannels(),

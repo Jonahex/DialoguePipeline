@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import struct
 import subprocess
 import threading
 import wave
@@ -42,6 +43,8 @@ from dialogue_pipeline.alignment_settings import (
 from dialogue_pipeline.audio import (
     cut_pcm_wav,
     first_quiet_pcm_boundary,
+    open_pcm_wav,
+    pcm_wav_shape,
     prepare_pcm_segmentation_source,
     quietest_pcm_boundary,
 )
@@ -91,6 +94,7 @@ from dialogue_pipeline.ui import (
     AudioPlayer,
     DialogueReviewApp,
     _candidate_selection_display,
+    _candidate_take_groups,
     _context_display_text,
     _initial_segment_window,
     _panned_sample_window,
@@ -134,12 +138,49 @@ def _write_tone(
         writer.writeframes(samples.tobytes())
 
 
+def _write_extensible_pcm_tone(path: Path) -> np.ndarray:
+    sample_rate = 96000
+    samples = np.array([-12000, -4000, 4000, 12000], dtype="<i2")
+    channels = 1
+    bits_per_sample = 16
+    block_alignment = channels * bits_per_sample // 8
+    byte_rate = sample_rate * block_alignment
+    pcm_subformat_guid = bytes.fromhex("0100000000001000800000aa00389b71")
+    fmt_chunk = (
+        struct.pack(
+            "<HHIIHHH",
+            0xFFFE,
+            channels,
+            sample_rate,
+            byte_rate,
+            block_alignment,
+            bits_per_sample,
+            22,
+        )
+        + struct.pack("<HI", bits_per_sample, 0x4)
+        + pcm_subformat_guid
+    )
+    data = samples.tobytes()
+    riff_size = 4 + 8 + len(fmt_chunk) + 8 + len(data)
+    path.write_bytes(
+        b"RIFF"
+        + struct.pack("<I", riff_size)
+        + b"WAVEfmt "
+        + struct.pack("<I", len(fmt_chunk))
+        + fmt_chunk
+        + b"data"
+        + struct.pack("<I", len(data))
+        + data
+    )
+    return samples
+
+
 def test_audio_player_uses_in_process_shared_wasapi_playback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     audio_path = tmp_path / "candidate.wav"
-    _write_tone(audio_path, duration_seconds=0.01)
+    _write_tone(audio_path, duration_seconds=0.05)
     settings_calls: list[dict[str, Any]] = []
     shared_settings = object()
     stream_calls: list[dict[str, Any]] = []
@@ -192,7 +233,7 @@ def test_audio_player_uses_in_process_shared_wasapi_playback(
     )
     player = AudioPlayer()
 
-    player.play(audio_path)
+    playback_id = player.play(audio_path)
 
     assert stream.started is True
     assert len(stream_calls) == 1
@@ -209,6 +250,23 @@ def test_audio_player_uses_in_process_shared_wasapi_playback(
     output = np.zeros((480, 1), dtype=np.float32)
     player._fill_output(output, 480, None, None)
     assert np.any(output != 0)
+    position, duration, playing, paused = player.status(playback_id)
+    assert position == pytest.approx(0.01)
+    assert duration == pytest.approx(0.05)
+    assert playing is True
+    assert paused is False
+
+    assert player.pause(playback_id) is True
+    assert player.pause(playback_id) is False
+    output.fill(1)
+    player._fill_output(output, 480, None, None)
+    assert np.all(output == 0)
+    assert player.status(playback_id)[0] == pytest.approx(0.01)
+
+    assert player.seek(playback_id, 0.02) is True
+    assert player.resume(playback_id) is True
+    player._fill_output(output, 480, None, None)
+    assert player.status(playback_id)[0] == pytest.approx(0.03)
 
     player.stop()
     output.fill(1)
@@ -251,6 +309,47 @@ def test_read_pcm_wav_supports_unsigned_8_bit_samples(tmp_path: Path) -> None:
     assert sample_rate == 48000
 
 
+def test_extensible_pcm_wav_is_supported_for_waveform_and_cutting(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "extensible.wav"
+    expected_samples = _write_extensible_pcm_tone(source)
+
+    assert pcm_wav_shape(source) == {
+        "sample_rate": 96000,
+        "channels": 1,
+        "bits_per_sample": 16,
+        "frame_count": 4,
+    }
+    with open_pcm_wav(source) as reader:
+        assert reader.getnchannels() == 1
+        assert reader.getsampwidth() == 2
+        assert reader.getframerate() == 96000
+        assert reader.getnframes() == 4
+        assert np.frombuffer(reader.readframes(4), dtype="<i2").tolist() == (
+            expected_samples.tolist()
+        )
+
+    waveform_samples, sample_rate = _read_pcm_wav(source)
+    assert sample_rate == 96000
+    assert waveform_samples.tolist() == expected_samples.tolist()
+
+    destination = tmp_path / "cut.wav"
+    metrics = cut_pcm_wav(
+        source,
+        destination,
+        start_sample=1,
+        end_sample=3,
+        fade_ms=0.0,
+    )
+    assert metrics["frame_count"] == 2
+    with wave.open(str(destination), "rb") as reader:
+        assert np.frombuffer(reader.readframes(2), dtype="<i2").tolist() == [
+            -4000,
+            4000,
+        ]
+
+
 def test_playback_samples_downmixes_and_resamples() -> None:
     stereo = np.array(
         [
@@ -266,6 +365,79 @@ def test_playback_samples_downmixes_and_resamples() -> None:
     assert result.shape == (4,)
     assert result[0] == pytest.approx(-1 / 65536)
     assert result[-1] == pytest.approx(0.5)
+
+
+def test_candidate_take_groups_use_base_lineage_and_custom_edit_source() -> None:
+    candidates = [
+        {
+            "segment_id": "session__t00001_0000000010_0000000090",
+            "session_id": "session",
+            "base_indices": [0],
+            "score": 88.0,
+        },
+        {
+            "segment_id": "session__s00002",
+            "session_id": "session",
+            "base_indices": [1],
+            "score": 91.0,
+        },
+        {
+            "segment_id": "session__s00001",
+            "session_id": "session",
+            "base_indices": [0],
+            "score": 88.0,
+        },
+        {
+            "segment_id": "session__ecustom",
+            "session_id": "session",
+            "base_indices": [0, 1],
+            "score": 88.0,
+            "manual_edit": True,
+            "edited_from_segment_id": "session__t00001_0000000010_0000000090",
+        },
+    ]
+
+    groups = _candidate_take_groups(candidates)
+
+    assert [[item["segment_id"] for item in group] for group in groups] == [
+        [
+            "session__t00001_0000000010_0000000090",
+            "session__s00001",
+            "session__ecustom",
+        ],
+        ["session__s00002"],
+    ]
+
+
+def test_candidate_take_groups_parse_legacy_base_segment_ids() -> None:
+    groups = _candidate_take_groups(
+        [
+            {"segment_id": "session_name__s00007", "score": 80.0},
+            {
+                "segment_id": "session_name__eold",
+                "score": 80.0,
+                "manual_edit": True,
+                "edited_from_segment_id": "session_name__s00007",
+            },
+        ]
+    )
+
+    assert len(groups) == 1
+
+
+def test_manual_only_normal_line_keeps_unmatched_take_pool_visible() -> None:
+    line = {
+        "type": "normal",
+        "status": "REVIEW",
+        "candidates": [
+            {
+                "segment_id": "session__ecustom",
+                "manual_edit": True,
+            }
+        ],
+    }
+
+    assert _uses_unmatched_candidates(line) is True
 
 
 def test_refresh_project_audio_recuts_existing_spans_without_reprocessing(

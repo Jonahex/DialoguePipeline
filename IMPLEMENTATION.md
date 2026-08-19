@@ -62,6 +62,10 @@ frame count. Sources not already in the export PCM shape are normalized once
 into `normalized_sources/`. This includes 32-bit floating-point post-processed
 WAV files.
 
+PCM input accepts both classic WAV headers and `WAVE_FORMAT_EXTENSIBLE` with
+the PCM subtype. Recent FFmpeg versions commonly use the extensible header for
+otherwise ordinary high-sample-rate PCM such as 96 kHz mono 16-bit audio.
+
 Segmentation and derived cuts are sample-accurate and use the normalized source.
 Configured fades are applied only when materializing the candidate WAV.
 
@@ -449,6 +453,12 @@ migration restores the historical 8-segment limits.
 
 `line_review.json` contains every script line, line type, status, narrowed
 candidates, selected and suggested segment IDs, and the audible unmatched pool.
+
+The review UI groups candidate variants by `(session_id, base_indices)`. The
+highest-scoring variant is the root of a collapsible take row (automatic
+variants win score ties), with other bounded or trimmed variants beneath it. A
+manual edit follows its `edited_from_segment_id` to retain the source take's
+group even when its new bounds overlap a different set of base segments.
 
 Selecting a candidate changes status to `MANUALLY_REVIEWED`. Unselecting changes
 it to `REVIEW`, or `MISSING` for a normal line without candidates. `RETAKE`

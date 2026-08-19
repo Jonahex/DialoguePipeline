@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import queue
+import re
 import sys
 import tempfile
 import threading
@@ -17,7 +18,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from .alignment import align_project
 from .alignment_settings import AlignmentSettings
-from .audio import cut_pcm_wav
+from .audio import cut_pcm_wav, open_pcm_wav
 from .cancellation import (
     ProcessingCancelled,
     cancellation_scope,
@@ -84,11 +85,16 @@ def _context_display_text(value: Any) -> str:
 
 
 def _uses_unmatched_candidates(line: dict[str, Any]) -> bool:
+    has_alignment_candidates = any(
+        not bool(candidate.get("manual_edit"))
+        for candidate in line.get("candidates") or []
+    )
     return bool(
         line["type"] == "nonverbal"
         or (
-            not line.get("candidates")
-            and line["status"] in {"MISSING", "MANUALLY_REVIEWED", "RETAKE"}
+            not has_alignment_candidates
+            and line["status"]
+            in {"REVIEW", "MISSING", "MANUALLY_REVIEWED", "RETAKE"}
         )
     )
 
@@ -148,8 +154,74 @@ def _candidate_selection_display(
     return "Select", ()
 
 
+def _candidate_take_key(
+    candidate: dict[str, Any],
+    candidates_by_id: dict[str, dict[str, Any]],
+) -> tuple[str, str, tuple[int, ...] | str]:
+    """Return the base-take identity, following a custom edit to its source."""
+
+    current = candidate
+    visited: set[str] = set()
+    while current.get("edited_from_segment_id"):
+        source_id = str(current["edited_from_segment_id"])
+        if source_id in visited:
+            break
+        visited.add(source_id)
+        source = candidates_by_id.get(source_id)
+        if source is None:
+            current = {"segment_id": source_id}
+            break
+        current = source
+
+    session_id = str(current.get("session_id") or "")
+    base_indices = tuple(int(value) for value in current.get("base_indices") or [])
+    if base_indices:
+        return "base", session_id, base_indices
+
+    segment_id = str(current.get("segment_id") or "")
+    match = re.fullmatch(r"(.+)__s(\d+)", segment_id)
+    if match:
+        return "base", session_id or match.group(1), (int(match.group(2)) - 1,)
+    return "segment", session_id, segment_id
+
+
+def _candidate_take_groups(
+    candidates: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Group variants cut from the same base segment sequence."""
+
+    candidates_by_id = {
+        str(candidate["segment_id"]): candidate for candidate in candidates
+    }
+    groups: dict[
+        tuple[str, str, tuple[int, ...] | str],
+        list[dict[str, Any]],
+    ] = {}
+    for candidate in candidates:
+        key = _candidate_take_key(candidate, candidates_by_id)
+        groups.setdefault(key, []).append(candidate)
+
+    grouped_candidates: list[list[dict[str, Any]]] = []
+    for group in groups.values():
+        original_order = {
+            str(candidate["segment_id"]): index
+            for index, candidate in enumerate(group)
+        }
+        grouped_candidates.append(
+            sorted(
+                group,
+                key=lambda candidate: (
+                    -float(candidate.get("score", 0.0)),
+                    bool(candidate.get("manual_edit")),
+                    original_order[str(candidate["segment_id"])],
+                ),
+            )
+        )
+    return grouped_candidates
+
+
 def _read_pcm_wav(path: Path) -> tuple[np.ndarray, int]:
-    with wave.open(str(path), "rb") as reader:
+    with open_pcm_wav(path) as reader:
         if reader.getcomptype() != "NONE":
             raise ValueError(f"Unsupported compressed WAV: {path}")
         channels = reader.getnchannels()
@@ -228,6 +300,9 @@ class AudioPlayer:
         self._lock = threading.Lock()
         self._samples = np.empty(0, dtype=np.float32)
         self._position = 0
+        self._playing = False
+        self._paused = False
+        self._playback_id = 0
         self._stream = sd.OutputStream(
             samplerate=self.sample_rate,
             channels=1,
@@ -246,6 +321,8 @@ class AudioPlayer:
     ) -> None:
         output.fill(0)
         with self._lock:
+            if not self._playing or self._paused:
+                return
             remaining = self._samples.size - self._position
             copy_count = min(frames, max(0, remaining))
             if copy_count:
@@ -254,20 +331,23 @@ class AudioPlayer:
                 ]
                 self._position += copy_count
             if self._position >= self._samples.size:
-                self._samples = np.empty(0, dtype=np.float32)
-                self._position = 0
+                self._position = self._samples.size
+                self._playing = False
 
     def stop(self) -> None:
         with self._lock:
             self._samples = np.empty(0, dtype=np.float32)
             self._position = 0
+            self._playing = False
+            self._paused = False
+            self._playback_id += 1
 
     def close(self) -> None:
         self.stop()
         self._stream.stop()
         self._stream.close()
 
-    def play(self, path: Path) -> None:
+    def play(self, path: Path, *, start_seconds: float = 0.0) -> int:
         if not path.is_file():
             raise FileNotFoundError(path)
         samples, sample_rate = _read_pcm_wav(path)
@@ -278,7 +358,64 @@ class AudioPlayer:
         )
         with self._lock:
             self._samples = playback
-            self._position = 0
+            self._position = max(
+                0,
+                min(
+                    int(round(float(start_seconds) * self.sample_rate)),
+                    playback.size,
+                ),
+            )
+            self._playing = self._position < playback.size
+            self._paused = False
+            self._playback_id += 1
+            return self._playback_id
+
+    def pause(self, playback_id: int) -> bool:
+        with self._lock:
+            if (
+                playback_id != self._playback_id
+                or not self._playing
+                or self._paused
+            ):
+                return False
+            self._paused = True
+            return True
+
+    def seek(self, playback_id: int, position_seconds: float) -> bool:
+        with self._lock:
+            if playback_id != self._playback_id or not self._samples.size:
+                return False
+            self._position = max(
+                0,
+                min(
+                    int(round(float(position_seconds) * self.sample_rate)),
+                    self._samples.size,
+                ),
+            )
+            self._playing = self._position < self._samples.size
+            return True
+
+    def resume(self, playback_id: int) -> bool:
+        with self._lock:
+            if (
+                playback_id != self._playback_id
+                or self._position >= self._samples.size
+            ):
+                return False
+            self._playing = True
+            self._paused = False
+            return True
+
+    def status(self, playback_id: int) -> tuple[float, float, bool, bool]:
+        with self._lock:
+            if playback_id != self._playback_id:
+                return 0.0, 0.0, False, False
+            return (
+                self._position / self.sample_rate,
+                self._samples.size / self.sample_rate,
+                self._playing,
+                self._paused,
+            )
 
 
 def _clock_time(sample: int, sample_rate: int) -> str:
@@ -466,6 +603,11 @@ class SegmentEditorDialog:
         self._pan_render_after_id: str | None = None
         self._playback_active = False
         self._playback_after_id: str | None = None
+        self._playback_id: int | None = None
+        self._playback_start_sample = start_sample
+        self._playhead_sample: int | None = None
+        self._drag_playhead = False
+        self._resume_after_playhead_drag = False
         self._temporary_dir = tempfile.TemporaryDirectory(
             prefix="dialogue-va-segment-editor-"
         )
@@ -485,7 +627,8 @@ class SegmentEditorDialog:
             outer,
             text=(
                 "Drag the green start line and red end line to set the copy. "
-                "Mouse wheel: zoom. Right-drag: move along the timeline."
+                "Drag the blue playback line to seek. Mouse wheel: zoom. "
+                "Right-drag: move along the timeline."
             ),
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(0, 8))
@@ -539,7 +682,7 @@ class SegmentEditorDialog:
         self.window.after_idle(self._redraw)
 
     def _read_waveform(self) -> tuple[np.ndarray, np.ndarray]:
-        with wave.open(str(self.audio_path), "rb") as reader:
+        with open_pcm_wav(self.audio_path) as reader:
             if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
                 raise ValueError(
                     "Waveform editing requires an uncompressed 16-bit PCM source."
@@ -758,6 +901,38 @@ class SegmentEditorDialog:
             f"End {_clock_time(self.end_sample, self.sample_rate)}",
             "ne",
         )
+        self._draw_playhead()
+
+    def _draw_playhead(self) -> None:
+        self.canvas.delete("playhead")
+        if (
+            self._playhead_sample is None
+            or not (self._playback_active or self._drag_playhead)
+            or not self.view_start <= self._playhead_sample <= self.view_end
+        ):
+            return
+        x = self._sample_to_x(self._playhead_sample)
+        height = max(1, self.canvas.winfo_height())
+        self.canvas.create_line(
+            x,
+            0,
+            x,
+            height,
+            fill="#2563eb",
+            width=3,
+            tags=("playhead",),
+        )
+        self.canvas.create_polygon(
+            x - 6,
+            0,
+            x + 6,
+            0,
+            x,
+            8,
+            fill="#2563eb",
+            outline="",
+            tags=("playhead",),
+        )
 
     def _draw_boundary(
         self,
@@ -786,11 +961,42 @@ class SegmentEditorDialog:
         name = min(distances, key=distances.get)
         return name if distances[name] <= 12.0 else None
 
+    def _playhead_is_near(self, x: float) -> bool:
+        return bool(
+            self._playback_active
+            and self._playhead_sample is not None
+            and abs(x - self._sample_to_x(self._playhead_sample)) <= 12.0
+        )
+
     def _drag_started(self, event: tk.Event[Any]) -> None:
+        if self._playhead_is_near(event.x):
+            self._drag_playhead = True
+            self._resume_after_playhead_drag = bool(
+                self._playback_id is not None
+                and self.player.pause(self._playback_id)
+            )
+            if self._resume_after_playhead_drag:
+                self._cancel_playback_timer()
+                self.play_button.configure(text="▶ Resume")
+            self.canvas.configure(cursor="sb_h_double_arrow")
+            return
         self._drag_boundary = self._nearest_boundary(event.x)
         self._drag_changed = False
 
     def _drag_moved(self, event: tk.Event[Any]) -> None:
+        if self._drag_playhead:
+            self._playhead_sample = max(
+                self.start_sample,
+                min(self._x_to_sample(event.x), self.end_sample),
+            )
+            if self._playback_id is not None:
+                self.player.seek(
+                    self._playback_id,
+                    (self._playhead_sample - self._playback_start_sample)
+                    / self.sample_rate,
+                )
+            self._draw_playhead()
+            return
         if self._drag_boundary is None:
             return
         sample = self._x_to_sample(event.x)
@@ -810,6 +1016,28 @@ class SegmentEditorDialog:
         self._redraw()
 
     def _drag_finished(self, _event: tk.Event[Any]) -> None:
+        if self._drag_playhead:
+            self._drag_playhead = False
+            if (
+                self._resume_after_playhead_drag
+                and self._playback_id is not None
+                and self.player.resume(self._playback_id)
+            ):
+                self.play_button.configure(text="⏸ Pause")
+                self._schedule_playback_update()
+            else:
+                position, duration, playing, paused = (
+                    self.player.status(self._playback_id)
+                    if self._playback_id is not None
+                    else (0.0, 0.0, False, False)
+                )
+                if paused and position < duration:
+                    self.play_button.configure(text="▶ Resume")
+                elif not playing:
+                    self._playback_finished()
+            self._resume_after_playhead_drag = False
+            self._canvas_motion(_event)
+            return
         changed = self._drag_changed
         self._drag_boundary = None
         self._drag_changed = False
@@ -822,7 +1050,7 @@ class SegmentEditorDialog:
             return
         self.canvas.configure(
             cursor="sb_h_double_arrow"
-            if self._nearest_boundary(event.x)
+            if self._playhead_is_near(event.x) or self._nearest_boundary(event.x)
             else ""
         )
 
@@ -836,11 +1064,38 @@ class SegmentEditorDialog:
         )
 
     def play(self) -> None:
+        if self._playback_active and self._playback_id is not None:
+            _position, _duration, playing, paused = self.player.status(
+                self._playback_id
+            )
+            if playing and not paused:
+                if self.player.pause(self._playback_id):
+                    self._cancel_playback_timer()
+                    self.play_button.configure(text="▶ Resume")
+                return
+            if paused:
+                if self.player.resume(self._playback_id):
+                    self.play_button.configure(text="⏸ Pause")
+                    self._schedule_playback_update()
+                else:
+                    self._playback_finished()
+                return
         self._play_current()
 
-    def _play_current(self) -> None:
+    def restart_playback(self) -> None:
+        self._play_current()
+
+    def _play_current(self, start_sample: int | None = None) -> None:
         self._cancel_playback_timer()
         self.player.stop()
+        self._playback_active = False
+        self._playback_id = None
+        self._playhead_sample = None
+        self._draw_playhead()
+        start_sample = self.start_sample if start_sample is None else max(
+            self.start_sample,
+            min(int(start_sample), self.end_sample),
+        )
         preview_path = Path(self._temporary_dir.name) / "preview.wav"
         try:
             cut_pcm_wav(
@@ -850,7 +1105,10 @@ class SegmentEditorDialog:
                 end_sample=self.end_sample,
                 fade_ms=0.0,
             )
-            self.player.play(preview_path)
+            self._playback_id = self.player.play(
+                preview_path,
+                start_seconds=(start_sample - self.start_sample) / self.sample_rate,
+            )
         except Exception as error:
             self._playback_active = False
             messagebox.showerror(
@@ -860,21 +1118,46 @@ class SegmentEditorDialog:
             )
             return
         self._playback_active = True
-        duration_ms = int(
-            round(
-                1000.0
-                * (self.end_sample - self.start_sample)
-                / self.sample_rate
-            )
-        )
+        self._playback_start_sample = self.start_sample
+        self._playhead_sample = start_sample
+        self.play_button.configure(text="⏸ Pause")
+        self._draw_playhead()
+        self._schedule_playback_update()
+
+    def _schedule_playback_update(self) -> None:
+        self._cancel_playback_timer()
         self._playback_after_id = self.window.after(
-            max(100, duration_ms + 100),
-            self._playback_finished,
+            33,
+            self._update_playback_position,
         )
 
-    def _playback_finished(self) -> None:
+    def _update_playback_position(self) -> None:
         self._playback_after_id = None
+        if not self._playback_active or self._playback_id is None:
+            return
+        position, _duration, playing, paused = self.player.status(self._playback_id)
+        if not playing and not paused:
+            self._playback_finished()
+            return
+        if not self._drag_playhead:
+            self._playhead_sample = min(
+                self.end_sample,
+                self._playback_start_sample
+                + int(round(position * self.sample_rate)),
+            )
+            self._draw_playhead()
+        if not paused:
+            self._schedule_playback_update()
+
+    def _playback_finished(self) -> None:
+        self._cancel_playback_timer()
         self._playback_active = False
+        self._playback_id = None
+        self._playhead_sample = None
+        self._drag_playhead = False
+        self._resume_after_playhead_drag = False
+        self.play_button.configure(text="▶ Play")
+        self._draw_playhead()
 
     def _cancel_playback_timer(self) -> None:
         if self._playback_after_id is not None:
@@ -902,6 +1185,10 @@ class SegmentEditorDialog:
         self._cancel_pan_refresh()
         self._cancel_playback_timer()
         self._playback_active = False
+        self._playback_id = None
+        self._playhead_sample = None
+        self._drag_playhead = False
+        self._resume_after_playhead_drag = False
         self.player.stop()
         with contextlib.suppress(tk.TclError):
             self.window.grab_release()
@@ -937,6 +1224,13 @@ class CandidateWaveformView(SegmentEditorDialog):
         self._pan_render_after_id: str | None = None
         self._playback_active = False
         self._playback_after_id: str | None = None
+        self._playback_id: int | None = None
+        self._playback_start_sample = 0
+        self._playhead_sample: int | None = None
+        self._drag_playhead = False
+        self._resume_after_playhead_drag = False
+        self._drag_boundary: str | None = None
+        self._drag_changed = False
         self._temporary_dir = tempfile.TemporaryDirectory(
             prefix="dialogue-va-candidate-preview-"
         )
@@ -953,7 +1247,10 @@ class CandidateWaveformView(SegmentEditorDialog):
         self.window = self.frame
         ttk.Label(
             self.frame,
-            text="Mouse wheel: zoom. Right-drag: move along the timeline.",
+            text=(
+                "Drag the blue playback line to seek. Mouse wheel: zoom. "
+                "Right-drag: move along the timeline."
+            ),
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(0, 6))
         self.canvas = tk.Canvas(
@@ -965,6 +1262,9 @@ class CandidateWaveformView(SegmentEditorDialog):
         )
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", self._canvas_resized)
+        self.canvas.bind("<Button-1>", self._drag_started)
+        self.canvas.bind("<B1-Motion>", self._drag_moved)
+        self.canvas.bind("<ButtonRelease-1>", self._drag_finished)
         self.canvas.bind("<Button-3>", self._pan_started)
         self.canvas.bind("<B3-Motion>", self._pan_moved)
         self.canvas.bind("<ButtonRelease-3>", self._pan_finished)
@@ -1001,6 +1301,11 @@ class CandidateWaveformView(SegmentEditorDialog):
     ) -> None:
         self._cancel_pan_refresh()
         self._cancel_playback_timer()
+        self._playback_active = False
+        self._playback_id = None
+        self._playhead_sample = None
+        self._drag_playhead = False
+        self._resume_after_playhead_drag = False
         self.player.stop()
         if not 0 <= start_sample < end_sample <= source_frames:
             raise ValueError("The candidate has invalid source sample boundaries.")
@@ -1022,6 +1327,7 @@ class CandidateWaveformView(SegmentEditorDialog):
         self._envelope_min, self._envelope_max = self._read_waveform()
         self._loaded = True
         self.play_button.configure(state="normal")
+        self.play_button.configure(text="▶ Play")
         self._update_bounds_text()
         self._redraw()
 
@@ -1031,10 +1337,15 @@ class CandidateWaveformView(SegmentEditorDialog):
         self._cancel_pan_refresh()
         self._cancel_playback_timer()
         self._playback_active = False
+        self._playback_id = None
+        self._playhead_sample = None
+        self._drag_playhead = False
+        self._resume_after_playhead_drag = False
         self.player.stop()
         self._loaded = False
         self._pan_start_x = None
         self.play_button.configure(state="disabled")
+        self.play_button.configure(text="▶ Play")
         self.bounds_text.set(message)
         self._redraw()
 
@@ -1062,8 +1373,21 @@ class CandidateWaveformView(SegmentEditorDialog):
             return "break"
         return super()._pan_started(event)
 
-    def _canvas_motion(self, _event: tk.Event[Any]) -> None:
-        self.canvas.configure(cursor="fleur" if self._pan_start_x is not None else "")
+    def _nearest_boundary(self, _x: float) -> str | None:
+        return None
+
+    def _canvas_motion(self, event: tk.Event[Any]) -> None:
+        self.canvas.configure(
+            cursor=(
+                "fleur"
+                if self._pan_start_x is not None
+                else (
+                    "sb_h_double_arrow"
+                    if self._playhead_is_near(event.x)
+                    else ""
+                )
+            )
+        )
 
     def play(self) -> None:
         if self._loaded:
@@ -1075,6 +1399,10 @@ class CandidateWaveformView(SegmentEditorDialog):
         self._cancel_pan_refresh()
         self._cancel_playback_timer()
         self._playback_active = False
+        self._playback_id = None
+        self._playhead_sample = None
+        self._drag_playhead = False
+        self._resume_after_playhead_drag = False
         self.player.stop()
         self._disposed = True
         with contextlib.suppress(OSError):
@@ -1594,6 +1922,7 @@ class DialogueReviewApp:
         self.selected_candidate_id: str | None = None
         self._candidate_line_id: str | None = None
         self.candidate_waveform: CandidateWaveformView | None = None
+        self._open_candidate_roots: set[str] = set()
 
         self._configure_styles()
         self.show_start()
@@ -2195,7 +2524,7 @@ class DialogueReviewApp:
                 column,
                 width=width,
                 minwidth=40 if column == "audio" else 70,
-                stretch=column in {"line", "target"},
+                stretch=False,
                 anchor=(
                     "center"
                     if column in {"index", "type", "status", "score", "audio"}
@@ -2318,8 +2647,16 @@ class DialogueReviewApp:
         self.candidate_tree = ttk.Treeview(
             right,
             columns=candidate_columns,
-            show="headings",
+            show="tree headings",
             selectmode="browse",
+        )
+        self.candidate_tree.heading("#0", text="Take")
+        self.candidate_tree.column(
+            "#0",
+            width=145,
+            minwidth=90,
+            stretch=False,
+            anchor="w",
         )
         candidate_headings = {
             "segment": ("Segment", 210, "w"),
@@ -2337,7 +2674,7 @@ class DialogueReviewApp:
                 column,
                 width=width,
                 minwidth=40,
-                stretch=column == "transcript",
+                stretch=False,
                 anchor=anchor,
             )
         self.candidate_tree.tag_configure("selected", background="#bbf7d0")
@@ -2553,6 +2890,16 @@ class DialogueReviewApp:
     def render_candidates(self) -> None:
         assert self.review_data is not None
         children = self.candidate_tree.get_children()
+        self._open_candidate_roots.update(
+            str(item_id)
+            for item_id in children
+            if bool(self.candidate_tree.item(item_id, "open"))
+        )
+        self._open_candidate_roots.difference_update(
+            str(item_id)
+            for item_id in children
+            if not bool(self.candidate_tree.item(item_id, "open"))
+        )
         if children:
             self.candidate_tree.delete(*children)
         line = self._selected_line()
@@ -2637,7 +2984,14 @@ class DialogueReviewApp:
             return
 
         selected_line_ids = _selected_line_ids_by_segment(self.review_data)
-        for candidate in candidates:
+
+        def insert_candidate(
+            candidate: dict[str, Any],
+            *,
+            parent: str,
+            take_label: str,
+            is_open: bool = False,
+        ) -> None:
             is_manual_edit = bool(candidate.get("manual_edit"))
             has_custom_asr = (
                 str(candidate.get("transcript_source") or "")
@@ -2661,9 +3015,11 @@ class DialogueReviewApp:
                 selected_line_ids=selected_line_ids,
             )
             self.candidate_tree.insert(
-                "",
+                parent,
                 "end",
                 iid=segment_id,
+                text=take_label,
+                open=is_open,
                 values=(
                     segment_id,
                     transcript,
@@ -2680,6 +3036,32 @@ class DialogueReviewApp:
                 ),
                 tags=tags,
             )
+
+        take_groups = _candidate_take_groups(candidates)
+        for take_number, group in enumerate(take_groups, start=1):
+            root_candidate = group[0]
+            root_id = str(root_candidate["segment_id"])
+            root_label = f"Take {take_number}"
+            if len(group) > 1:
+                root_label += f" ({len(group)} versions)"
+            elif root_candidate.get("manual_edit"):
+                root_label += " · Custom"
+            insert_candidate(
+                root_candidate,
+                parent="",
+                take_label=root_label,
+                is_open=root_id in self._open_candidate_roots,
+            )
+            for alternative_number, candidate in enumerate(group[1:], start=1):
+                insert_candidate(
+                    candidate,
+                    parent=root_id,
+                    take_label=(
+                        "Custom edit"
+                        if candidate.get("manual_edit")
+                        else f"Alternative {alternative_number}"
+                    ),
+                )
 
         candidate_ids = [str(candidate["segment_id"]) for candidate in candidates]
         preferred_id = self.selected_candidate_id
@@ -2770,7 +3152,7 @@ class DialogueReviewApp:
         line: dict[str, Any],
     ) -> list[dict[str, Any]]:
         assert self.review_data is not None
-        if line["type"] == "nonverbal":
+        if line["type"] == "nonverbal" or _uses_unmatched_candidates(line):
             combined = [
                 *line["candidates"],
                 *self.review_data["unmatched_segments"],
@@ -2779,8 +3161,6 @@ class DialogueReviewApp:
             for candidate in combined:
                 unique.setdefault(str(candidate["segment_id"]), candidate)
             return list(unique.values())
-        if _uses_unmatched_candidates(line):
-            return list(self.review_data["unmatched_segments"])
         return list(line["candidates"])
 
     def copy_and_edit_candidate(self, segment_id: str) -> None:
@@ -2907,6 +3287,19 @@ class DialogueReviewApp:
     def play_segment(self, segment_id: str) -> None:
         assert self.project_dir is not None
         assert self.review_data is not None
+        if (
+            self.candidate_waveform is not None
+            and self.candidate_tree.exists(segment_id)
+        ):
+            if self.selected_candidate_id != segment_id:
+                self.selected_candidate_id = segment_id
+                self.candidate_tree.selection_set(segment_id)
+                self.candidate_tree.focus(segment_id)
+                self.candidate_tree.see(segment_id)
+                self._show_candidate_waveform(segment_id)
+            if self.candidate_waveform._loaded:
+                self.candidate_waveform.restart_playback()
+                return
         try:
             path = segment_file_for_id(
                 project_dir=self.project_dir,

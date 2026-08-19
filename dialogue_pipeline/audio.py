@@ -5,6 +5,7 @@ import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import wave
@@ -20,6 +21,57 @@ SILENCE_START_RE = re.compile(r"silence_start:\s*([0-9.]+)")
 SILENCE_END_RE = re.compile(
     r"silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)"
 )
+WAVE_FORMAT_PCM = 0x0001
+WAVE_FORMAT_EXTENSIBLE = 0xFFFE
+PCM_SUBFORMAT_GUID = bytes.fromhex("0100000000001000800000aa00389b71")
+
+
+class PcmWaveReader(wave.Wave_read):
+    """Read ordinary PCM and WAVE_FORMAT_EXTENSIBLE PCM on Python 3.11."""
+
+    def _read_fmt_chunk(self, chunk: Any) -> None:
+        try:
+            (
+                format_tag,
+                self._nchannels,
+                self._framerate,
+                _average_bytes_per_second,
+                _block_alignment,
+                bits_per_sample,
+            ) = struct.unpack("<HHIIHH", chunk.read(16))
+        except struct.error:
+            raise EOFError from None
+
+        if format_tag == WAVE_FORMAT_EXTENSIBLE:
+            try:
+                extension_size = struct.unpack("<H", chunk.read(2))[0]
+                valid_bits, _channel_mask = struct.unpack("<HI", chunk.read(6))
+                subformat_guid = chunk.read(16)
+            except struct.error:
+                raise EOFError from None
+            if extension_size < 22 or len(subformat_guid) != 16:
+                raise wave.Error("invalid WAVE_FORMAT_EXTENSIBLE header")
+            if subformat_guid != PCM_SUBFORMAT_GUID:
+                raise wave.Error("WAVE_FORMAT_EXTENSIBLE subtype is not PCM")
+            if valid_bits and valid_bits > bits_per_sample:
+                raise wave.Error("invalid valid-bits value in extensible WAV")
+        elif format_tag != WAVE_FORMAT_PCM:
+            raise wave.Error(f"unknown format: {format_tag!r}")
+
+        self._sampwidth = (bits_per_sample + 7) // 8
+        if not self._sampwidth:
+            raise wave.Error("bad sample width")
+        if not self._nchannels:
+            raise wave.Error("bad # of channels")
+        self._framesize = self._nchannels * self._sampwidth
+        self._comptype = "NONE"
+        self._compname = "not compressed"
+
+
+def open_pcm_wav(path: Path) -> PcmWaveReader:
+    """Open a PCM WAV, including the extensible PCM headers FFmpeg emits."""
+
+    return PcmWaveReader(str(path))
 
 
 def require_executable(name: str) -> str:
@@ -78,7 +130,7 @@ def probe_audio(path: Path, *, include_hash: bool = True) -> dict[str, Any]:
 
 def pcm_wav_shape(path: Path) -> dict[str, int] | None:
     try:
-        with wave.open(str(path), "rb") as reader:
+        with open_pcm_wav(path) as reader:
             params = reader.getparams()
             if params.comptype != "NONE":
                 return None
@@ -112,7 +164,7 @@ def quietest_pcm_boundary(
     fallback = None if require_quiet else int(proposed_sample)
 
     try:
-        with wave.open(str(path), "rb") as reader:
+        with open_pcm_wav(path) as reader:
             if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
                 return fallback
             sample_rate = int(reader.getframerate())
@@ -185,7 +237,7 @@ def first_quiet_pcm_boundary(
     """Return the first sufficiently quiet PCM window after a proposed cut."""
 
     try:
-        with wave.open(str(path), "rb") as reader:
+        with open_pcm_wav(path) as reader:
             if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
                 return None
             sample_rate = int(reader.getframerate())
@@ -234,7 +286,7 @@ def pcm_voice_regions(
     """Return absolute PCM regions classified as speech by Silero VAD."""
 
     try:
-        with wave.open(str(path), "rb") as reader:
+        with open_pcm_wav(path) as reader:
             if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
                 return []
             sample_rate = int(reader.getframerate())
@@ -339,7 +391,7 @@ def pcm_leading_sibilant_start(
     """
 
     try:
-        with wave.open(str(path), "rb") as reader:
+        with open_pcm_wav(path) as reader:
             if reader.getsampwidth() != 2 or reader.getcomptype() != "NONE":
                 return None
             sample_rate = int(reader.getframerate())
@@ -617,7 +669,7 @@ def cut_pcm_wav(
     fade_ms: float = 5.0,
 ) -> dict[str, Any]:
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(source), "rb") as reader:
+    with open_pcm_wav(source) as reader:
         params = reader.getparams()
         if params.comptype != "NONE":
             raise ValueError(f"Compressed WAV is not supported for exact cutting: {source}")

@@ -268,9 +268,13 @@ ASR timestamp midpoints. The untrimmed candidate remains available.
 Repeated takes are blocked from `AUTO_OK` by token precision, detection of
 voiced but untranscribed merged pieces (`MERGED_UNTRANSCRIBED_AUDIO`), and
 `reliable_min_duration_plausibility` (`POSSIBLE_REPEATED_TAKES`). Repetition can
-also supply a split point when Whisper stretches a boundary word across a pause;
-the split is accepted only when ordered Silero VAD regions provide a matching
-acoustic gap, and both resulting spans are then transcribed independently.
+also supply split points for every oversized base segment, independently of the
+line chosen by whole-segment alignment. The ordered repetition search supports
+single-word lines and a small ASR token-count difference, such as a scripted
+`Mud hopper` decoded as `Mudhopper`. When Whisper stretches a boundary word
+across a pause, the split is accepted only when ordered Silero VAD regions
+provide matching acoustic gaps. Recovered takes are prioritized within the
+bounded per-segment candidate budget and independently exact-WAV transcribed.
 If Whisper collapses several audible deliveries into one word sequence, an
 additional fallback proposes take-sized windows between at least two substantial
 strict-VAD gaps. It runs only on implausibly long spans, keeps a bounded number
@@ -463,14 +467,15 @@ migration restores the historical 8-segment limits.
 `line_review.json` contains every script line, line type, status, narrowed
 candidates, selected and suggested segment IDs, and the audible unmatched pool.
 
-The review UI first combines variants with the same `(session_id, base_indices)`
-and then clusters overlapping spans around non-overlapping acoustic roots. Root
-priority rewards silence on both outside edges and penalizes large gaps inside
-the span, so shifted cross-take and partial candidates remain collapsed beneath
-the cleanest take. Alternatives attach to the root with their greatest base-
-segment overlap. A manual edit follows its `edited_from_segment_id` to retain
-the source take's group even when its new bounds overlap a different set of
-base segments.
+The review UI uses each candidate's actual time bounds when available and then
+clusters substantially overlapping spans around non-overlapping acoustic roots.
+Repeated intra-segment takes receive root precedence, so adjacent recovered
+takes inside one base segment remain separate while shifted alternatives for the
+same take stay collapsed. Root priority rewards silence on both outside edges
+and penalizes large gaps inside the span. Alternatives attach to the root with
+their greatest acoustic overlap. A manual edit follows its
+`edited_from_segment_id` to retain the source take's group even when its new
+bounds overlap a different take or set of base segments.
 
 Selecting a candidate changes status to `MANUALLY_REVIEWED`. Unselecting changes
 it to `REVIEW`, or `MISSING` for a normal line without candidates. `RETAKE`

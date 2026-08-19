@@ -2881,25 +2881,46 @@ def _repeated_line_boundary_offsets(
     """Find adjacent complete repetitions even when Whisper spans the pause."""
 
     expected_word_count = evaluator.line_features[line_index].word_count
-    if expected_word_count < 2 or len(words) < expected_word_count * 2:
+    if expected_word_count < 1 or len(words) < 2:
         return {}
+    # Spoken compounds are not stable ASR token boundaries (for example,
+    # "Mud hopper" is commonly decoded as one "Mudhopper" token). Search a
+    # narrow range of ordered word-window sizes instead of requiring the
+    # observed and scripted token counts to be identical.
+    minimum_window_words = max(1, expected_word_count - 2)
+    maximum_window_words = expected_word_count + 2
     matching_windows = []
-    for first_word in range(len(words) - expected_word_count + 1):
-        last_word = first_word + expected_word_count - 1
-        window_text = " ".join(
-            str(word.get("word") or "").strip()
-            for word in words[first_word : last_word + 1]
-        )
-        evaluation = evaluator.evaluate(line_index, window_text)
-        if (
-            evaluation.match_score >= minimum_match
-            and float(evaluation.fidelity["token_coverage"]) >= 0.95
-            and float(evaluation.fidelity["token_precision"]) >= 0.95
-            and int(evaluation.fidelity["extra_word_count"]) == 0
-            and int(evaluation.sentence["missing_clause_count"]) == 0
-            and bool(evaluation.sentence["clauses_in_order"])
+    for first_word in range(len(words)):
+        best_window = None
+        for window_word_count in range(
+            minimum_window_words,
+            maximum_window_words + 1,
         ):
-            matching_windows.append((first_word, last_word))
+            last_word = first_word + window_word_count - 1
+            if last_word >= len(words):
+                break
+            window_text = " ".join(
+                str(word.get("word") or "").strip()
+                for word in words[first_word : last_word + 1]
+            )
+            evaluation = evaluator.evaluate(line_index, window_text)
+            if (
+                evaluation.match_score < minimum_match
+                or float(evaluation.fidelity["ordered_similarity"])
+                < minimum_match
+                or int(evaluation.sentence["missing_clause_count"]) > 0
+                or not bool(evaluation.sentence["clauses_in_order"])
+            ):
+                continue
+            quality = (
+                float(evaluation.match_score),
+                -abs(window_word_count - expected_word_count),
+                -window_word_count,
+            )
+            if best_window is None or quality > best_window[0]:
+                best_window = (quality, first_word, last_word)
+        if best_window is not None:
+            matching_windows.append((best_window[1], best_window[2]))
     if len(matching_windows) < 2:
         return {}
 
@@ -2909,16 +2930,15 @@ def _repeated_line_boundary_offsets(
     )
     typical_duration = durations[len(durations) // 2]
     boundaries = {}
-    for left_window, right_window in zip(
-        matching_windows,
-        matching_windows[1:],
-    ):
-        left_first, left_last = left_window
+    windows_by_start = {
+        first_word: (first_word, last_word)
+        for first_word, last_word in matching_windows
+    }
+    for _, left_last in matching_windows:
+        right_window = windows_by_start.get(left_last + 1)
+        if right_window is None:
+            continue
         right_first, _ = right_window
-        if right_first != left_last + 1:
-            continue
-        if left_first + expected_word_count - 1 != left_last:
-            continue
         left_end = float(words[left_last]["end"])
         right_start = float(words[right_first]["start"])
         right_end = float(words[right_first]["end"])
@@ -2932,6 +2952,42 @@ def _repeated_line_boundary_offsets(
             boundary = (left_end + right_start) / 2.0
         boundaries[left_last] = boundary
     return boundaries
+
+
+def _may_contain_repeated_line(
+    expected: TextFeatures,
+    observed: TextFeatures,
+) -> bool:
+    """Cheaply prefilter the session-wide repeated-line search."""
+
+    expected_tokens = expected.tokens
+    observed_tokens = observed.tokens
+    expected_count = len(expected_tokens)
+    if expected_count < 1 or len(observed_tokens) < 2:
+        return False
+
+    occurrence_count = 0
+    token_index = 0
+    while token_index + expected_count <= len(observed_tokens):
+        if (
+            observed_tokens[token_index : token_index + expected_count]
+            == expected_tokens
+        ):
+            occurrence_count += 1
+            if occurrence_count >= 2:
+                return True
+            token_index += expected_count
+        else:
+            token_index += 1
+
+    # Joining spaces catches stable ASR compound changes without invoking the
+    # much more expensive fuzzy evaluator for every line in a broad session.
+    expected_compact = "".join(expected_tokens)
+    observed_compact = "".join(observed_tokens)
+    return bool(
+        len(expected_compact) >= 5
+        and observed_compact.count(expected_compact) >= 2
+    )
 
 
 def _segment_voice_regions_for_trimming(
@@ -3275,15 +3331,26 @@ def _intra_segment_trim_actions(
 
     proposals: list[dict[str, Any]] = []
     seen: set[tuple[int, int, int, int]] = set()
-    source_actions_by_base = [
-        (source_action, base_index)
-        for source_action in actions
+    repetition_search_lines = [
+        (
+            line_index,
+            evaluator.line_features[line_index],
+        )
+        for line_index, line in enumerate(lines)
+        if not is_vocalization_script(line["line"])
+    ]
+    source_action_by_base: dict[int, dict[str, Any]] = {}
+    for source_action in actions:
         for base_index in range(
             int(source_action["start_index"]),
             int(source_action["start_index"])
             + int(source_action["count"]),
-        )
-        if 0 <= base_index < len(base_segments)
+        ):
+            if 0 <= base_index < len(base_segments):
+                source_action_by_base.setdefault(base_index, source_action)
+    source_actions_by_base = [
+        (source_action_by_base.get(base_index), base_index)
+        for base_index in range(len(base_segments))
     ]
     for source_action, base_index in source_actions_by_base:
         check_processing_cancelled()
@@ -3299,6 +3366,9 @@ def _intra_segment_trim_actions(
         ]
         if len(words) < 2:
             continue
+        observed_words = evaluator.observed_features(
+            " ".join(str(word["word"]).strip() for word in words)
+        )
 
         gap_boundary_offsets: dict[int, float] = {}
         for word_index, (left, right) in enumerate(
@@ -3353,13 +3423,35 @@ def _intra_segment_trim_actions(
                 boundary = snapped_sample / sample_rate
             gap_boundary_offsets[word_index] = boundary
 
-        line_indexes = [int(source_action["line_index"])]
-        line_indexes.extend(
-            int(match["line_index"])
-            for match in source_action.get("top_matches") or []
-            if float(match.get("match_score", 0.0))
-            >= float(settings.get("candidate_min_score", 45.0))
-        )
+        line_indexes = []
+        if source_action is not None:
+            line_indexes.append(int(source_action["line_index"]))
+            line_indexes.extend(
+                int(match["line_index"])
+                for match in source_action.get("top_matches") or []
+                if float(match.get("match_score", 0.0))
+                >= float(settings.get("candidate_min_score", 45.0))
+            )
+        repeated_boundaries_by_line: dict[int, dict[int, float]] = {}
+        for repeated_line_index, repeated_line_features in repetition_search_lines:
+            expected_word_count = repeated_line_features.word_count
+            if len(words) < max(2, 2 * max(1, expected_word_count - 2)):
+                continue
+            if not _may_contain_repeated_line(
+                repeated_line_features.text,
+                observed_words,
+            ):
+                continue
+            repeated = _repeated_line_boundary_offsets(
+                line_index=repeated_line_index,
+                words=words,
+                evaluator=evaluator,
+                minimum_match=minimum_match,
+            )
+            if repeated:
+                repeated_boundaries_by_line[repeated_line_index] = repeated
+                line_indexes.append(repeated_line_index)
+        action_hint = source_action or {}
         for line_index in dict.fromkeys(line_indexes):
             line = lines[line_index]
             if is_vocalization_script(line["line"]):
@@ -3368,12 +3460,14 @@ def _intra_segment_trim_actions(
                 str(line["line"])
             )
             boundary_offsets = dict(gap_boundary_offsets)
-            repeated_boundaries = _repeated_line_boundary_offsets(
-                line_index=line_index,
-                words=words,
-                evaluator=evaluator,
-                minimum_match=minimum_match,
-            )
+            repeated_boundaries = repeated_boundaries_by_line.get(line_index)
+            if repeated_boundaries is None:
+                repeated_boundaries = _repeated_line_boundary_offsets(
+                    line_index=line_index,
+                    words=words,
+                    evaluator=evaluator,
+                    minimum_match=minimum_match,
+                )
             if repeated_boundaries and project_dir is not None:
                 repeated_boundaries = _snap_repeated_boundaries_to_voice_gaps(
                     repeated_boundaries,
@@ -3386,7 +3480,7 @@ def _intra_segment_trim_actions(
             boundary_offsets.update(repeated_boundaries)
             if project_dir is not None:
                 for acoustic in _acoustic_take_trim_proposals(
-                    source_action=source_action,
+                    source_action=action_hint,
                     segment=segment,
                     base_index=base_index,
                     line_index=line_index,
@@ -3461,9 +3555,30 @@ def _intra_segment_trim_actions(
                 trimmed = evaluator.evaluate(line_index, window_text)
                 fidelity = trimmed.fidelity
                 sentence = trimmed.sentence
+                is_repeated_window = bool(
+                    (
+                        first_word > 0
+                        and first_word - 1 in repeated_boundaries
+                    )
+                    or (
+                        last_word < len(words) - 1
+                        and last_word in repeated_boundaries
+                    )
+                )
+                # ASR commonly joins or splits compounds differently from the
+                # script ("Mud hopper" -> "Mudhopper"). An otherwise near-
+                # exact ordered repeated window is safe to propose with one
+                # unmatched token; exact-span ASR still verifies it later.
+                required_coverage = minimum_coverage
+                if (
+                    is_repeated_window
+                    and float(fidelity["ordered_similarity"]) >= 95.0
+                    and float(fidelity["token_precision"]) >= 0.95
+                ):
+                    required_coverage = min(required_coverage, 0.75)
                 if (
                     trimmed.match_score < minimum_match
-                    or float(fidelity["token_coverage"]) < minimum_coverage
+                    or float(fidelity["token_coverage"]) < required_coverage
                     or float(fidelity["token_precision"]) < minimum_precision
                     or float(fidelity["ordered_similarity"]) < minimum_ordered
                     or int(sentence["missing_clause_count"]) > 0
@@ -3532,7 +3647,7 @@ def _intra_segment_trim_actions(
                         ),
                         "duration_plausibility": duration_score,
                         "order_hint": float(
-                            source_action.get("order_hint", 0.0)
+                            action_hint.get("order_hint", 0.0)
                         ),
                         "top_matches": [
                             {
@@ -3541,7 +3656,7 @@ def _intra_segment_trim_actions(
                                 "ranking_score": trimmed.match_score,
                                 "duration_plausibility": duration_score,
                                 "order_hint": float(
-                                    source_action.get("order_hint", 0.0)
+                                    action_hint.get("order_hint", 0.0)
                                 ),
                                 "confidence_margin": (
                                     trimmed.match_score - other_score
@@ -3553,16 +3668,7 @@ def _intra_segment_trim_actions(
                         "trim_word_start": first_word,
                         "trim_word_end": last_word,
                         "intra_segment_trim": True,
-                        "repeated_take_trim": bool(
-                            (
-                                first_word > 0
-                                and first_word - 1 in repeated_boundaries
-                            )
-                            or (
-                                last_word < len(words) - 1
-                                and last_word in repeated_boundaries
-                            )
-                        ),
+                        "repeated_take_trim": is_repeated_window,
                         "is_primary_match": True,
                         "segment_match_rank": 1,
                     }
@@ -3570,6 +3676,7 @@ def _intra_segment_trim_actions(
 
     proposals.sort(
         key=lambda action: (
+            bool(action.get("repeated_take_trim")),
             float(action["match_score"]),
             float(
                 evaluator.evaluate(
@@ -3596,7 +3703,10 @@ def _intra_segment_trim_actions(
                 maximum_per_line,
                 int(settings.get("acoustic_take_trim_max_actions_per_line", 8)),
             )
-            if action.get("acoustic_take_trim")
+            if (
+                action.get("acoustic_take_trim")
+                or action.get("repeated_take_trim")
+            )
             else maximum_per_line
         )
         if (

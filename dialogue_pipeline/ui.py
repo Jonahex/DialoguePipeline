@@ -154,11 +154,11 @@ def _candidate_selection_display(
     return "Select", ()
 
 
-def _candidate_take_key(
+def _candidate_take_source(
     candidate: dict[str, Any],
     candidates_by_id: dict[str, dict[str, Any]],
-) -> tuple[str, str, tuple[int, ...] | str]:
-    """Return the base-take identity, following a custom edit to its source."""
+) -> dict[str, Any]:
+    """Follow a custom edit chain to the candidate from which it was made."""
 
     current = candidate
     visited: set[str] = set()
@@ -172,8 +172,28 @@ def _candidate_take_key(
             current = {"segment_id": source_id}
             break
         current = source
+    return current
+
+
+def _candidate_take_key(
+    candidate: dict[str, Any],
+    candidates_by_id: dict[str, dict[str, Any]],
+    *,
+    use_acoustic_span: bool = False,
+) -> tuple[str, str, tuple[int, ...] | str]:
+    """Return the take identity, following a custom edit to its source."""
+
+    current = _candidate_take_source(candidate, candidates_by_id)
 
     session_id = str(current.get("session_id") or "")
+    if use_acoustic_span:
+        start_seconds = current.get("start_seconds")
+        end_seconds = current.get("end_seconds")
+        if start_seconds is not None and end_seconds is not None:
+            start_micros = round(float(start_seconds) * 1_000_000)
+            end_micros = round(float(end_seconds) * 1_000_000)
+            if end_micros > start_micros:
+                return "time", session_id, (start_micros, end_micros)
     base_indices = tuple(int(value) for value in current.get("base_indices") or [])
     if base_indices:
         return "base", session_id, base_indices
@@ -255,11 +275,15 @@ def _candidate_acoustic_isolation(
     return leading_gap + trailing_gap - 2.0 * max(internal_gaps, default=0.0)
 
 
-def _base_interval_overlap(
-    left: tuple[int, int],
-    right: tuple[int, int],
-) -> int:
-    return max(0, min(left[1], right[1]) - max(left[0], right[0]) + 1)
+def _time_interval_overlap(
+    left: tuple[float, float],
+    right: tuple[float, float],
+) -> float:
+    overlap = max(0.0, min(left[1], right[1]) - max(left[0], right[0]))
+    shorter = min(left[1] - left[0], right[1] - right[0])
+    if shorter <= 0.0 or overlap / shorter < 0.20:
+        return 0.0
+    return overlap
 
 
 def _candidate_take_groups(
@@ -280,7 +304,11 @@ def _candidate_take_groups(
         list[dict[str, Any]],
     ] = {}
     for candidate in candidates:
-        key = _candidate_take_key(candidate, candidates_by_id)
+        key = _candidate_take_key(
+            candidate,
+            candidates_by_id,
+            use_acoustic_span=bool(base_segments_by_session),
+        )
         exact_groups.setdefault(key, []).append(candidate)
     for group in exact_groups.values():
         group.sort(
@@ -298,14 +326,30 @@ def _candidate_take_groups(
     for key, group in exact_groups.items():
         kind, session_id, identity = key
         segments = base_segments_by_session.get(session_id)
-        if kind != "base" or not isinstance(identity, tuple) or not segments:
+        if not isinstance(identity, tuple) or not segments:
             fallback_nodes.append({"group": group})
             continue
-        isolation = _candidate_acoustic_isolation(identity, segments)
+        source_candidates = [
+            _candidate_take_source(candidate, candidates_by_id)
+            for candidate in group
+        ]
+        base_indices = tuple(
+            int(value)
+            for value in source_candidates[0].get("base_indices") or []
+        )
+        if kind == "base":
+            base_indices = identity
+        isolation = _candidate_acoustic_isolation(base_indices, segments)
         if isolation is None:
             fallback_nodes.append({"group": group})
             continue
-        interval = (min(identity), max(identity))
+        if kind == "time":
+            interval = (identity[0] / 1_000_000.0, identity[1] / 1_000_000.0)
+        else:
+            interval = (
+                float(segments[min(base_indices)]["start_seconds"]),
+                float(segments[max(base_indices)]["end_seconds"]),
+            )
         root_candidate = group[0]
         node = {
             "group": group,
@@ -314,6 +358,10 @@ def _candidate_take_groups(
             "priority": (
                 float(root_candidate.get("score", 0.0))
                 + 4.0 * isolation
+            ),
+            "repeated_take": any(
+                bool(source.get("repeated_take_trim"))
+                for source in source_candidates
             ),
             "original_order": min(
                 original_order[str(candidate["segment_id"])]
@@ -328,13 +376,14 @@ def _candidate_take_groups(
         for node in sorted(
             session_nodes,
             key=lambda value: (
+                -int(bool(value["repeated_take"])),
                 -float(value["priority"]),
                 -float(value["isolation"]),
                 int(value["original_order"]),
             ),
         ):
             if any(
-                _base_interval_overlap(node["interval"], root["interval"])
+                _time_interval_overlap(node["interval"], root["interval"])
                 for root in roots
             ):
                 continue
@@ -348,20 +397,20 @@ def _candidate_take_groups(
             overlapping_roots = [
                 root
                 for root in roots
-                if _base_interval_overlap(node_interval, root["interval"])
+                if _time_interval_overlap(node_interval, root["interval"])
             ]
             if not overlapping_roots:
                 roots.append(node)
                 members_by_root[id(node)] = [node]
                 continue
-            node_length = node_interval[1] - node_interval[0] + 1
+            node_length = node_interval[1] - node_interval[0]
             node_center = sum(node_interval) / 2.0
             owner = max(
                 overlapping_roots,
                 key=lambda root: (
-                    _base_interval_overlap(node_interval, root["interval"])
+                    _time_interval_overlap(node_interval, root["interval"])
                     / node_length,
-                    _base_interval_overlap(node_interval, root["interval"]),
+                    _time_interval_overlap(node_interval, root["interval"]),
                     -abs(node_center - sum(root["interval"]) / 2.0),
                     float(root["priority"]),
                 ),

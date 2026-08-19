@@ -485,6 +485,53 @@ def test_candidate_take_groups_cluster_shifted_spans_around_acoustic_roots() -> 
     ]
 
 
+def test_candidate_take_groups_keep_repetitions_inside_one_base_separate() -> None:
+    segments = [{"start_seconds": 10.0, "end_seconds": 13.0}]
+
+    def candidate(
+        segment_id: str,
+        start: float,
+        end: float,
+        score: float,
+        *,
+        repeated: bool = False,
+    ) -> dict:
+        return {
+            "segment_id": segment_id,
+            "session_id": "session",
+            "base_indices": [0],
+            "start_seconds": start,
+            "end_seconds": end,
+            "score": score,
+            "intra_segment_trim": True,
+            "repeated_take_trim": repeated,
+        }
+
+    candidates = [
+        candidate("session__take1", 10.0, 11.5, 100.0, repeated=True),
+        candidate("session__take1_shifted", 9.95, 11.6, 96.0, repeated=True),
+        candidate("session__take2", 11.5, 13.0, 99.0, repeated=True),
+        candidate("session__whole", 10.0, 13.0, 70.0),
+        {
+            **candidate("session__custom", 11.7, 12.8, 98.0),
+            "manual_edit": True,
+            "edited_from_segment_id": "session__take2",
+        },
+    ]
+
+    groups = _candidate_take_groups(candidates, {"session": segments})
+    groups_by_root = {
+        group[0]["segment_id"]: {
+            candidate["segment_id"] for candidate in group
+        }
+        for group in groups
+    }
+
+    assert set(groups_by_root) == {"session__take1", "session__take2"}
+    assert "session__take1_shifted" in groups_by_root["session__take1"]
+    assert "session__custom" in groups_by_root["session__take2"]
+
+
 def test_manual_only_normal_line_keeps_unmatched_take_pool_visible() -> None:
     line = {
         "type": "normal",
@@ -3433,6 +3480,162 @@ def test_trim_recovery_splits_adjacent_repeated_line_without_word_gap() -> None:
     assert second["trim_start_sample"] == expected_boundary
     assert second["trim_end_sample"] == segment["end_sample"]
     assert all(item["match_score"] == 100.0 for item in trimmed)
+
+
+def test_trim_recovery_discovers_repeated_single_word_for_other_primary_line() -> None:
+    sample_rate = 48000
+    lines = [
+        {"line_id": "R21", "line": "Goodbye."},
+        {"line_id": "other", "line": "Safe travels."},
+    ]
+    words = [
+        {"word": " Goodbye", "start": 0.0, "end": 0.53},
+        {"word": " Goodbye", "start": 0.81, "end": 1.55},
+    ]
+    segment = {
+        "segment_id": "session__s00043",
+        "start_sample": 0,
+        "end_sample": round(2.2 * sample_rate),
+        "start_seconds": 0.0,
+        "end_seconds": 2.2,
+        "transcript": "Goodbye Goodbye",
+        "segment_asr": {
+            "primary": {
+                "transcript": "Goodbye Goodbye",
+                "words": words,
+            }
+        },
+    }
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 1,
+        "match_score": 20.0,
+        "transcript": segment["transcript"],
+        "duration_plausibility": 20.0,
+        "top_matches": [],
+    }
+
+    trimmed = _intra_segment_trim_actions(
+        [action],
+        lines=lines,
+        base_segments=[segment],
+        sample_rate=sample_rate,
+        settings={},
+        evaluator=TranscriptEvaluator(lines, {}),
+    )
+
+    goodbye_takes = [item for item in trimmed if item["line_index"] == 0]
+    assert len(goodbye_takes) == 2
+    assert all(item["repeated_take_trim"] for item in goodbye_takes)
+
+
+def test_trim_recovery_keeps_three_repetitions_before_other_primary_line() -> None:
+    sample_rate = 48000
+    lines = [
+        {"line_id": "R22", "line": "See you later."},
+        {"line_id": "R23", "line": "Safe travels."},
+    ]
+    words = [
+        {"word": " See", "start": 0.0, "end": 0.358},
+        {"word": " you", "start": 0.358, "end": 0.458},
+        {"word": " later", "start": 0.458, "end": 0.758},
+        {"word": " See", "start": 0.898, "end": 1.818},
+        {"word": " you", "start": 1.818, "end": 1.998},
+        {"word": " later", "start": 1.998, "end": 2.318},
+        {"word": " See", "start": 2.458, "end": 3.218},
+        {"word": " you", "start": 3.218, "end": 3.358},
+        {"word": " later", "start": 3.358, "end": 3.638},
+        {"word": " Safe", "start": 4.698, "end": 4.998},
+        {"word": " travels", "start": 4.998, "end": 5.378},
+    ]
+    transcript = "See you later See you later See you later Safe travels"
+    segment = {
+        "segment_id": "session__s00048",
+        "start_sample": 0,
+        "end_sample": round(6.125 * sample_rate),
+        "start_seconds": 0.0,
+        "end_seconds": 6.125,
+        "transcript": transcript,
+        "segment_asr": {
+            "primary": {"transcript": transcript, "words": words}
+        },
+    }
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 1,
+        "match_score": 50.0,
+        "transcript": transcript,
+        "duration_plausibility": 20.0,
+        "top_matches": [],
+    }
+
+    trimmed = _intra_segment_trim_actions(
+        [action],
+        lines=lines,
+        base_segments=[segment],
+        sample_rate=sample_rate,
+        settings={},
+        evaluator=TranscriptEvaluator(lines, {}),
+    )
+
+    r22_takes = [item for item in trimmed if item["line_index"] == 0]
+    assert len(r22_takes) == 3
+    assert all(item["repeated_take_trim"] for item in r22_takes)
+
+
+def test_trim_recovery_allows_compound_word_asr_in_repeated_take() -> None:
+    sample_rate = 48000
+    lines = [
+        {"line_id": "PatronR6", "line": "Mud hopper stew, extra spicy."},
+        {"line_id": "other", "line": "Yule pie."},
+    ]
+    words = [
+        {"word": " Mudhopper", "start": 0.0, "end": 0.912},
+        {"word": " stew", "start": 0.912, "end": 1.131},
+        {"word": " Extra", "start": 1.432, "end": 2.272},
+        {"word": " spicy", "start": 2.272, "end": 2.792},
+        {"word": " Mudhopper", "start": 3.912, "end": 4.872},
+        {"word": " stew", "start": 4.872, "end": 5.131},
+        {"word": " Extra", "start": 5.592, "end": 6.551},
+        {"word": " spicy", "start": 6.551, "end": 7.151},
+    ]
+    transcript = "Mudhopper stew Extra spicy Mudhopper stew Extra spicy"
+    segment = {
+        "segment_id": "session__s00024",
+        "start_sample": 0,
+        "end_sample": round(8.223 * sample_rate),
+        "start_seconds": 0.0,
+        "end_seconds": 8.223,
+        "transcript": transcript,
+        "segment_asr": {
+            "primary": {"transcript": transcript, "words": words}
+        },
+    }
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 1,
+        "match_score": 20.0,
+        "transcript": transcript,
+        "duration_plausibility": 20.0,
+        "top_matches": [],
+    }
+
+    trimmed = _intra_segment_trim_actions(
+        [action],
+        lines=lines,
+        base_segments=[segment],
+        sample_rate=sample_rate,
+        settings={},
+        evaluator=TranscriptEvaluator(lines, {}),
+    )
+
+    patron_takes = [item for item in trimmed if item["line_index"] == 0]
+    assert len(patron_takes) == 2
+    assert all(item["repeated_take_trim"] for item in patron_takes)
+    assert all(item["match_score"] > 95.0 for item in patron_takes)
 
 
 def test_repeated_take_trim_uses_ordered_vad_gaps(

@@ -45,7 +45,7 @@ from .review import (
 )
 from .segmentation import refresh_project_audio, segment_project
 from .transcription import transcribe_project, transcribe_segments_project
-from .util import project_file_from_arg, write_json
+from .util import project_file_from_arg, read_json, write_json
 
 
 APP_TITLE = "Dialogue VA Pipeline"
@@ -185,39 +185,224 @@ def _candidate_take_key(
     return "segment", session_id, segment_id
 
 
+def _candidate_group_sort_key(
+    candidate: dict[str, Any],
+    original_order: dict[str, int],
+) -> tuple[float, float, bool, int]:
+    return (
+        -float(candidate.get("score", 0.0)),
+        -float(candidate.get("selection_score", 0.0)),
+        bool(candidate.get("manual_edit")),
+        original_order[str(candidate["segment_id"])],
+    )
+
+
+def _segment_gap(
+    segments: list[dict[str, Any]],
+    left_index: int,
+    right_index: int,
+) -> float:
+    return max(
+        0.0,
+        float(segments[right_index].get("start_seconds", 0.0))
+        - float(segments[left_index].get("end_seconds", 0.0)),
+    )
+
+
+def _candidate_acoustic_isolation(
+    base_indices: tuple[int, ...],
+    segments: list[dict[str, Any]],
+) -> float | None:
+    """Score how clearly a span is separated from neighboring performances."""
+
+    if not base_indices:
+        return None
+    start_index = min(base_indices)
+    end_index = max(base_indices)
+    if (
+        start_index < 0
+        or end_index >= len(segments)
+        or tuple(range(start_index, end_index + 1)) != base_indices
+    ):
+        return None
+
+    internal_gaps = [
+        _segment_gap(segments, index, index + 1)
+        for index in range(start_index, end_index)
+    ]
+    known_edge_gaps = []
+    if start_index > 0:
+        known_edge_gaps.append(
+            _segment_gap(segments, start_index - 1, start_index)
+        )
+    if end_index + 1 < len(segments):
+        known_edge_gaps.append(
+            _segment_gap(segments, end_index, end_index + 1)
+        )
+    edge_default = max([0.0, *known_edge_gaps, *internal_gaps])
+    leading_gap = (
+        _segment_gap(segments, start_index - 1, start_index)
+        if start_index > 0
+        else edge_default
+    )
+    trailing_gap = (
+        _segment_gap(segments, end_index, end_index + 1)
+        if end_index + 1 < len(segments)
+        else edge_default
+    )
+    # A candidate that crosses a large pause is less likely to be one take,
+    # even if its two outside edges also happen to be well separated.
+    return leading_gap + trailing_gap - 2.0 * max(internal_gaps, default=0.0)
+
+
+def _base_interval_overlap(
+    left: tuple[int, int],
+    right: tuple[int, int],
+) -> int:
+    return max(0, min(left[1], right[1]) - max(left[0], right[0]) + 1)
+
+
 def _candidate_take_groups(
     candidates: list[dict[str, Any]],
+    base_segments_by_session: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[list[dict[str, Any]]]:
-    """Group variants cut from the same base segment sequence."""
+    """Group exact and overlapping variants around acoustically clean takes."""
 
     candidates_by_id = {
         str(candidate["segment_id"]): candidate for candidate in candidates
     }
-    groups: dict[
+    original_order = {
+        str(candidate["segment_id"]): index
+        for index, candidate in enumerate(candidates)
+    }
+    exact_groups: dict[
         tuple[str, str, tuple[int, ...] | str],
         list[dict[str, Any]],
     ] = {}
     for candidate in candidates:
         key = _candidate_take_key(candidate, candidates_by_id)
-        groups.setdefault(key, []).append(candidate)
-
-    grouped_candidates: list[list[dict[str, Any]]] = []
-    for group in groups.values():
-        original_order = {
-            str(candidate["segment_id"]): index
-            for index, candidate in enumerate(group)
-        }
-        grouped_candidates.append(
-            sorted(
-                group,
-                key=lambda candidate: (
-                    -float(candidate.get("score", 0.0)),
-                    bool(candidate.get("manual_edit")),
-                    original_order[str(candidate["segment_id"])],
-                ),
+        exact_groups.setdefault(key, []).append(candidate)
+    for group in exact_groups.values():
+        group.sort(
+            key=lambda candidate: _candidate_group_sort_key(
+                candidate,
+                original_order,
             )
         )
-    return grouped_candidates
+
+    if not base_segments_by_session:
+        return list(exact_groups.values())
+
+    nodes_by_session: dict[str, list[dict[str, Any]]] = {}
+    fallback_nodes: list[dict[str, Any]] = []
+    for key, group in exact_groups.items():
+        kind, session_id, identity = key
+        segments = base_segments_by_session.get(session_id)
+        if kind != "base" or not isinstance(identity, tuple) or not segments:
+            fallback_nodes.append({"group": group})
+            continue
+        isolation = _candidate_acoustic_isolation(identity, segments)
+        if isolation is None:
+            fallback_nodes.append({"group": group})
+            continue
+        interval = (min(identity), max(identity))
+        root_candidate = group[0]
+        node = {
+            "group": group,
+            "interval": interval,
+            "isolation": isolation,
+            "priority": (
+                float(root_candidate.get("score", 0.0))
+                + 4.0 * isolation
+            ),
+            "original_order": min(
+                original_order[str(candidate["segment_id"])]
+                for candidate in group
+            ),
+        }
+        nodes_by_session.setdefault(session_id, []).append(node)
+
+    clustered_nodes: list[dict[str, Any]] = []
+    for session_nodes in nodes_by_session.values():
+        roots: list[dict[str, Any]] = []
+        for node in sorted(
+            session_nodes,
+            key=lambda value: (
+                -float(value["priority"]),
+                -float(value["isolation"]),
+                int(value["original_order"]),
+            ),
+        ):
+            if any(
+                _base_interval_overlap(node["interval"], root["interval"])
+                for root in roots
+            ):
+                continue
+            roots.append(node)
+
+        members_by_root = {id(root): [root] for root in roots}
+        for node in session_nodes:
+            if node in roots:
+                continue
+            node_interval = node["interval"]
+            overlapping_roots = [
+                root
+                for root in roots
+                if _base_interval_overlap(node_interval, root["interval"])
+            ]
+            if not overlapping_roots:
+                roots.append(node)
+                members_by_root[id(node)] = [node]
+                continue
+            node_length = node_interval[1] - node_interval[0] + 1
+            node_center = sum(node_interval) / 2.0
+            owner = max(
+                overlapping_roots,
+                key=lambda root: (
+                    _base_interval_overlap(node_interval, root["interval"])
+                    / node_length,
+                    _base_interval_overlap(node_interval, root["interval"]),
+                    -abs(node_center - sum(root["interval"]) / 2.0),
+                    float(root["priority"]),
+                ),
+            )
+            members_by_root[id(owner)].append(node)
+
+        for root in roots:
+            alternatives = [
+                candidate
+                for node in members_by_root[id(root)]
+                if node is not root
+                for candidate in node["group"]
+            ]
+            alternatives.sort(
+                key=lambda candidate: _candidate_group_sort_key(
+                    candidate,
+                    original_order,
+                )
+            )
+            clustered_nodes.append(
+                {
+                    "group": [*root["group"], *alternatives],
+                    "original_order": min(
+                        int(node["original_order"])
+                        for node in members_by_root[id(root)]
+                    ),
+                }
+            )
+
+    clustered_nodes.extend(
+        {
+            "group": node["group"],
+            "original_order": min(
+                original_order[str(candidate["segment_id"])]
+                for candidate in node["group"]
+            ),
+        }
+        for node in fallback_nodes
+    )
+    clustered_nodes.sort(key=lambda node: int(node["original_order"]))
+    return [node["group"] for node in clustered_nodes]
 
 
 def _read_pcm_wav(path: Path) -> tuple[np.ndarray, int]:
@@ -1906,6 +2091,7 @@ class DialogueReviewApp:
         self.project: dict[str, Any] | None = None
         self.review_path: Path | None = None
         self.review_data: dict[str, Any] | None = None
+        self.base_segments_by_session: dict[str, list[dict[str, Any]]] = {}
         self.selected_line_id: str | None = None
         self.status_filter = tk.StringVar(value="All")
         self.line_sort_column = "status"
@@ -1965,6 +2151,7 @@ class DialogueReviewApp:
         self.project = None
         self.review_path = None
         self.review_data = None
+        self.base_segments_by_session = {}
         self.selected_line_id = None
         self.selected_candidate_id = None
         self._candidate_line_id = None
@@ -2138,10 +2325,19 @@ class DialogueReviewApp:
         review_data = load_line_review(review_path)
         project_file = project_file_from_arg(project_dir)
         loaded_dir, project = load_project(project_file)
+        manifest_path = loaded_dir / "segments_manifest.json"
+        manifest = read_json(manifest_path) if manifest_path.is_file() else {}
         self.project_dir = loaded_dir
         self.project = project
         self.review_path = review_path
         self.review_data = review_data
+        self.base_segments_by_session = {
+            str(session.get("session_id") or ""): list(
+                session.get("segments") or []
+            )
+            for session in manifest.get("sessions") or []
+            if str(session.get("session_id") or "")
+        }
         self.selected_line_id = (
             review_data["lines"][0]["line_id"] if review_data["lines"] else None
         )
@@ -3037,7 +3233,10 @@ class DialogueReviewApp:
                 tags=tags,
             )
 
-        take_groups = _candidate_take_groups(candidates)
+        take_groups = _candidate_take_groups(
+            candidates,
+            self.base_segments_by_session,
+        )
         for take_number, group in enumerate(take_groups, start=1):
             root_candidate = group[0]
             root_id = str(root_candidate["segment_id"])

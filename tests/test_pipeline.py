@@ -425,6 +425,66 @@ def test_candidate_take_groups_parse_legacy_base_segment_ids() -> None:
     assert len(groups) == 1
 
 
+def test_candidate_take_groups_cluster_shifted_spans_around_acoustic_roots() -> None:
+    segments = []
+    cursor = 0.0
+    gaps_after = [0.1, 0.0, 1.5, 0.2, 0.0, 0.05, 1.5, 0.4, 0.05, 1.8]
+    for gap_after in gaps_after:
+        segments.append(
+            {
+                "start_seconds": cursor,
+                "end_seconds": cursor + 1.0,
+            }
+        )
+        cursor += 1.0 + gap_after
+
+    def candidate(segment_id: str, start: int, end: int, score: float) -> dict:
+        return {
+            "segment_id": segment_id,
+            "session_id": "session",
+            "base_indices": list(range(start, end + 1)),
+            "score": score,
+        }
+
+    candidates = [
+        candidate("session__m00003_00006", 2, 5, 95.65),
+        candidate("session__m00007_00009", 6, 8, 95.65),
+        candidate("session__m00008_00010", 7, 9, 95.65),
+        candidate("session__m00004_00007", 3, 6, 95.65),
+        candidate("session__m00001_00003", 0, 2, 92.98),
+        candidate("session__m00001_00002", 0, 1, 92.98),
+        candidate("session__m00004_00006", 3, 5, 95.65),
+        candidate("session__m00004_00008", 3, 7, 94.21),
+        candidate("session__m00008_00009", 7, 8, 95.65),
+    ]
+
+    groups = _candidate_take_groups(
+        candidates,
+        {"session": segments},
+    )
+    groups_by_root = {
+        group[0]["segment_id"]: {
+            candidate["segment_id"] for candidate in group
+        }
+        for group in groups
+    }
+
+    assert set(groups_by_root) == {
+        "session__m00001_00003",
+        "session__m00004_00007",
+        "session__m00008_00010",
+    }
+    assert "session__m00003_00006" in groups_by_root[
+        "session__m00004_00007"
+    ]
+    assert "session__m00007_00009" in groups_by_root[
+        "session__m00008_00010"
+    ]
+    assert "session__m00001_00002" in groups_by_root[
+        "session__m00001_00003"
+    ]
+
+
 def test_manual_only_normal_line_keeps_unmatched_take_pool_visible() -> None:
     line = {
         "type": "normal",

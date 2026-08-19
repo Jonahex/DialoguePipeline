@@ -3568,6 +3568,138 @@ def test_trim_recovery_scans_bases_inside_a_merged_primary_action() -> None:
     assert "Nothing too substantial Nothing" not in recovered["transcript"]
 
 
+@pytest.mark.parametrize(
+    ("prefix", "suffix"),
+    [
+        ("I suppose I should start", ""),
+        ("", "The next script line starts here"),
+    ],
+)
+def test_trim_recovery_finds_complete_take_beside_partial_dialogue(
+    prefix: str,
+    suffix: str,
+) -> None:
+    sample_rate = 48000
+    line_text = "I suppose I should start making space for the display."
+    line_tokens = line_text.rstrip(".").split()
+    tokens = [*prefix.split(), *line_tokens, *suffix.split()]
+    line_start = len(prefix.split())
+    line_end = line_start + len(line_tokens) - 1
+    words = []
+    cursor = 0.0
+    for index, token in enumerate(tokens):
+        if index == line_start and line_start:
+            cursor += 0.25
+        if index == line_end + 1:
+            cursor += 0.25
+        words.append(
+            {"word": f" {token}", "start": cursor, "end": cursor + 0.20}
+        )
+        cursor += 0.20
+    transcript = " ".join(tokens)
+    segment = {
+        "segment_id": "session__s00001",
+        "start_sample": 0,
+        "end_sample": round((cursor + 0.20) * sample_rate),
+        "start_seconds": 0.0,
+        "end_seconds": cursor + 0.20,
+        "transcript": transcript,
+        "segment_asr": {
+            "primary": {"transcript": transcript, "words": words}
+        },
+    }
+    line = {"line_id": "target", "line": line_text}
+    evaluator = TranscriptEvaluator([line], {})
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": evaluator.match(0, transcript),
+        "transcript": transcript,
+        "duration_plausibility": 30.0,
+        "top_matches": [],
+    }
+
+    trimmed = _intra_segment_trim_actions(
+        [action],
+        lines=[line],
+        base_segments=[segment],
+        sample_rate=sample_rate,
+        settings={},
+        evaluator=evaluator,
+    )
+
+    recovered = next(item for item in trimmed if item["match_score"] == 100.0)
+    assert recovered["repeated_take_trim"] is True
+    assert (recovered["trim_start_sample"] > 0) is bool(prefix)
+    assert (
+        recovered["trim_end_sample"] < segment["end_sample"]
+    ) is bool(suffix)
+
+
+def test_trim_recovery_deduplicates_fuzzy_windows_between_repeated_takes() -> None:
+    sample_rate = 48000
+    line_text = (
+        "I can send Seeks-Treasure and a few volunteers there at once. "
+        "We'll work out other details when we have time."
+    )
+    spoken_tokens = (
+        "I can send six treasure and a few volunteers there at once "
+        "we'll work out other details when we have time"
+    ).split()
+    words = []
+    cursor = 0.0
+    for take in range(2):
+        if take:
+            cursor += 0.50
+        for token in spoken_tokens:
+            words.append(
+                {
+                    "word": f" {token}",
+                    "start": cursor,
+                    "end": cursor + 0.20,
+                }
+            )
+            cursor += 0.20
+    transcript = " ".join(spoken_tokens * 2)
+    segment = {
+        "segment_id": "session__s00001",
+        "start_sample": 0,
+        "end_sample": round((cursor + 0.25) * sample_rate),
+        "start_seconds": 0.0,
+        "end_seconds": cursor + 0.25,
+        "transcript": transcript,
+        "segment_asr": {
+            "primary": {"transcript": transcript, "words": words}
+        },
+    }
+    line = {"line_id": "target", "line": line_text}
+    evaluator = TranscriptEvaluator([line], {})
+    action = {
+        "start_index": 0,
+        "count": 1,
+        "line_index": 0,
+        "match_score": evaluator.match(0, transcript),
+        "transcript": transcript,
+        "duration_plausibility": 20.0,
+        "top_matches": [],
+    }
+
+    trimmed = _intra_segment_trim_actions(
+        [action],
+        lines=[line],
+        base_segments=[segment],
+        sample_rate=sample_rate,
+        settings={},
+        evaluator=evaluator,
+    )
+
+    assert len(trimmed) == 2
+    assert all(item["match_score"] > 95.0 for item in trimmed)
+    assert trimmed[0]["trim_end_sample"] == trimmed[1]["trim_start_sample"]
+    assert all(item["repeated_take_trim"] for item in trimmed)
+
+
 def test_trim_recovery_splits_adjacent_repeated_line_without_word_gap() -> None:
     line_text = "Wonderful to see you again."
     repeated_words = [
@@ -3830,9 +3962,9 @@ def test_repeated_take_trim_uses_ordered_vad_gaps(
         alignment_module,
         "_segment_voice_regions_for_trimming",
         lambda *_args, **_kwargs: [
-            (round(0.25 * sample_rate), round(1.02 * sample_rate)),
-            (round(1.79 * sample_rate), round(2.53 * sample_rate)),
-            (round(3.17 * sample_rate), round(3.84 * sample_rate)),
+            (round(0.25 * sample_rate), round(1.20 * sample_rate)),
+            (round(1.42 * sample_rate), round(2.70 * sample_rate)),
+            (round(2.92 * sample_rate), round(3.84 * sample_rate)),
         ],
     )
     monkeypatch.setattr(
@@ -3862,8 +3994,8 @@ def test_repeated_take_trim_uses_ordered_vad_gaps(
     )
 
     expected_boundaries = {
-        round(((1.02 + 1.79) / 2.0) * sample_rate),
-        round(((2.53 + 3.17) / 2.0) * sample_rate),
+        round(((1.20 + 1.42) / 2.0) * sample_rate),
+        round(((2.70 + 2.92) / 2.0) * sample_rate),
     }
     actual_boundaries = {
         int(item["trim_start_sample"])
@@ -4078,6 +4210,117 @@ def test_fragment_join_can_trim_shared_take_boundary_segment() -> None:
     assert second_take["trim_start_sample"] > segments[2]["start_sample"]
     assert first_take["match_score"] == 100.0
     assert second_take["match_score"] == 100.0
+
+
+def test_fragment_join_trims_repeated_prefix_from_complete_multisegment_take() -> None:
+    line_text = (
+        "Your best bet is Master Meretor. You can usually find him in the "
+        "castle. Just be aware he's a bit... peculiar."
+    )
+    lines = [{"line_id": "target", "line": line_text}]
+    first_tokens = (
+        "Your best bet is Master Meretor "
+        "Your best bet is Master Meretor "
+        "You can usually find him in the castle"
+    ).split()
+    first_words = []
+    cursor = 0.0
+    for index, token in enumerate(first_tokens):
+        if index == 6:
+            cursor += 0.70
+        elif index == 12:
+            cursor += 0.50
+        first_words.append(
+            {"word": f" {token}", "start": cursor, "end": cursor + 0.20}
+        )
+        cursor += 0.20
+
+    first_duration = cursor + 0.20
+    second_text = "Just be aware he's a bit peculiar"
+    second_tokens = second_text.split()
+    second_words = [
+        {
+            "word": f" {token}",
+            "start": index * 0.25,
+            "end": index * 0.25 + 0.20,
+        }
+        for index, token in enumerate(second_tokens)
+    ]
+    second_duration = len(second_tokens) * 0.25 + 0.20
+    sample_rate = 48000
+    segments = [
+        {
+            "segment_id": "session__s00001",
+            "start_sample": 0,
+            "end_sample": round(first_duration * sample_rate),
+            "start_seconds": 0.0,
+            "end_seconds": first_duration,
+            "transcript": " ".join(first_tokens),
+            "asr_probability": 0.95,
+            "segment_asr": {
+                "primary": {
+                    "transcript": " ".join(first_tokens),
+                    "words": first_words,
+                }
+            },
+        },
+        {
+            "segment_id": "session__s00002",
+            "start_sample": round(first_duration * sample_rate),
+            "end_sample": round(
+                (first_duration + second_duration) * sample_rate
+            ),
+            "start_seconds": first_duration,
+            "end_seconds": first_duration + second_duration,
+            "transcript": second_text,
+            "asr_probability": 0.95,
+            "segment_asr": {
+                "primary": {
+                    "transcript": second_text,
+                    "words": second_words,
+                }
+            },
+        },
+    ]
+    evaluator = TranscriptEvaluator(lines, {})
+    full_text = " ".join(segment["transcript"] for segment in segments)
+    source_action = {
+        "start_index": 0,
+        "count": 2,
+        "line_index": 0,
+        "match_score": evaluator.match(0, full_text),
+        "transcript": full_text,
+        "duration_plausibility": 60.0,
+        "order_hint": 0.0,
+        "top_matches": [],
+    }
+
+    joined = _multisentence_fragment_join_actions(
+        [source_action],
+        lines=lines,
+        base_segments=segments,
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 2,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 20.0,
+            }
+        ),
+        evaluator=evaluator,
+        span_catalog=SpanCatalog(segments, {}),
+    )
+
+    recovered = next(
+        action
+        for action in joined
+        if action["start_index"] == 0
+        and action["count"] == 2
+        and action.get("trimmed_edge_join")
+    )
+    assert recovered["trim_start_sample"] > segments[0]["start_sample"]
+    assert recovered["trim_end_sample"] == segments[1]["end_sample"]
+    assert recovered["match_score"] == 100.0
+    assert recovered["repeated_take_trim"] is True
 
 
 def test_boundary_noise_cleanup_recovers_clean_single_base_span() -> None:

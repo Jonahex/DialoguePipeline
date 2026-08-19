@@ -2397,6 +2397,43 @@ def _multisentence_fragment_join_actions(
             and int(fidelity["trailing_substitution_count"]) == 0
         )
 
+    def has_repeated_excess(line_index: int, transcript: str) -> bool:
+        expected_counts = Counter(
+            evaluator.line_features[line_index].text.tokens
+        )
+        observed_counts = Counter(
+            evaluator.observed_features(transcript).tokens
+        )
+        return any(
+            count >= 2 and count > expected_counts.get(token, 0)
+            for token, count in observed_counts.items()
+        )
+
+    def has_recoverable_repeated_edge(
+        action: dict[str, Any],
+        fidelity: dict[str, Any],
+    ) -> bool:
+        """Return whether an otherwise complete join contains a repeated edge.
+
+        Such spans must remain eligible for edge trimming: the clean take can
+        begin partway through the first base segment and continue into later
+        segments, or end partway through the last one.
+        """
+
+        if int(action.get("count", 1)) < 2:
+            return False
+        if int(fidelity["extra_word_count"]) <= 0:
+            return False
+        if not (
+            int(fidelity["leading_extra_token_count"]) > 0
+            or int(fidelity["trailing_extra_token_count"]) > 0
+        ):
+            return False
+        return has_repeated_excess(
+            int(action["line_index"]),
+            str(action.get("transcript") or ""),
+        )
+
     complete_action_keys: set[tuple[int, int, int]] = set()
     complete_action_ranges: dict[int, list[tuple[int, int]]] = defaultdict(list)
     if only_incomplete_lines:
@@ -2440,6 +2477,10 @@ def _multisentence_fragment_join_actions(
                 and minimum_length_ratio
                 <= length_ratio
                 <= maximum_length_ratio
+                and not has_recoverable_repeated_edge(
+                    action,
+                    scored["fidelity"],
+                )
             ):
                 action_start = int(action["start_index"])
                 action_count = int(action["count"])
@@ -2700,15 +2741,9 @@ def _multisentence_fragment_join_actions(
                     boundary_audio_rescue = False
                     fallback_preview = True
 
-                expected_counts = Counter(
-                    evaluator.line_features[line_index].text.tokens
-                )
-                observed_counts = Counter(
-                    evaluator.observed_features(span["transcript"]).tokens
-                )
-                repeated_excess = any(
-                    count >= 2 and count > expected_counts.get(token, 0)
-                    for token, count in observed_counts.items()
+                repeated_excess = has_repeated_excess(
+                    line_index,
+                    str(span["transcript"]),
                 )
                 if (
                     repeated_excess
@@ -2778,6 +2813,19 @@ def _multisentence_fragment_join_actions(
                         "intra_segment_trim": bool(
                             span.get("trim_start_sample") is not None
                             or span.get("trim_end_sample") is not None
+                        ),
+                        "repeated_take_trim": bool(
+                            (
+                                span.get("trim_start_sample") is not None
+                                or span.get("trim_end_sample") is not None
+                            )
+                            and any(
+                                has_repeated_excess(
+                                    line_index,
+                                    str(action.get("transcript") or ""),
+                                )
+                                for action in comparison_actions
+                            )
                         ),
                         "trimmed_edge_join": bool(
                             span.get("trim_start_sample") is not None
@@ -2878,7 +2926,11 @@ def _repeated_line_boundary_offsets(
     evaluator: TranscriptEvaluator,
     minimum_match: float,
 ) -> dict[int, float]:
-    """Find adjacent complete repetitions even when Whisper spans the pause."""
+    """Find complete line windows embedded inside a larger ASR segment.
+
+    This covers adjacent repeated takes as well as a complete take preceded by
+    a partial false start or followed by dialogue from the next script line.
+    """
 
     expected_word_count = evaluator.line_features[line_index].word_count
     if expected_word_count < 1 or len(words) < 2:
@@ -2904,25 +2956,61 @@ def _repeated_line_boundary_offsets(
                 for word in words[first_word : last_word + 1]
             )
             evaluation = evaluator.evaluate(line_index, window_text)
+            required_coverage = 0.85
+            if (
+                float(evaluation.fidelity["ordered_similarity"]) >= 95.0
+                and float(evaluation.fidelity["token_precision"]) >= 0.95
+            ):
+                required_coverage = 0.75
             if (
                 evaluation.match_score < minimum_match
                 or float(evaluation.fidelity["ordered_similarity"])
                 < minimum_match
+                or float(evaluation.fidelity["token_coverage"])
+                < required_coverage
+                or float(evaluation.fidelity["token_precision"]) < 0.85
                 or int(evaluation.sentence["missing_clause_count"]) > 0
                 or not bool(evaluation.sentence["clauses_in_order"])
             ):
                 continue
             quality = (
                 float(evaluation.match_score),
+                float(evaluation.fidelity["token_coverage"]),
+                float(evaluation.fidelity["token_precision"]),
+                -int(evaluation.fidelity["extra_word_count"]),
                 -abs(window_word_count - expected_word_count),
                 -window_word_count,
             )
             if best_window is None or quality > best_window[0]:
                 best_window = (quality, first_word, last_word)
         if best_window is not None:
-            matching_windows.append((best_window[1], best_window[2]))
-    if len(matching_windows) < 2:
+            matching_windows.append(best_window)
+    if not matching_windows:
         return {}
+
+    # The +/-2 word search intentionally produces overlapping fuzzy variants
+    # around each real take. Select the best non-overlapping windows before
+    # deriving boundaries; treating every variant as a separate repetition can
+    # snap one semantic pause to several unrelated VAD gaps.
+    selected_windows = []
+    for quality, first_word, last_word in sorted(
+        matching_windows,
+        key=lambda item: (
+            item[0],
+            -item[1],
+        ),
+        reverse=True,
+    ):
+        if any(
+            not (
+                last_word < selected_first
+                or first_word > selected_last
+            )
+            for _, selected_first, selected_last in selected_windows
+        ):
+            continue
+        selected_windows.append((quality, first_word, last_word))
+    selected_windows.sort(key=lambda item: item[1])
 
     durations = sorted(
         max(0.0, float(word["end"]) - float(word["start"]))
@@ -2930,15 +3018,11 @@ def _repeated_line_boundary_offsets(
     )
     typical_duration = durations[len(durations) // 2]
     boundaries = {}
-    windows_by_start = {
-        first_word: (first_word, last_word)
-        for first_word, last_word in matching_windows
-    }
-    for _, left_last in matching_windows:
-        right_window = windows_by_start.get(left_last + 1)
-        if right_window is None:
-            continue
-        right_first, _ = right_window
+
+    def add_boundary(left_last: int) -> None:
+        if left_last < 0 or left_last + 1 >= len(words):
+            return
+        right_first = left_last + 1
         left_end = float(words[left_last]["end"])
         right_start = float(words[right_first]["start"])
         right_end = float(words[right_first]["end"])
@@ -2951,6 +3035,12 @@ def _repeated_line_boundary_offsets(
         else:
             boundary = (left_end + right_start) / 2.0
         boundaries[left_last] = boundary
+
+    for _, first_word, last_word in selected_windows:
+        if first_word > 0:
+            add_boundary(first_word - 1)
+        if last_word < len(words) - 1:
+            add_boundary(last_word)
     return boundaries
 
 
@@ -3057,7 +3147,11 @@ def _snap_repeated_boundaries_to_voice_gaps(
         ),
         stored_key="strict_speech_regions",
     )
-    minimum_voice_gap = max(0.10, min(float(minimum_gap), 0.30))
+    # A fidelity-verified embedded line window supplies much stronger boundary
+    # evidence than an ordinary pause-only trim. Keep requiring a strict VAD
+    # separation, but admit short direction resets that commonly fall below
+    # the general 0.40-second word-gap threshold.
+    minimum_voice_gap = max(0.10, min(float(minimum_gap), 0.20))
     gaps = [
         (left_end, right_start)
         for (_, left_end), (right_start, _) in zip(regions, regions[1:])

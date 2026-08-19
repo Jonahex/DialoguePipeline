@@ -244,11 +244,18 @@ limit. `fragment_join_max_actions` controls retained recovery alternatives, not
 span size. `fragment_join_fallback_max_actions` separately bounds fallback
 joins. `intra_segment_trim_max_actions_per_line` and
 `intra_segment_trim_max_actions_per_segment` bound pause-based trim expansion.
+Intra-segment recovery also locates a fidelity-complete script window beside a
+partial false start or following dialogue. Overlapping fuzzy window variants
+are collapsed before their semantic boundaries are snapped to short strict-VAD
+pauses, preventing one real take boundary from consuming several later gaps.
 
 Strict joins must pass whole-line similarity, token coverage, clause fidelity,
 order, and precision. A provisional path admits spans that clearly improve an
 incomplete fragment. A bounded number of promising alternatives are exact-WAV
 transcribed before reliability is decided. Secondary matches can seed recovery;
+multi-segment spans with complete script coverage but a repeated leading or
+trailing take remain eligible for edge trimming, so a clean take may begin or
+end inside an edge segment while continuing across adjacent segments.
 `fragment_join_secondary_seed_min_match_score` defaults to `80`.
 Recovery is take-local: a complete take does not suppress recovery of later
 incomplete actions for the same script line, but complete takes act as barriers

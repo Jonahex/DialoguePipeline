@@ -2213,6 +2213,96 @@ def _multisentence_fragment_join_actions(
             )
             recovery_actions.append(secondary)
             recovery_keys.add(key)
+
+    # The primary path is deliberately non-overlapping, so a long line can
+    # disappear when its pause-separated clauses are each better local
+    # matches for unrelated short scripts. Seed currently unrepresented long
+    # lines from those selected fragments, then let the normal bounded join
+    # search reconstruct and verify the complete span. This keeps the costly
+    # search local while allowing review candidates to overlap primary
+    # assignments.
+    primary_line_indexes = {
+        int(action["line_index"])
+        for action in actions
+    }
+    line_seed_minimum_partial_score = float(
+        settings.get("fragment_join_line_seed_min_partial_score", 92.0)
+    )
+    line_seed_minimum_words = max(
+        1,
+        int(settings.get("fragment_join_line_seed_min_words", 3)),
+    )
+    line_seed_minimum_script_words = max(
+        line_seed_minimum_words + 1,
+        int(settings.get("fragment_join_line_seed_min_script_words", 6)),
+    )
+    line_seeds_per_line = max(
+        1,
+        int(settings.get("fragment_join_line_seeds_per_line", 2)),
+    )
+    for line_index, line in enumerate(lines):
+        check_processing_cancelled()
+        expected = evaluator.line_features[line_index].text
+        if (
+            line_index in primary_line_indexes
+            or is_vocalization_script(str(line["line"]))
+            or len(expected.tokens) < line_seed_minimum_script_words
+        ):
+            continue
+        seed_options = []
+        for action in actions:
+            transcript = str(action.get("transcript") or "").strip()
+            if not transcript:
+                continue
+            observed = evaluator.observed_features(transcript)
+            observed_word_count = len(observed.tokens)
+            if observed_word_count < line_seed_minimum_words:
+                continue
+            direct_score = evaluator.match(line_index, transcript)
+            partial_score = float(
+                fuzz.partial_ratio(expected.normalized, observed.normalized)
+            )
+            is_near_complete_seed = (
+                direct_score >= secondary_seed_minimum_score
+            )
+            is_clause_seed = bool(
+                observed_word_count < len(expected.tokens)
+                and partial_score >= line_seed_minimum_partial_score
+            )
+            if not is_near_complete_seed and not is_clause_seed:
+                continue
+            seed_options.append(
+                (
+                    is_near_complete_seed,
+                    partial_score,
+                    observed_word_count,
+                    direct_score,
+                    action,
+                )
+            )
+        seed_options.sort(key=lambda item: item[:4], reverse=True)
+        for _, partial_score, _, direct_score, action in seed_options[
+            :line_seeds_per_line
+        ]:
+            key = (
+                line_index,
+                int(action["start_index"]),
+                int(action["count"]),
+            )
+            if key in recovery_keys:
+                continue
+            secondary = dict(action)
+            secondary.update(
+                {
+                    "line_index": line_index,
+                    "match_score": direct_score,
+                    "confidence_margin": 0.0,
+                    "fragment_line_seed": True,
+                    "fragment_line_seed_partial_score": partial_score,
+                }
+            )
+            recovery_actions.append(secondary)
+            recovery_keys.add(key)
     ordered_actions = sorted(
         recovery_actions,
         key=lambda action: (
@@ -2807,6 +2897,9 @@ def _multisentence_fragment_join_actions(
                             }
                         ],
                         "fragment_join": True,
+                        "fragment_line_seed": bool(
+                            seed_action.get("fragment_line_seed", False)
+                        ),
                         "fragment_join_fallback": fallback_preview,
                         "fragment_source_count": count,
                         "fragment_join_provisional": not strict_preview,
@@ -5650,6 +5743,9 @@ def align_project(
                 "boundary_clause_consensus": boundary_clause_consensus,
                 "unsafe_untranscribed_merge": unsafe_untranscribed_merge,
                 "fragment_join": bool(action.get("fragment_join", False)),
+                "fragment_line_seed": bool(
+                    action.get("fragment_line_seed", False)
+                ),
                 "fragment_source_count": int(
                     action.get("fragment_source_count", 0)
                 ),

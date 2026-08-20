@@ -2,7 +2,7 @@
 
 Dialogue VA Pipeline is a local Windows application for turning long
 voice-actor recordings into reviewable per-take WAV files and copying approved
-takes to the exact filenames defined by an Excel dialogue script.
+takes to the exact filenames defined by a dialogue spreadsheet.
 
 It provides a desktop workflow for creating a project, processing recordings,
 reviewing candidate takes, making sample-accurate edits, requesting retakes,
@@ -24,9 +24,11 @@ design, see [IMPLEMENTATION.md](IMPLEMENTATION.md).
 - An NVIDIA GPU is optional. **GPU transcription requires CUDA 12 and cuDNN 9**
   plus a compatible NVIDIA driver. Without that runtime, use CPU transcription.
 
-The input workbook may be `.xlsx` or macro-enabled `.xlsm`. Recordings should
-be WAV files; supported source formats are normalized by the tool before
-segmentation.
+The input workbook may be `.xlsx`, macro-enabled `.xlsm`, or an OpenDocument
+`.ods` dialogue export. For Creation Kit-style ODS exports, `RESPONSE TEXT` is
+the spoken line and `TOPIC TEXT` is the context, falling back to `TOPIC` when
+the topic text is empty. Recordings should be WAV files; supported source
+formats are normalized by the tool before segmentation.
 
 ## Setup
 

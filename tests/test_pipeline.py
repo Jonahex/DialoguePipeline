@@ -7,6 +7,7 @@ import threading
 import wave
 from pathlib import Path
 from types import SimpleNamespace
+from zipfile import ZIP_STORED, ZipFile
 
 import numpy as np
 import pytest
@@ -2009,6 +2010,146 @@ def test_sample_workbook_schema() -> None:
     assert len({line["target_filename"] for line in result["lines"]}) == 457
 
 
+def test_workbook_parser_supports_repeated_sections_and_note_vocalizations(
+    tmp_path: Path,
+) -> None:
+    workbook_path = tmp_path / "sectioned-lines.xlsx"
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Main"
+    headers = [
+        "Quest",
+        "Context",
+        "Line to speak",
+        "Acting Note",
+        "Filecutting Note",
+        "Filename",
+    ]
+    worksheet.cell(1, 2).value = "You are voicing Actor One"
+    for column, header in enumerate(headers, start=1):
+        worksheet.cell(2, column).value = header
+    worksheet.append(["Quest One", "Greeting", "Hello.", "", "", "one.wav"])
+
+    worksheet.cell(5, 2).value = "You are voicing Actor Two"
+    second_headers = [
+        "Filename",
+        "Acting Note",
+        "Line to speak",
+        "Context",
+        "Quest",
+        "Filecutting Note",
+    ]
+    for column, header in enumerate(second_headers, start=1):
+        worksheet.cell(6, column).value = header
+    worksheet.append(["two.wav", "Huh...", " ", "Idle", "Quest Two", ""])
+    workbook.save(workbook_path)
+    workbook.close()
+
+    result = parse_workbook(workbook_path)
+
+    assert result["line_count"] == 2
+    assert [line["line_id"] for line in result["lines"]] == [
+        "Main::R3",
+        "Main::R7",
+    ]
+    assert [line["quest"] for line in result["lines"]] == [
+        "Quest One",
+        "Quest Two",
+    ]
+    assert result["lines"][1]["line"] == "Huh..."
+    assert result["lines"][1]["acting_note"] == "Huh..."
+    assert result["sheets"][0]["voice_headers"] == [
+        "You are voicing Actor One",
+        "You are voicing Actor Two",
+    ]
+    assert "Line to speak" not in {line["line"] for line in result["lines"]}
+
+
+def test_workbook_parser_supports_creation_kit_ods_context_fallback(
+    tmp_path: Path,
+) -> None:
+    workbook_path = tmp_path / "dialogue.ods"
+    content = """<?xml version="1.0" encoding="UTF-8"?>
+<office:document-content
+    xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+    xmlns:table="urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+    xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0">
+  <office:body>
+    <office:spreadsheet>
+      <table:table table:name="dialogueExport">
+        <table:table-row>
+          <table:table-cell><text:p>QUEST</text:p></table:table-cell>
+          <table:table-cell><text:p>TOPIC</text:p></table:table-cell>
+          <table:table-cell><text:p>TOPIC TEXT</text:p></table:table-cell>
+          <table:table-cell><text:p>RESPONSE TEXT</text:p></table:table-cell>
+          <table:table-cell><text:p>SCRIPT NOTES</text:p></table:table-cell>
+          <table:table-cell><text:p>EMOTION</text:p></table:table-cell>
+          <table:table-cell><text:p>FILENAME</text:p></table:table-cell>
+          <table:table-cell><text:p>VOICE TYPE</text:p></table:table-cell>
+        </table:table-row>
+        <table:table-row>
+          <table:table-cell><text:p>QuestOne</text:p></table:table-cell>
+          <table:table-cell><text:p>InternalTopic</text:p></table:table-cell>
+          <table:table-cell><text:p>Player-facing prompt</text:p></table:table-cell>
+          <table:table-cell><text:p>First response.</text:p></table:table-cell>
+          <table:table-cell><text:p>Friendly</text:p></table:table-cell>
+          <table:table-cell><text:p>Neutral 50</text:p></table:table-cell>
+          <table:table-cell><text:p>first_line</text:p></table:table-cell>
+          <table:table-cell><text:p>VoiceTypeOne</text:p></table:table-cell>
+        </table:table-row>
+        <table:table-row>
+          <table:table-cell/>
+          <table:table-cell><text:p>FallbackTopic</text:p></table:table-cell>
+          <table:table-cell/>
+          <table:table-cell><text:p>Second response.</text:p></table:table-cell>
+          <table:table-cell/>
+          <table:table-cell><text:p>Anger 25</text:p></table:table-cell>
+          <table:table-cell><text:p>second_line</text:p></table:table-cell>
+          <table:table-cell><text:p>VoiceTypeOne</text:p></table:table-cell>
+        </table:table-row>
+        <table:table-row>
+          <table:table-cell/>
+          <table:table-cell/>
+          <table:table-cell/>
+          <table:table-cell/>
+          <table:table-cell><text:p>Hmm...</text:p></table:table-cell>
+          <table:table-cell><text:p>Neutral 0</text:p></table:table-cell>
+          <table:table-cell><text:p>third_line</text:p></table:table-cell>
+          <table:table-cell><text:p>VoiceTypeOne</text:p></table:table-cell>
+        </table:table-row>
+        <table:table-row table:number-rows-repeated="1048572">
+          <table:table-cell table:number-columns-repeated="8"/>
+        </table:table-row>
+      </table:table>
+    </office:spreadsheet>
+  </office:body>
+</office:document-content>
+"""
+    with ZipFile(workbook_path, "w") as archive:
+        archive.writestr(
+            "mimetype",
+            "application/vnd.oasis.opendocument.spreadsheet",
+            compress_type=ZIP_STORED,
+        )
+        archive.writestr("content.xml", content)
+
+    result = parse_workbook(workbook_path)
+
+    assert result["line_count"] == 3
+    assert [line["context"] for line in result["lines"]] == [
+        "Player-facing prompt",
+        "FallbackTopic",
+        "",
+    ]
+    assert result["lines"][1]["quest"] == "QuestOne"
+    assert result["lines"][2]["line"] == "Hmm..."
+    assert result["lines"][2]["acting_note"] == "Hmm..."
+    assert result["sheets"][0]["voice_headers"] == [
+        "You are voicing VoiceTypeOne"
+    ]
+    assert result["sheets"][0]["line_ids"][-1] == "dialogueExport::R4"
+
+
 def test_new_project_settings_are_validated_and_merged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2876,7 +3017,7 @@ def test_v2_alignment_vad_thresholds_migrate_to_segmentation() -> None:
     )
 
 
-def test_generic_and_bandit_recordings_infer_narrow_sheet_mappings(
+def test_ambiguous_generic_recording_includes_both_sheets_and_needs_review(
     tmp_path: Path,
 ) -> None:
     source_data = {
@@ -2915,8 +3056,12 @@ def test_generic_and_bandit_recordings_infer_narrow_sheet_mappings(
     mappings = {session["id"]: session for session in sessions}
 
     assert mappings["arg_maleelfsly_generic_post_proc"]["sheets"] == [
-        "Any NPC using voice type ARG1RM"
+        "Any NPC using voice type ARG1RM",
+        "Лист1",
     ]
+    assert mappings["arg_maleelfsly_generic_post_proc"][
+        "needs_mapping_review"
+    ] is True
     assert mappings["arg_maleelfsly_combat_post_proc"]["sheets"] == ["Лист1"]
     assert mappings["arg_maleelfsly_banditgeneric_post_proc"]["sheets"] == [
         "Member of faction ARGBanditFact"
@@ -2924,7 +3069,11 @@ def test_generic_and_bandit_recordings_infer_narrow_sheet_mappings(
     assert mappings["arg_maleelfsly_banditcombat_post_proc"]["sheets"] == [
         "Лист2"
     ]
-    assert not any(session["needs_mapping_review"] for session in sessions)
+    assert not any(
+        session["needs_mapping_review"]
+        for session_id, session in mappings.items()
+        if session_id != "arg_maleelfsly_generic_post_proc"
+    )
 
 
 def test_exact_short_match_still_requires_resolved_ambiguity() -> None:
@@ -4656,6 +4805,75 @@ def test_secondary_near_complete_match_can_seed_fragment_join() -> None:
 
     recovered = next(action for action in joined if action["line_index"] == 1)
     assert recovered["transcript"] == "You should leave. Now."
+    assert recovered["fragment_join_provisional"] is False
+
+
+def test_missing_long_line_can_recover_from_fragments_assigned_elsewhere() -> None:
+    lines = [
+        {
+            "line_id": "target",
+            "line": (
+                "Akhori, dongo do-daibethe! Good to see you. "
+                "How are things at the docks?"
+            ),
+        },
+        {"line_id": "name", "line": "Akhori."},
+        {"line_id": "yoku", "line": "Dongo do-daibethe."},
+        {"line_id": "greeting", "line": "Good to see you."},
+        {
+            "line_id": "question",
+            "line": "How are things at the docks?",
+        },
+    ]
+    transcripts = [
+        "Akhori.",
+        "Dongo do-daibethe.",
+        "Good to see you.",
+        "How are things at the docks?",
+    ]
+    segments = [
+        {
+            "start_seconds": index * 1.2,
+            "end_seconds": index * 1.2 + 1.0,
+            "transcript": transcript,
+            "asr_probability": 0.95,
+        }
+        for index, transcript in enumerate(transcripts)
+    ]
+    actions = [
+        {
+            "type": "assigned",
+            "start_index": index,
+            "count": 1,
+            "line_index": index + 1,
+            "match_score": 100.0,
+            "transcript": transcript,
+            "duration_plausibility": 80.0,
+            "order_hint": 0.0,
+            "top_matches": [
+                {"line_index": index + 1, "match_score": 100.0}
+            ],
+        }
+        for index, transcript in enumerate(transcripts)
+    ]
+
+    joined = _multisentence_fragment_join_actions(
+        actions,
+        lines=lines,
+        base_segments=segments,
+        settings=_alignment_settings(
+            span_search={
+                "max_segments": 4,
+                "max_gap_seconds": 1.0,
+                "max_duration_seconds": 10.0,
+            }
+        ),
+    )
+
+    recovered = next(action for action in joined if action["line_index"] == 0)
+    assert recovered["start_index"] == 0
+    assert recovered["count"] == 4
+    assert recovered["fragment_line_seed"] is True
     assert recovered["fragment_join_provisional"] is False
 
 

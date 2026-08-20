@@ -11,7 +11,11 @@ from openpyxl.utils import get_column_letter
 
 from .review import load_line_review
 from .util import read_json, resolve_project_path
-from .workbook_io import _find_header_row
+from .workbook_io import (
+    _effective_spoken_line,
+    _find_header_row,
+    _find_header_row_for_data_row,
+)
 
 
 SUPPORTED_WORKBOOK_SUFFIXES = {".xlsx", ".xlsm"}
@@ -158,20 +162,22 @@ def export_retake_script(
     )
     temporary_path: Path | None = None
     try:
-        layouts: dict[str, tuple[int, dict[str, int]]] = {}
         for line in retake_lines:
             sheet_name = str(line["sheet"])
             if sheet_name not in workbook.sheetnames:
                 raise ValueError(
                     f"Source workbook no longer contains sheet {sheet_name!r}."
                 )
-            if sheet_name not in layouts:
-                layouts[sheet_name] = _find_header_row(workbook[sheet_name])
-            _, columns = layouts[sheet_name]
             worksheet = workbook[sheet_name]
             row_number = int(line["excel_row"])
-            workbook_line = _cell_text(
-                worksheet.cell(row_number, columns["line"]).value
+            _, columns = _find_header_row_for_data_row(
+                worksheet,
+                row_number,
+            )
+            workbook_line = _effective_spoken_line(
+                worksheet,
+                row_number,
+                columns,
             )
             workbook_filename = _cell_text(
                 worksheet.cell(row_number, columns["filename"]).value

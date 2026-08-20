@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dialogue-pipeline",
         description=(
-            "Split long voice recordings, align takes to an Excel script, "
+            "Split long voice recordings, align takes to a dialogue script, "
             "generate review data, and finalize selected assets."
         ),
     )

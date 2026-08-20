@@ -142,8 +142,16 @@ def infer_sessions(
                 if name not in set(generic_sheets) | named_sheets
             ]
         elif "generic" in stem_lower:
-            sheets = [speaking_sheet] if speaking_sheet else []
-            needs_review = not bool(sheets)
+            # A plain "generic" label is ambiguous in real recording packs:
+            # it is often used for one file containing both speaking and
+            # combat generics. Keep both candidate sheets in scope so lines
+            # are not silently excluded, but require the user to confirm the
+            # inferred mapping. Explicit "speakinggenerics" and
+            # "combatgenerics" names are handled above.
+            sheets = [
+                name for name in [speaking_sheet, combat_sheet] if name
+            ]
+            needs_review = True
         elif "combat" in stem_lower:
             sheets = [combat_sheet] if combat_sheet else []
             needs_review = not bool(sheets)

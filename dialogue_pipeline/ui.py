@@ -2347,7 +2347,7 @@ class DialogueReviewApp:
         workbook = filedialog.askopenfilename(
             title="Select lines spreadsheet",
             filetypes=[
-                ("Excel workbooks", "*.xlsm *.xlsx"),
+                ("Dialogue spreadsheets", "*.xlsm *.xlsx *.ods"),
                 ("All files", "*.*"),
             ],
             initialdir=str(project_dir.parent),

@@ -49,6 +49,10 @@ _INTERNAL_DEFAULTS: dict[str, Any] = {
     "fragment_join_provisional_min_ordered_score": 55.0,
     "fragment_join_provisional_min_token_precision": 0.65,
     "fragment_join_secondary_seed_min_match_score": 80.0,
+    "fragment_join_line_seed_min_partial_score": 92.0,
+    "fragment_join_line_seed_min_words": 3,
+    "fragment_join_line_seed_min_script_words": 6,
+    "fragment_join_line_seeds_per_line": 2,
     "fragment_join_complete_min_match_score": 72.0,
     "fragment_join_complete_min_ordered_score": 70.0,
     "fragment_join_complete_min_length_ratio": 0.75,
@@ -214,6 +218,18 @@ _GROUPED_KEYS: dict[tuple[str, ...], str] = {
     ),
     ("recovery", "secondary_seed_minimum_match_score"): (
         "fragment_join_secondary_seed_min_match_score"
+    ),
+    ("recovery", "line_seed_minimum_partial_score"): (
+        "fragment_join_line_seed_min_partial_score"
+    ),
+    ("recovery", "line_seed_minimum_words"): (
+        "fragment_join_line_seed_min_words"
+    ),
+    ("recovery", "line_seed_minimum_script_words"): (
+        "fragment_join_line_seed_min_script_words"
+    ),
+    ("recovery", "line_seeds_per_line"): (
+        "fragment_join_line_seeds_per_line"
     ),
     ("recovery", "complete", "minimum_match_score"): (
         "fragment_join_complete_min_match_score"
@@ -436,6 +452,9 @@ class AlignmentSettings(Mapping[str, Any]):
             "candidate_top_k",
             "fragment_join_max_actions",
             "fragment_join_max_segments",
+            "fragment_join_line_seed_min_words",
+            "fragment_join_line_seed_min_script_words",
+            "fragment_join_line_seeds_per_line",
             "reliable_boundary_window_tokens",
             "boundary_clause_consensus_max_words",
         ):
@@ -480,6 +499,7 @@ class AlignmentSettings(Mapping[str, Any]):
             "short_line_min_ordered_score",
             "fidelity_token_min_similarity",
             "fragment_join_fallback_min_match_score",
+            "fragment_join_line_seed_min_partial_score",
             "intra_segment_trim_min_match_score",
             "intra_segment_trim_min_ordered_score",
             "boundary_noise_cleanup_min_match_score",

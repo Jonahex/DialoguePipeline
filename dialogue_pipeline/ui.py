@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import queue
 import re
 import sys
@@ -29,7 +30,9 @@ from .project import (
     apply_project_settings,
     create_project,
     editable_project_settings,
+    inventory_by_path,
     load_project,
+    load_source_data,
 )
 from .retakes import export_retake_script
 from .review import (
@@ -46,7 +49,8 @@ from .review import (
 )
 from .segmentation import refresh_project_audio, segment_project
 from .transcription import transcribe_project, transcribe_segments_project
-from .util import project_file_from_arg, read_json, write_json
+from .util import project_file_from_arg, read_json, resolve_project_path, write_json
+from .workbook_io import lines_for_session
 
 
 APP_TITLE = "Dialogue VA Pipeline"
@@ -68,6 +72,99 @@ STATUS_COLORS = {
 }
 
 MULTIPLE_CONTEXTS_HEADER = "used in multiple contexts:"
+
+
+def _format_excel_rows(rows: Any) -> str:
+    """Format an exact Excel-row filter compactly for the mapping editor."""
+
+    values = sorted({int(row) for row in (rows or [])})
+    if not values:
+        return ""
+    ranges: list[str] = []
+    start = previous = values[0]
+    for value in values[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = value
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ", ".join(ranges)
+
+
+def _parse_excel_rows(value: str) -> list[int]:
+    """Parse comma-separated Excel rows and inclusive ranges."""
+
+    text = value.strip()
+    if not text:
+        return []
+    rows: set[int] = set()
+    for raw_part in text.split(","):
+        part = raw_part.strip()
+        if not part:
+            raise ValueError("Empty item in the Excel rows filter.")
+        match = re.fullmatch(r"(\d+)(?:\s*-\s*(\d+))?", part)
+        if not match:
+            raise ValueError(
+                f"Invalid Excel row item {part!r}. Use values such as 12, 18-24."
+            )
+        first = int(match.group(1))
+        last = int(match.group(2) or first)
+        if first < 1 or last < 1:
+            raise ValueError("Excel row numbers must be positive.")
+        if last < first:
+            raise ValueError(f"Excel row range {part!r} ends before it starts.")
+        rows.update(range(first, last + 1))
+    return sorted(rows)
+
+
+def _validate_session_mappings(
+    sessions: list[dict[str, Any]],
+    source_data: dict[str, Any],
+) -> None:
+    """Reject mappings that would make the downstream pipeline unusable."""
+
+    valid_sheets = {str(sheet["name"]) for sheet in source_data.get("sheets", [])}
+    enabled_count = 0
+    for session in sessions:
+        session_id = str(session.get("id") or "<unnamed recording>")
+        sheets = [str(sheet) for sheet in session.get("sheets") or []]
+        unknown = [sheet for sheet in sheets if sheet not in valid_sheets]
+        if unknown:
+            raise ValueError(
+                f"{session_id} refers to missing script sheet(s): "
+                + ", ".join(unknown)
+            )
+        if not session.get("enabled", True):
+            continue
+        enabled_count += 1
+        if not sheets:
+            raise ValueError(
+                f"Choose at least one script sheet for enabled recording "
+                f"{session_id}."
+            )
+        if not lines_for_session(source_data, session):
+            raise ValueError(
+                f"The mapping for {session_id} contains no script lines. "
+                "Check its sheets and optional Excel row filter."
+            )
+    if not enabled_count:
+        raise ValueError("Enable at least one audio recording before processing.")
+
+
+def _mapping_sheet_action_names(
+    *,
+    mapped_sheets: list[str],
+    available_sheets: list[str],
+    selected_sheet: str | None,
+) -> tuple[str, str]:
+    selected_action = (
+        "Remove" if selected_sheet in mapped_sheets else "Add"
+    )
+    remove_all = bool(mapped_sheets) and all(
+        sheet in mapped_sheets for sheet in available_sheets
+    )
+    return selected_action, "Remove All" if remove_all else "Add All"
 
 
 def _context_display_text(value: Any) -> str:
@@ -2221,6 +2318,13 @@ class DialogueReviewApp:
         self._candidate_line_id: str | None = None
         self.candidate_waveform: CandidateWaveformView | None = None
         self._open_candidate_roots: set[str] = set()
+        self._mapping_project: dict[str, Any] | None = None
+        self._mapping_source_data: dict[str, Any] | None = None
+        self._mapping_inventory: dict[Path, dict[str, Any]] = {}
+        self._mapping_reprocessing = False
+        self._mapping_session_id: str | None = None
+        self._mapping_row_values: dict[str, str] = {}
+        self._mapping_line_id_values: dict[str, list[str]] = {}
 
         self._configure_styles()
         self.show_start()
@@ -2268,6 +2372,13 @@ class DialogueReviewApp:
         self.selected_candidate_id = None
         self.selected_base_segment_id = None
         self._candidate_line_id = None
+        self._mapping_project = None
+        self._mapping_source_data = None
+        self._mapping_inventory = {}
+        self._mapping_reprocessing = False
+        self._mapping_session_id = None
+        self._mapping_row_values = {}
+        self._mapping_line_id_values = {}
 
         outer = ttk.Frame(self.root, padding=40)
         outer.pack(fill="both", expand=True)
@@ -2432,6 +2543,591 @@ class DialogueReviewApp:
             submit_label="Reprocess Project" if reprocessing else "Create Project",
         ).result
 
+    def show_session_mapping_review(
+        self,
+        project_dir: Path,
+        *,
+        reprocessing: bool,
+    ) -> None:
+        """Pause processing so every recording-to-sheet mapping can be confirmed."""
+
+        loaded_dir, project = load_project(project_file_from_arg(project_dir))
+        source_data = load_source_data(loaded_dir, project)
+        inventory = inventory_by_path(loaded_dir, project)
+        sessions = list(project.get("sessions") or [])
+        if not sessions:
+            raise ValueError("The audio inventory contains no recording sessions.")
+
+        self._clear()
+        self.project_dir = loaded_dir
+        self._mapping_project = copy.deepcopy(project)
+        session_ids: set[str] = set()
+        for session in self._mapping_project.get("sessions") or []:
+            session_id = str(session.get("id") or "")
+            if not session_id:
+                raise ValueError("An inventoried audio session has no ID.")
+            if session_id in session_ids:
+                raise ValueError(f"Duplicate audio session ID: {session_id}")
+            session_ids.add(session_id)
+            session["sheets"] = list(
+                dict.fromkeys(str(sheet) for sheet in session.get("sheets") or [])
+            )
+        self._mapping_source_data = source_data
+        self._mapping_inventory = inventory
+        self._mapping_reprocessing = reprocessing
+        self._mapping_session_id = None
+        self._mapping_row_values = {
+            str(session["id"]): _format_excel_rows(session.get("excel_rows"))
+            for session in sessions
+        }
+        self._mapping_line_id_values = {
+            str(session["id"]): [str(value) for value in session.get("line_ids") or []]
+            for session in sessions
+        }
+
+        outer = ttk.Frame(self.root, padding=20)
+        outer.pack(fill="both", expand=True)
+        heading = ttk.Frame(outer)
+        heading.pack(fill="x", pady=(0, 6))
+        ttk.Label(
+            heading,
+            text="Review Audio / Script Matching",
+            style="Title.TLabel",
+        ).pack(side="left")
+        ttk.Label(
+            outer,
+            text=(
+                "Confirm which workbook sheets are spoken in each recording. "
+                "Processing will begin only after these mappings are saved."
+            ),
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(0, 14))
+
+        panes = ttk.Panedwindow(outer, orient="horizontal")
+        panes.pack(fill="both", expand=True)
+        recordings = ttk.Labelframe(panes, text="Audio recordings", padding=8)
+        mapping = ttk.Labelframe(panes, text="Selected recording", padding=12)
+        panes.add(recordings, weight=2)
+        panes.add(mapping, weight=3)
+
+        recording_columns = ("enabled", "audio", "duration", "sheets", "state")
+        self.mapping_recording_tree = ttk.Treeview(
+            recordings,
+            columns=recording_columns,
+            show="headings",
+            selectmode="browse",
+        )
+        for column, label, width, anchor in (
+            ("enabled", "Use", 55, "center"),
+            ("audio", "Audio file", 210, "w"),
+            ("duration", "Length", 70, "e"),
+            ("sheets", "Script sheets", 280, "w"),
+            ("state", "Mapping", 85, "center"),
+        ):
+            self.mapping_recording_tree.heading(column, text=label)
+            self.mapping_recording_tree.column(
+                column,
+                width=width,
+                minwidth=45,
+                anchor=anchor,
+                stretch=column in {"audio", "sheets"},
+            )
+        recording_scroll = ttk.Scrollbar(
+            recordings,
+            orient="vertical",
+            command=self.mapping_recording_tree.yview,
+        )
+        self.mapping_recording_tree.configure(yscrollcommand=recording_scroll.set)
+        self.mapping_recording_tree.pack(side="left", fill="both", expand=True)
+        recording_scroll.pack(side="right", fill="y")
+        self.mapping_recording_tree.tag_configure("review", background="#fef3c7")
+        self.mapping_recording_tree.tag_configure("disabled", foreground="#64748b")
+        self.mapping_recording_tree.bind(
+            "<<TreeviewSelect>>",
+            self._mapping_recording_selected,
+        )
+
+        self.mapping_audio_name = tk.StringVar(value="")
+        self.mapping_audio_details = tk.StringVar(value="")
+        ttk.Label(
+            mapping,
+            textvariable=self.mapping_audio_name,
+            style="Heading.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            mapping,
+            textvariable=self.mapping_audio_details,
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(2, 10))
+
+        self.mapping_enabled = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            mapping,
+            text="Use this recording during processing",
+            variable=self.mapping_enabled,
+            command=self._mapping_enabled_changed,
+        ).pack(anchor="w", pady=(0, 10))
+
+        row_filter = ttk.Frame(mapping)
+        row_filter.pack(fill="x", pady=(0, 10))
+        ttk.Label(row_filter, text="Excel rows (optional):").pack(side="left")
+        self.mapping_rows = tk.StringVar(value="")
+        row_entry = ttk.Entry(row_filter, textvariable=self.mapping_rows, width=30)
+        row_entry.pack(side="left", padx=(8, 8))
+        row_entry.bind("<FocusOut>", self._mapping_rows_changed)
+        row_entry.bind("<Return>", self._mapping_rows_changed)
+        ttk.Label(
+            row_filter,
+            text="Example: 12, 18-24. Blank includes every dialogue row.",
+            style="Muted.TLabel",
+        ).pack(side="left")
+
+        self.mapping_keep_line_ids = tk.BooleanVar(value=False)
+        self.mapping_line_id_label = tk.StringVar(value="")
+        self.mapping_line_id_check = ttk.Checkbutton(
+            mapping,
+            textvariable=self.mapping_line_id_label,
+            variable=self.mapping_keep_line_ids,
+            command=self._mapping_line_ids_changed,
+        )
+        self.mapping_line_id_check.pack(anchor="w", pady=(0, 10))
+
+        ttk.Label(
+            mapping,
+            text="Workbook sheets (double-click or press Space to add/remove):",
+            style="FieldName.TLabel",
+        ).pack(anchor="w", pady=(0, 5))
+        sheet_frame = ttk.Frame(mapping)
+        sheet_frame.pack(fill="both", expand=True)
+        sheet_columns = ("mapped", "order", "sheet", "lines", "voice")
+        self.mapping_sheet_tree = ttk.Treeview(
+            sheet_frame,
+            columns=sheet_columns,
+            show="headings",
+            selectmode="browse",
+        )
+        for column, label, width, anchor in (
+            ("mapped", "Mapped", 70, "center"),
+            ("order", "Order", 55, "center"),
+            ("sheet", "Sheet", 170, "w"),
+            ("lines", "Lines", 60, "e"),
+            ("voice", "Voice / section", 300, "w"),
+        ):
+            self.mapping_sheet_tree.heading(column, text=label)
+            self.mapping_sheet_tree.column(
+                column,
+                width=width,
+                minwidth=45,
+                anchor=anchor,
+                stretch=column in {"sheet", "voice"},
+            )
+        sheet_scroll = ttk.Scrollbar(
+            sheet_frame,
+            orient="vertical",
+            command=self.mapping_sheet_tree.yview,
+        )
+        self.mapping_sheet_tree.configure(yscrollcommand=sheet_scroll.set)
+        self.mapping_sheet_tree.pack(side="left", fill="both", expand=True)
+        sheet_scroll.pack(side="right", fill="y")
+        self.mapping_sheet_tree.tag_configure("mapped", background="#dcfce7")
+        self.mapping_sheet_tree.tag_configure("missing", background="#fee2e2")
+        self.mapping_sheet_tree.bind("<Double-1>", self._mapping_sheet_double_click)
+        self.mapping_sheet_tree.bind("<space>", self._mapping_sheet_space)
+        self.mapping_sheet_tree.bind(
+            "<<TreeviewSelect>>",
+            self._update_mapping_sheet_actions,
+        )
+
+        sheet_controls = ttk.Frame(mapping)
+        sheet_controls.pack(fill="x", pady=(8, 0))
+        self.mapping_sheet_action_label = tk.StringVar(value="Add")
+        self.mapping_sheet_action_button = ttk.Button(
+            sheet_controls,
+            textvariable=self.mapping_sheet_action_label,
+            command=self._toggle_selected_mapping_sheet,
+        )
+        self.mapping_sheet_action_button.pack(side="left")
+        self.mapping_all_sheets_action_label = tk.StringVar(value="Add All")
+        self.mapping_all_sheets_action_button = ttk.Button(
+            sheet_controls,
+            textvariable=self.mapping_all_sheets_action_label,
+            command=self._toggle_all_mapping_sheets,
+        )
+        self.mapping_all_sheets_action_button.pack(side="left", padx=(8, 0))
+        ttk.Button(
+            sheet_controls,
+            text="Move Up",
+            command=lambda: self._move_mapping_sheet(-1),
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            sheet_controls,
+            text="Move Down",
+            command=lambda: self._move_mapping_sheet(1),
+        ).pack(side="left", padx=(8, 0))
+        self.mapping_line_summary = tk.StringVar(value="")
+        ttk.Label(
+            sheet_controls,
+            textvariable=self.mapping_line_summary,
+            style="Muted.TLabel",
+        ).pack(side="right")
+
+        footer = ttk.Frame(outer)
+        footer.pack(fill="x", pady=(14, 0))
+        ttk.Label(
+            footer,
+            text=(
+                "Yellow recordings were inferred ambiguously and especially need "
+                "review. Disabled recordings are kept in the project but skipped."
+            ),
+            style="Muted.TLabel",
+        ).pack(side="left")
+        ttk.Button(
+            footer,
+            text="Back to Start",
+            command=self.show_start,
+        ).pack(side="right")
+        ttk.Button(
+            footer,
+            text="Confirm Mappings and Process",
+            style="Primary.TButton",
+            command=self._confirm_session_mappings,
+        ).pack(side="right", padx=(0, 8), ipady=3)
+
+        self._refresh_mapping_recordings()
+        first_session_id = str(sessions[0]["id"])
+        self.mapping_recording_tree.selection_set(first_session_id)
+        self.mapping_recording_tree.focus(first_session_id)
+        self.mapping_recording_tree.see(first_session_id)
+        self._show_mapping_session(first_session_id)
+
+    def _mapping_sessions(self) -> list[dict[str, Any]]:
+        if self._mapping_project is None:
+            return []
+        return list(self._mapping_project.get("sessions") or [])
+
+    def _mapping_session(self, session_id: str | None = None) -> dict[str, Any] | None:
+        wanted = session_id or self._mapping_session_id
+        return next(
+            (
+                session
+                for session in self._mapping_sessions()
+                if str(session.get("id")) == wanted
+            ),
+            None,
+        )
+
+    def _remember_mapping_rows(self) -> None:
+        if self._mapping_session_id and hasattr(self, "mapping_rows"):
+            value = self.mapping_rows.get()
+            self._mapping_row_values[self._mapping_session_id] = value
+            session = self._mapping_session()
+            if session is not None:
+                try:
+                    session["excel_rows"] = _parse_excel_rows(value)
+                except ValueError:
+                    pass
+
+    def _refresh_mapping_recordings(self) -> None:
+        if self._mapping_project is None or self._mapping_source_data is None:
+            return
+        selected = self._mapping_session_id
+        self.mapping_recording_tree.delete(*self.mapping_recording_tree.get_children())
+        for session in self._mapping_sessions():
+            session_id = str(session["id"])
+            audio_path = resolve_project_path(
+                self.project_dir or Path.cwd(),
+                str(session["audio"]),
+            )
+            metadata = self._mapping_inventory.get(audio_path.resolve(), {})
+            duration = metadata.get("duration_seconds")
+            duration_text = f"{float(duration) / 60:.1f} min" if duration is not None else "—"
+            sheets = list(session.get("sheets") or [])
+            enabled = bool(session.get("enabled", True))
+            state = "Review" if session.get("needs_mapping_review") else "Inferred"
+            if not enabled:
+                state = "Skipped"
+            tags = (
+                "disabled" if not enabled else "review" if session.get("needs_mapping_review") else "",
+            )
+            self.mapping_recording_tree.insert(
+                "",
+                "end",
+                iid=session_id,
+                values=(
+                    "Yes" if enabled else "No",
+                    audio_path.name,
+                    duration_text,
+                    " → ".join(str(sheet) for sheet in sheets) or "(none)",
+                    state,
+                ),
+                tags=tuple(tag for tag in tags if tag),
+            )
+        if selected and self.mapping_recording_tree.exists(selected):
+            self.mapping_recording_tree.selection_set(selected)
+
+    def _mapping_recording_selected(self, _event: tk.Event[Any]) -> None:
+        selection = self.mapping_recording_tree.selection()
+        if not selection:
+            return
+        session_id = str(selection[0])
+        if session_id == self._mapping_session_id:
+            return
+        self._remember_mapping_rows()
+        self._show_mapping_session(session_id)
+
+    def _show_mapping_session(self, session_id: str) -> None:
+        session = self._mapping_session(session_id)
+        if session is None or self._mapping_source_data is None:
+            return
+        self._mapping_session_id = session_id
+        audio_path = resolve_project_path(
+            self.project_dir or Path.cwd(),
+            str(session["audio"]),
+        )
+        metadata = self._mapping_inventory.get(audio_path.resolve(), {})
+        detail_parts = [str(audio_path)]
+        if metadata:
+            detail_parts.append(
+                f"{float(metadata.get('duration_seconds') or 0):.1f} s, "
+                f"{int(metadata.get('sample_rate') or 0)} Hz, "
+                f"{int(metadata.get('channels') or 0)} channel(s)"
+            )
+        detail_parts.append(f"pass: {session.get('pass') or 'main'}")
+        self.mapping_audio_name.set(audio_path.name)
+        self.mapping_audio_details.set("  •  ".join(detail_parts))
+        self.mapping_enabled.set(bool(session.get("enabled", True)))
+        self.mapping_rows.set(self._mapping_row_values.get(session_id, ""))
+        exact_id_count = len(self._mapping_line_id_values.get(session_id, []))
+        self.mapping_keep_line_ids.set(bool(session.get("line_ids")))
+        self.mapping_line_id_label.set(
+            f"Keep {exact_id_count} existing exact line ID filter(s)"
+            if exact_id_count
+            else "No exact line ID filters"
+        )
+        self.mapping_line_id_check.configure(
+            state="normal" if exact_id_count else "disabled"
+        )
+        self._refresh_mapping_sheet_tree()
+
+    def _mapping_enabled_changed(self) -> None:
+        session = self._mapping_session()
+        if session is None:
+            return
+        session["enabled"] = bool(self.mapping_enabled.get())
+        self._refresh_mapping_recordings()
+
+    def _mapping_rows_changed(self, _event: tk.Event[Any]) -> None:
+        session = self._mapping_session()
+        if session is None or self._mapping_session_id is None:
+            return
+        value = self.mapping_rows.get()
+        self._mapping_row_values[self._mapping_session_id] = value
+        try:
+            session["excel_rows"] = _parse_excel_rows(value)
+        except ValueError:
+            return
+        self._refresh_mapping_sheet_tree()
+
+    def _mapping_line_ids_changed(self) -> None:
+        session = self._mapping_session()
+        if session is None or self._mapping_session_id is None:
+            return
+        session["line_ids"] = (
+            list(self._mapping_line_id_values.get(self._mapping_session_id, []))
+            if self.mapping_keep_line_ids.get()
+            else []
+        )
+        self._refresh_mapping_sheet_tree()
+
+    def _refresh_mapping_sheet_tree(self) -> None:
+        session = self._mapping_session()
+        if session is None or self._mapping_source_data is None:
+            return
+        selected_sheet = next(iter(self.mapping_sheet_tree.selection()), None)
+        mapped = [str(sheet) for sheet in session.get("sheets") or []]
+        sheet_by_name = {
+            str(sheet["name"]): sheet
+            for sheet in self._mapping_source_data.get("sheets", [])
+        }
+        display_order = [
+            *mapped,
+            *[sheet for sheet in sheet_by_name if sheet not in mapped],
+        ]
+        self.mapping_sheet_tree.delete(*self.mapping_sheet_tree.get_children())
+        for sheet_name in display_order:
+            sheet = sheet_by_name.get(sheet_name)
+            is_mapped = sheet_name in mapped
+            is_missing = sheet is None
+            self.mapping_sheet_tree.insert(
+                "",
+                "end",
+                iid=sheet_name,
+                values=(
+                    "Yes" if is_mapped else "",
+                    mapped.index(sheet_name) + 1 if is_mapped else "",
+                    sheet_name,
+                    int(sheet.get("line_count") or 0) if sheet else 0,
+                    (
+                        str(sheet.get("voice_header") or "")
+                        if sheet
+                        else "Missing from current workbook — remove this mapping"
+                    ),
+                ),
+                tags=("missing",) if is_missing else ("mapped",) if is_mapped else (),
+            )
+        if selected_sheet and self.mapping_sheet_tree.exists(selected_sheet):
+            self.mapping_sheet_tree.selection_set(selected_sheet)
+        line_count = len(lines_for_session(self._mapping_source_data, session))
+        exact_ids = len(session.get("line_ids") or [])
+        summary = f"{line_count} mapped line(s)"
+        if exact_ids:
+            summary += f"; {exact_ids} exact line ID filter(s) retained"
+        self.mapping_line_summary.set(summary)
+        self._update_mapping_sheet_actions()
+        self._refresh_mapping_recordings()
+
+    def _update_mapping_sheet_actions(
+        self,
+        _event: tk.Event[Any] | None = None,
+    ) -> None:
+        session = self._mapping_session()
+        if session is None or self._mapping_source_data is None:
+            return
+        selection = self.mapping_sheet_tree.selection()
+        selected_sheet = str(selection[0]) if selection else None
+        mapped = [str(sheet) for sheet in session.get("sheets") or []]
+        available = [
+            str(sheet["name"])
+            for sheet in self._mapping_source_data.get("sheets", [])
+        ]
+        selected_action, all_action = _mapping_sheet_action_names(
+            mapped_sheets=mapped,
+            available_sheets=available,
+            selected_sheet=selected_sheet,
+        )
+        self.mapping_sheet_action_label.set(selected_action)
+        self.mapping_sheet_action_button.configure(
+            state="normal" if selected_sheet else "disabled"
+        )
+        self.mapping_all_sheets_action_label.set(all_action)
+        self.mapping_all_sheets_action_button.configure(
+            state="normal" if available or mapped else "disabled"
+        )
+
+    def _mapping_sheet_double_click(self, event: tk.Event[Any]) -> None:
+        item = self.mapping_sheet_tree.identify_row(event.y)
+        if item:
+            self.mapping_sheet_tree.selection_set(item)
+            self._toggle_selected_mapping_sheet()
+
+    def _mapping_sheet_space(self, _event: tk.Event[Any]) -> str:
+        self._toggle_selected_mapping_sheet()
+        return "break"
+
+    def _toggle_selected_mapping_sheet(self) -> None:
+        session = self._mapping_session()
+        selection = self.mapping_sheet_tree.selection()
+        if session is None or not selection:
+            return
+        sheet_name = str(selection[0])
+        mapped = [str(sheet) for sheet in session.get("sheets") or []]
+        if sheet_name in mapped:
+            mapped.remove(sheet_name)
+        else:
+            mapped.append(sheet_name)
+        session["sheets"] = mapped
+        self._refresh_mapping_sheet_tree()
+
+    def _toggle_all_mapping_sheets(self) -> None:
+        session = self._mapping_session()
+        if session is None or self._mapping_source_data is None:
+            return
+        mapped = [str(sheet) for sheet in session.get("sheets") or []]
+        available = [
+            str(sheet["name"])
+            for sheet in self._mapping_source_data.get("sheets", [])
+        ]
+        _selected_action, all_action = _mapping_sheet_action_names(
+            mapped_sheets=mapped,
+            available_sheets=available,
+            selected_sheet=None,
+        )
+        if all_action == "Remove All":
+            session["sheets"] = []
+        else:
+            session["sheets"] = [
+                *mapped,
+                *[sheet for sheet in available if sheet not in mapped],
+            ]
+        self._refresh_mapping_sheet_tree()
+
+    def _move_mapping_sheet(self, direction: int) -> None:
+        session = self._mapping_session()
+        selection = self.mapping_sheet_tree.selection()
+        if session is None or not selection:
+            return
+        sheet_name = str(selection[0])
+        mapped = [str(sheet) for sheet in session.get("sheets") or []]
+        if sheet_name not in mapped:
+            return
+        current = mapped.index(sheet_name)
+        destination = current + direction
+        if destination < 0 or destination >= len(mapped):
+            return
+        mapped[current], mapped[destination] = mapped[destination], mapped[current]
+        session["sheets"] = mapped
+        self._refresh_mapping_sheet_tree()
+        self.mapping_sheet_tree.selection_set(sheet_name)
+        self.mapping_sheet_tree.see(sheet_name)
+
+    def _confirm_session_mappings(self) -> None:
+        if self._mapping_project is None or self._mapping_source_data is None:
+            return
+        self._remember_mapping_rows()
+        try:
+            for session in self._mapping_sessions():
+                session_id = str(session["id"])
+                session["excel_rows"] = _parse_excel_rows(
+                    self._mapping_row_values.get(session_id, "")
+                )
+            _validate_session_mappings(
+                self._mapping_sessions(),
+                self._mapping_source_data,
+            )
+        except ValueError as error:
+            messagebox.showerror(
+                "Cannot save mappings",
+                str(error),
+                parent=self.root,
+            )
+            return
+
+        for session in self._mapping_sessions():
+            session["needs_mapping_review"] = False
+        project_dir = self.project_dir
+        if project_dir is None:
+            return
+        try:
+            write_json(project_dir / "project.json", self._mapping_project)
+        except Exception as error:
+            messagebox.showerror(
+                "Cannot save mappings",
+                str(error),
+                parent=self.root,
+            )
+            return
+        reprocessing = self._mapping_reprocessing
+        self._mapping_project = None
+        self._mapping_source_data = None
+        self._mapping_inventory = {}
+        self._mapping_session_id = None
+        self._mapping_row_values = {}
+        self._mapping_line_id_values = {}
+        self._continue_project_processing(
+            project_dir,
+            reprocessing=reprocessing,
+        )
+
     def open_project(self, project_dir: Path) -> None:
         project_dir = project_dir.resolve()
         review_path = project_dir / REVIEW_FILE_NAME
@@ -2464,34 +3160,25 @@ class DialogueReviewApp:
         project_dir: Path,
         project_settings: dict[str, Any],
     ) -> None:
-        self.show_progress(project_dir, title="Creating project")
+        self.show_progress(project_dir, title="Building project inventory")
 
         def work() -> Path:
             check_processing_cancelled()
-            print("[phase 1/5] Creating project and inventory", flush=True)
-            project = create_project(
+            print("Creating project and inventorying source audio.", flush=True)
+            create_project(
                 workbook_path=workbook_path,
                 audio_dir=audio_dir,
                 project_dir=project_dir,
                 project_settings=project_settings,
             )
             check_processing_cancelled()
-            print("[phase 2/5] Transcribing source recordings", flush=True)
-            transcribe_project(project_dir=project_dir, project=project)
-            check_processing_cancelled()
-            print("[phase 3/5] Segmenting recordings", flush=True)
-            segment_project(project_dir=project_dir, project=project)
-            check_processing_cancelled()
-            print("[phase 4/5] Transcribing temporary segments", flush=True)
-            transcribe_segments_project(project_dir=project_dir, project=project)
-            check_processing_cancelled()
-            print("[phase 5/5] Aligning segments to script lines", flush=True)
-            align_project(project_dir=project_dir, project=project)
-            check_processing_cancelled()
-            print("Pipeline complete.", flush=True)
-            return project_dir
+            print("Audio inventory complete. Review session mappings next.", flush=True)
+            return project_dir.resolve()
 
-        self._start_worker(work, self._pipeline_finished)
+        self._start_worker(
+            work,
+            lambda path: self._inventory_finished(path, reprocessing=False),
+        )
 
     def run_existing_project(
         self,
@@ -2499,7 +3186,7 @@ class DialogueReviewApp:
         project_settings: dict[str, Any],
     ) -> None:
         """Rerun an existing project without recreating or clearing it."""
-        self.show_progress(project_dir, title="Reprocessing project")
+        self.show_progress(project_dir, title="Preparing project for reprocessing")
 
         def work() -> Path:
             check_processing_cancelled()
@@ -2513,19 +3200,67 @@ class DialogueReviewApp:
                 "and cached artifacts.",
                 flush=True,
             )
-            print("[phase 1/4] Transcribing source recordings", flush=True)
-            transcribe_project(project_dir=loaded_dir, project=project)
             check_processing_cancelled()
-            print("[phase 2/4] Segmenting recordings", flush=True)
-            segment_project(project_dir=loaded_dir, project=project)
-            check_processing_cancelled()
-            print("[phase 3/4] Transcribing temporary segments", flush=True)
-            transcribe_segments_project(project_dir=loaded_dir, project=project)
-            check_processing_cancelled()
-            print("[phase 4/4] Aligning segments to script lines", flush=True)
-            align_project(project_dir=loaded_dir, project=project)
-            check_processing_cancelled()
-            print("Project reprocessing complete.", flush=True)
+            print("Audio inventory is ready. Review session mappings next.", flush=True)
+            return loaded_dir
+
+        self._start_worker(
+            work,
+            lambda path: self._inventory_finished(path, reprocessing=True),
+        )
+
+    def _run_pipeline_stages(
+        self,
+        project_dir: Path,
+        project: dict[str, Any],
+        *,
+        reprocessing: bool,
+    ) -> None:
+        check_processing_cancelled()
+        print("[phase 1/4] Transcribing source recordings", flush=True)
+        transcribe_project(project_dir=project_dir, project=project)
+        check_processing_cancelled()
+        print("[phase 2/4] Segmenting recordings", flush=True)
+        segment_project(project_dir=project_dir, project=project)
+        check_processing_cancelled()
+        print("[phase 3/4] Transcribing temporary segments", flush=True)
+        transcribe_segments_project(project_dir=project_dir, project=project)
+        check_processing_cancelled()
+        print("[phase 4/4] Aligning segments to script lines", flush=True)
+        align_project(project_dir=project_dir, project=project)
+        check_processing_cancelled()
+        print(
+            "Project reprocessing complete." if reprocessing else "Pipeline complete.",
+            flush=True,
+        )
+
+    def _inventory_finished(self, project_dir: Path, *, reprocessing: bool) -> None:
+        try:
+            self.show_session_mapping_review(
+                project_dir,
+                reprocessing=reprocessing,
+            )
+        except Exception as error:
+            self._pipeline_failed(error)
+
+    def _continue_project_processing(
+        self,
+        project_dir: Path,
+        *,
+        reprocessing: bool,
+    ) -> None:
+        self.show_progress(
+            project_dir,
+            title="Reprocessing project" if reprocessing else "Processing project",
+        )
+
+        def work() -> Path:
+            loaded_dir, project = load_project(project_file_from_arg(project_dir))
+            self._run_pipeline_stages(
+                loaded_dir,
+                project,
+                reprocessing=reprocessing,
+            )
             return loaded_dir
 
         self._start_worker(work, self._pipeline_finished)

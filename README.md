@@ -63,16 +63,25 @@ The desktop app is the recommended way to use the pipeline:
    the recorded WAV files.
 4. Review the project settings. Settings are grouped into General,
    Transcription, Segment Transcription, Segmentation, Alignment, and Export.
-5. Start processing. The app inventories the audio, transcribes it, creates
-   candidate segments, aligns them to script lines, and opens the review screen.
+5. Start project creation. The app inventories the workbook and audio, then
+   opens **Review Audio / Script Matching** before any transcription begins.
+6. For every recording, confirm whether it is enabled and which workbook
+   sheets it contains. Add, remove, reorder, or map/unmap all sheets at once,
+   and optionally restrict the mapping to exact Excel rows such as `12, 18-24`.
+   Existing projects also
+   let you retain or clear any exact line-ID filter already on a recording.
+7. Select **Confirm Mappings and Process**. The app transcribes the audio,
+   creates candidate segments, aligns them to script lines, and opens the line
+   review screen.
 
 Processing runs in the background and displays a log. **Cancel** stops at the
 next safe processing boundary and returns to the start screen.
 
-When processing a new project for the first time, review the generated session
-mappings in `project.json`. Each session associates a source recording with the
-workbook sheets or row ranges expected in that recording. Incorrect mappings
-will produce poor candidate assignments.
+The matching screen is mandatory for both new projects and reprocessing. It
+shows the inferred mappings (ambiguous ones in yellow), audio metadata, sheet
+line counts, and any existing exact-line filters. Disabled recordings remain in
+the project but are skipped. Confirmed mappings are saved to the `sessions`
+section of `project.json`.
 
 ### Open an existing project
 

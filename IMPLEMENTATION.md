@@ -55,6 +55,17 @@ project metadata.
 Cancellation is cooperative. Inventory, ASR, segmentation, and alignment check
 for cancellation at safe boundaries rather than interrupting file writes.
 
+The desktop workflow has a mandatory mapping gate between inventory and ASR.
+After a new project's workbook and audio inventory are written, or after an
+existing project's reprocessing settings are saved, the app presents every
+audio session alongside the available workbook sheets. The user can enable or
+disable a session, add/remove/reorder sheets, edit the optional exact Excel row
+filter, and retain or clear an existing exact line-ID filter. Confirmation
+validates that each enabled session resolves to at least one source line,
+clears `needs_mapping_review`, persists `project.json`, and only then starts
+transcription. Reprocessing uses the same gate and retains the existing mapping
+as its editable starting point.
+
 ## Audio inventory, normalization, and refresh
 
 The inventory records hashes, duration, sample rate, channels, bit depth, and

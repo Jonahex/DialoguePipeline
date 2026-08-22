@@ -100,7 +100,10 @@ from dialogue_pipeline.ui import (
     _candidate_take_groups,
     _context_display_text,
     _first_line_base_segment_key,
+    _format_excel_rows,
     _initial_segment_window,
+    _mapping_sheet_action_names,
+    _parse_excel_rows,
     _panned_sample_window,
     _playback_samples,
     _project_settings_from_values,
@@ -109,6 +112,7 @@ from dialogue_pipeline.ui import (
     _selected_line_ids_by_segment,
     _sounddevice_output_options,
     _uses_unmatched_candidates,
+    _validate_session_mappings,
     _zoomed_sample_window,
 )
 from dialogue_pipeline.util import (
@@ -2271,6 +2275,199 @@ def test_create_button_shows_existing_settings_before_reprocessing(
     assert selected == [(project_dir.resolve(), shown[0][0])]
 
 
+def test_mapping_row_filter_round_trip_and_validation() -> None:
+    assert _format_excel_rows([24, 18, 19, 20, 12, 12]) == "12, 18-20, 24"
+    assert _parse_excel_rows("12, 18 - 20, 24") == [12, 18, 19, 20, 24]
+    assert _parse_excel_rows("  ") == []
+    with pytest.raises(ValueError, match="ends before"):
+        _parse_excel_rows("24-18")
+    with pytest.raises(ValueError, match="Invalid Excel row"):
+        _parse_excel_rows("12, all")
+
+    source_data = {
+        "sheets": [
+            {"name": "First"},
+            {"name": "Second"},
+        ],
+        "lines": [
+            {"line_id": "First::R12", "sheet": "First", "excel_row": 12},
+            {"line_id": "Second::R18", "sheet": "Second", "excel_row": 18},
+        ],
+    }
+    sessions = [
+        {
+            "id": "main",
+            "enabled": True,
+            "sheets": ["First"],
+            "excel_rows": [12],
+            "line_ids": [],
+        },
+        {
+            "id": "unused",
+            "enabled": False,
+            "sheets": [],
+            "excel_rows": [],
+            "line_ids": [],
+        },
+    ]
+    _validate_session_mappings(sessions, source_data)
+
+    sessions[0]["excel_rows"] = [999]
+    with pytest.raises(ValueError, match="contains no script lines"):
+        _validate_session_mappings(sessions, source_data)
+    sessions[0]["excel_rows"] = []
+    sessions[0]["sheets"] = ["Missing"]
+    with pytest.raises(ValueError, match="missing script sheet"):
+        _validate_session_mappings(sessions, source_data)
+
+
+def test_mapping_sheet_actions_follow_selection_and_bulk_state() -> None:
+    assert _mapping_sheet_action_names(
+        mapped_sheets=["First"],
+        available_sheets=["First", "Second"],
+        selected_sheet="First",
+    ) == ("Remove", "Add All")
+    assert _mapping_sheet_action_names(
+        mapped_sheets=["First"],
+        available_sheets=["First", "Second"],
+        selected_sheet="Second",
+    ) == ("Add", "Add All")
+    assert _mapping_sheet_action_names(
+        mapped_sheets=["First", "Second"],
+        available_sheets=["First", "Second"],
+        selected_sheet="Second",
+    ) == ("Remove", "Remove All")
+
+    session = {"id": "actor", "sheets": ["Second"]}
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    app._mapping_project = {"sessions": [session]}
+    app._mapping_source_data = {
+        "sheets": [{"name": "First"}, {"name": "Second"}]
+    }
+    app._mapping_session_id = "actor"
+    refreshes = []
+    app._refresh_mapping_sheet_tree = lambda: refreshes.append(True)
+
+    app._toggle_all_mapping_sheets()
+    assert session["sheets"] == ["Second", "First"]
+    app._toggle_all_mapping_sheets()
+    assert session["sheets"] == []
+    assert len(refreshes) == 2
+
+
+def test_new_project_pauses_for_mapping_review_after_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.ui as ui_module
+
+    project_dir = tmp_path / "project"
+    calls = []
+    monkeypatch.setattr(
+        ui_module,
+        "create_project",
+        lambda **_kwargs: calls.append("inventory") or {},
+    )
+    monkeypatch.setattr(
+        ui_module,
+        "transcribe_project",
+        lambda **_kwargs: pytest.fail("Transcription must wait for mapping review"),
+    )
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    app.show_progress = lambda path, *, title: calls.append((path, title))
+    app._inventory_finished = lambda path, *, reprocessing: calls.append(
+        (path, reprocessing)
+    )
+    app._start_worker = lambda function, callback: callback(function())
+
+    app.run_new_project(
+        workbook_path=tmp_path / "lines.xlsx",
+        audio_dir=tmp_path / "audio",
+        project_dir=project_dir,
+        project_settings={},
+    )
+
+    assert calls == [
+        (project_dir, "Building project inventory"),
+        "inventory",
+        (project_dir.resolve(), False),
+    ]
+
+
+def test_reprocessing_pauses_for_mapping_review_before_transcription(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.ui as ui_module
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    write_json(project_dir / "project.json", {"schema_version": 1})
+    monkeypatch.setattr(
+        ui_module,
+        "transcribe_project",
+        lambda **_kwargs: pytest.fail("Transcription must wait for mapping review"),
+    )
+    calls = []
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    app.root = object()
+    app.show_progress = lambda path, *, title: calls.append((path, title))
+    app._inventory_finished = lambda path, *, reprocessing: calls.append(
+        (path, reprocessing)
+    )
+    app._start_worker = lambda function, callback: callback(function())
+
+    app.run_existing_project(
+        project_dir,
+        editable_project_settings({"schema_version": 1}),
+    )
+
+    assert calls == [
+        (project_dir, "Preparing project for reprocessing"),
+        (project_dir.resolve(), True),
+    ]
+
+
+def test_confirmed_mapping_is_persisted_before_processing(tmp_path: Path) -> None:
+    session = {
+        "id": "actor",
+        "enabled": True,
+        "audio": "Actor.wav",
+        "sheets": ["Second", "First"],
+        "excel_rows": [],
+        "line_ids": [],
+        "needs_mapping_review": True,
+    }
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    app.root = object()
+    app.project_dir = tmp_path
+    app._mapping_project = {"schema_version": 1, "sessions": [session]}
+    app._mapping_source_data = {
+        "sheets": [{"name": "First"}, {"name": "Second"}],
+        "lines": [
+            {"line_id": "Second::R18", "sheet": "Second", "excel_row": 18}
+        ],
+    }
+    app._mapping_inventory = {}
+    app._mapping_reprocessing = False
+    app._mapping_session_id = "actor"
+    app._mapping_row_values = {"actor": "18-19"}
+    app._mapping_line_id_values = {"actor": []}
+    app._remember_mapping_rows = lambda: None
+    continued = []
+    app._continue_project_processing = (
+        lambda path, *, reprocessing: continued.append((path, reprocessing))
+    )
+
+    app._confirm_session_mappings()
+
+    saved = read_json(tmp_path / "project.json")
+    assert saved["sessions"][0]["sheets"] == ["Second", "First"]
+    assert saved["sessions"][0]["excel_rows"] == [18, 19]
+    assert saved["sessions"][0]["needs_mapping_review"] is False
+    assert continued == [(tmp_path, False)]
+
+
 def test_forced_metadata_refresh_backs_up_and_preserves_existing_settings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2427,10 +2624,15 @@ def test_existing_project_reprocess_pipeline_preserves_folder(
     )
 
     app = DialogueReviewApp.__new__(DialogueReviewApp)
+    app.root = object()
     progress = []
     finished = []
+    mapping_review = []
     app.show_progress = lambda path, *, title: progress.append((path, title))
     app._pipeline_finished = lambda path: finished.append(path)
+    app._inventory_finished = lambda path, *, reprocessing: mapping_review.append(
+        (path, reprocessing)
+    )
     app._start_worker = lambda function, callback: callback(function())
 
     project_settings = editable_project_settings(
@@ -2442,6 +2644,15 @@ def test_existing_project_reprocess_pipeline_preserves_folder(
     project_settings["language"] = "fr"
     app.run_existing_project(project_dir, project_settings)
 
+    assert calls == []
+    assert progress == [(project_dir, "Preparing project for reprocessing")]
+    assert mapping_review == [(project_dir.resolve(), True)]
+    saved_project = read_json(project_dir / "project.json")
+    assert saved_project["custom_setting"] == "keep-me"
+    assert saved_project["language"] == "fr"
+
+    app._continue_project_processing(project_dir, reprocessing=True)
+
     assert [phase for phase, _path, _setting in calls] == [
         "transcribe",
         "segment",
@@ -2450,12 +2661,12 @@ def test_existing_project_reprocess_pipeline_preserves_folder(
     ]
     assert all(path == project_dir.resolve() for _phase, path, _setting in calls)
     assert all(setting == "keep-me" for _phase, _path, setting in calls)
-    assert progress == [(project_dir, "Reprocessing project")]
+    assert progress == [
+        (project_dir, "Preparing project for reprocessing"),
+        (project_dir, "Reprocessing project"),
+    ]
     assert finished == [project_dir.resolve()]
     assert sentinel.read_text(encoding="utf-8") == "preserved"
-    saved_project = read_json(project_dir / "project.json")
-    assert saved_project["custom_setting"] == "keep-me"
-    assert saved_project["language"] == "fr"
 
 
 def test_processing_cancellation_scope_is_thread_local() -> None:

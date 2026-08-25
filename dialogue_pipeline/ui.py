@@ -2341,6 +2341,8 @@ class DialogueReviewApp:
         self.selected_base_segment_id: str | None = None
         self._candidate_line_id: str | None = None
         self.candidate_waveform: CandidateWaveformView | None = None
+        self._waveform_segment_id: str | None = None
+        self._base_segments_line_id: str | None = None
         self._open_candidate_roots: set[str] = set()
         self._mapping_project: dict[str, Any] | None = None
         self._mapping_source_data: dict[str, Any] | None = None
@@ -2370,6 +2372,8 @@ class DialogueReviewApp:
         if self.candidate_waveform is not None:
             self.candidate_waveform.dispose()
             self.candidate_waveform = None
+        self._waveform_segment_id = None
+        self._base_segments_line_id = None
         self.player.close()
         self.root.destroy()
 
@@ -2378,6 +2382,8 @@ class DialogueReviewApp:
         if self.candidate_waveform is not None:
             self.candidate_waveform.dispose()
             self.candidate_waveform = None
+        self._waveform_segment_id = None
+        self._base_segments_line_id = None
         for child in self.root.winfo_children():
             child.destroy()
         self._log_text = None
@@ -2396,6 +2402,8 @@ class DialogueReviewApp:
         self.selected_candidate_id = None
         self.selected_base_segment_id = None
         self._candidate_line_id = None
+        self._waveform_segment_id = None
+        self._base_segments_line_id = None
         self._mapping_project = None
         self._mapping_source_data = None
         self._mapping_inventory = {}
@@ -3882,6 +3890,8 @@ class DialogueReviewApp:
             parent=right,
             player=self.player,
         )
+        self._waveform_segment_id = None
+        self._base_segments_line_id = None
         self.candidate_waveform.frame.grid(
             row=5,
             column=0,
@@ -4032,7 +4042,10 @@ class DialogueReviewApp:
                 self.selected_line_id = None
                 self.render_candidates()
             return
-        self.selected_line_id = selected[0]
+        selected_line_id = str(selected[0])
+        if selected_line_id == self.selected_line_id:
+            return
+        self.selected_line_id = selected_line_id
         self.render_candidates()
 
     def _line_table_clicked(self, event: tk.Event[Any]) -> None:
@@ -4069,7 +4082,7 @@ class DialogueReviewApp:
         self.selected_context_text.configure(state="disabled")
         self.selected_context_text.yview_moveto(0.0)
 
-    def render_candidates(self) -> None:
+    def render_candidates(self, *, refresh_base_segments: bool = True) -> None:
         assert self.review_data is not None
         children = self.candidate_tree.get_children()
         self._open_candidate_roots.update(
@@ -4089,9 +4102,7 @@ class DialogueReviewApp:
             self.selected_candidate_id = None
             self.selected_base_segment_id = None
             self._candidate_line_id = None
-            base_children = self.base_segment_tree.get_children()
-            if base_children:
-                self.base_segment_tree.delete(*base_children)
+            self._base_segments_line_id = None
             self.review_tabs.tab(self.base_segments_tab, state="disabled")
             self.review_tabs.select(self.candidates_tab)
             self.mark_retake_button.configure(state="disabled")
@@ -4104,6 +4115,7 @@ class DialogueReviewApp:
             )
             if self.candidate_waveform is not None:
                 self.candidate_waveform.clear()
+                self._waveform_segment_id = None
             return
 
         line_id = str(line["line_id"])
@@ -4119,13 +4131,19 @@ class DialogueReviewApp:
         )
         if not is_verbal and self._base_segments_tab_active():
             self.review_tabs.select(self.candidates_tab)
-        if is_verbal:
-            self._render_base_segments(line, reset_focus=line_changed)
+        if is_verbal and self._base_segments_tab_active():
+            if (
+                refresh_base_segments
+                or self._base_segments_line_id != line_id
+            ):
+                self._render_base_segments(line, reset_focus=line_changed)
+        elif is_verbal:
+            if line_changed:
+                self.selected_base_segment_id = None
+                self._base_segments_line_id = None
         else:
-            base_children = self.base_segment_tree.get_children()
-            if base_children:
-                self.base_segment_tree.delete(*base_children)
             self.selected_base_segment_id = None
+            self._base_segments_line_id = None
         self.mark_retake_button.configure(
             state=("disabled" if line["status"] == "RETAKE" else "normal")
         )
@@ -4195,6 +4213,7 @@ class DialogueReviewApp:
                 self._show_selected_base_segment_waveform()
             elif self.candidate_waveform is not None:
                 self.candidate_waveform.clear("No candidate waveform is available.")
+                self._waveform_segment_id = None
             return
 
         selected_line_ids = _selected_line_ids_by_segment(self.review_data)
@@ -4377,6 +4396,7 @@ class DialogueReviewApp:
         if preferred_id not in segment_ids:
             preferred_id = segment_ids[0] if segment_ids else None
         self.selected_base_segment_id = preferred_id
+        self._base_segments_line_id = str(line["line_id"])
         if preferred_id is not None:
             self.base_segment_tree.selection_set(preferred_id)
             self.base_segment_tree.focus(preferred_id)
@@ -4384,11 +4404,19 @@ class DialogueReviewApp:
 
     def _review_tab_changed(self, _event: tk.Event[Any]) -> None:
         if self._base_segments_tab_active():
+            line = self._selected_line()
+            if (
+                line is not None
+                and line["type"] == "normal"
+                and self._base_segments_line_id != str(line["line_id"])
+            ):
+                self._render_base_segments(line, reset_focus=True)
             self._show_selected_base_segment_waveform()
         elif self.selected_candidate_id:
             self._show_candidate_waveform(self.selected_candidate_id)
         elif self.candidate_waveform is not None:
             self.candidate_waveform.clear("No candidate waveform is available.")
+            self._waveform_segment_id = None
 
     def _base_segment_tree_selected(self, _event: tk.Event[Any]) -> None:
         selected = self.base_segment_tree.selection()
@@ -4405,6 +4433,7 @@ class DialogueReviewApp:
             self._show_candidate_waveform(self.selected_base_segment_id)
         elif self.candidate_waveform is not None:
             self.candidate_waveform.clear("No base-segment waveform is available.")
+            self._waveform_segment_id = None
 
     def _base_segment_table_clicked(self, event: tk.Event[Any]) -> None:
         segment_id = self.base_segment_tree.identify_row(event.y)
@@ -4475,6 +4504,11 @@ class DialogueReviewApp:
     def _show_candidate_waveform(self, segment_id: str) -> None:
         if self.candidate_waveform is None or self.project_dir is None:
             return
+        if (
+            self._waveform_segment_id == segment_id
+            and self.candidate_waveform._loaded
+        ):
+            return
         try:
             source = segment_edit_source(
                 project_dir=self.project_dir,
@@ -4488,8 +4522,10 @@ class DialogueReviewApp:
                 start_sample=int(segment["start_sample"]),
                 end_sample=int(segment["end_sample"]),
             )
+            self._waveform_segment_id = segment_id
         except Exception as error:
             self.candidate_waveform.clear(f"Waveform unavailable: {error}")
+            self._waveform_segment_id = None
 
     def _candidate_table_clicked(self, event: tk.Event[Any]) -> None:
         segment_id = self.candidate_tree.identify_row(event.y)
@@ -4705,9 +4741,11 @@ class DialogueReviewApp:
         else:
             line["selected_segment_id"] = segment_id
             line["status"] = "MANUALLY_REVIEWED"
+        line_id = str(line["line_id"])
         save_line_review(self.review_path, self.review_data)
         self.render_lines()
-        self.render_candidates()
+        if self.selected_line_id == line_id:
+            self.render_candidates(refresh_base_segments=False)
 
     def mark_for_retake(self) -> None:
         assert self.review_path is not None
@@ -4717,9 +4755,11 @@ class DialogueReviewApp:
             return
         line["selected_segment_id"] = None
         line["status"] = "RETAKE"
+        line_id = str(line["line_id"])
         save_line_review(self.review_path, self.review_data)
         self.render_lines()
-        self.render_candidates()
+        if self.selected_line_id == line_id:
+            self.render_candidates(refresh_base_segments=False)
 
     def mark_as_reviewed(self) -> None:
         assert self.review_path is not None
@@ -4728,9 +4768,11 @@ class DialogueReviewApp:
         if line is None:
             return
         line["status"] = "MANUALLY_REVIEWED"
+        line_id = str(line["line_id"])
         save_line_review(self.review_path, self.review_data)
         self.render_lines()
-        self.render_candidates()
+        if self.selected_line_id == line_id:
+            self.render_candidates(refresh_base_segments=False)
 
     def export_retakes(self) -> None:
         assert self.project_dir is not None

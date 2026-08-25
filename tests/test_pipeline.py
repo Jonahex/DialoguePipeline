@@ -2383,6 +2383,45 @@ def test_empty_line_tree_selection_clears_selected_line() -> None:
     assert app.selected_line_id is None
     assert renders == [True]
 
+    app.line_tree = SimpleNamespace(selection=lambda: ("line-2",))
+    app.selected_line_id = "line-2"
+    app._tree_line_selected(None)
+    assert renders == [True]
+
+
+def test_review_ui_reuses_waveform_and_builds_base_segments_on_demand(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.ui as ui_module
+
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    app.project_dir = tmp_path
+    app.candidate_waveform = SimpleNamespace(_loaded=True)
+    app._waveform_segment_id = "session__s00001"
+    monkeypatch.setattr(
+        ui_module,
+        "segment_edit_source",
+        lambda **_kwargs: pytest.fail("Cached waveform must not be reloaded"),
+    )
+
+    app._show_candidate_waveform("session__s00001")
+
+    line = {"line_id": "Sheet::R3", "type": "normal"}
+    app._base_segments_tab_active = lambda: True
+    app._selected_line = lambda: line
+    app._base_segments_line_id = None
+    base_renders = []
+    app._render_base_segments = lambda selected, *, reset_focus: base_renders.append(
+        (selected, reset_focus)
+    ) or setattr(app, "_base_segments_line_id", selected["line_id"])
+    app._show_selected_base_segment_waveform = lambda: None
+
+    app._review_tab_changed(None)
+    app._review_tab_changed(None)
+
+    assert base_renders == [(line, True)]
+
 
 def test_new_project_pauses_for_mapping_review_after_inventory(
     tmp_path: Path,
@@ -6744,13 +6783,15 @@ def test_mark_for_retake_clears_selection_and_is_preserved(
     app.review_data = review
     app.selected_line_id = line["line_id"]
     app.render_lines = lambda: None
-    app.render_candidates = lambda: None
+    candidate_refreshes = []
+    app.render_candidates = lambda **kwargs: candidate_refreshes.append(kwargs)
 
     app.mark_for_retake()
 
     saved = load_line_review(review_path)
     assert saved["lines"][0]["status"] == "RETAKE"
     assert saved["lines"][0]["selected_segment_id"] is None
+    assert candidate_refreshes == [{"refresh_base_segments": False}]
 
     regenerated = build_line_review(
         source_lines=[line],
@@ -6800,13 +6841,15 @@ def test_mark_as_reviewed_keeps_selection_state_and_is_preserved(
     app.review_data = review
     app.selected_line_id = line["line_id"]
     app.render_lines = lambda: None
-    app.render_candidates = lambda: None
+    candidate_refreshes = []
+    app.render_candidates = lambda **kwargs: candidate_refreshes.append(kwargs)
 
     app.mark_as_reviewed()
 
     saved = load_line_review(review_path)
     assert saved["lines"][0]["status"] == "MANUALLY_REVIEWED"
     assert saved["lines"][0]["selected_segment_id"] == expected_selection
+    assert candidate_refreshes == [{"refresh_base_segments": False}]
 
     regenerated = build_line_review(
         source_lines=[line],

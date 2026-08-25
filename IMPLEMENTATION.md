@@ -508,6 +508,10 @@ Selecting a candidate changes status to `MANUALLY_REVIEWED`. Unselecting changes
 it to `REVIEW`, or `MISSING` for a normal line without candidates. `RETAKE`
 cannot contain a selected segment and survives later alignment runs.
 
+The review UI can also mark a line as `MANUALLY_REVIEWED` without changing its
+selection. This explicit reviewed state, including an intentionally empty
+selection, survives review regeneration.
+
 Regeneration restores manual edit candidates and manual selections. For a
 selected normal candidate, its segment and covered base segments are removed
 from the unmatched pool. Selected unmatched segments are retained when needed

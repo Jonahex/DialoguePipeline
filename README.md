@@ -120,13 +120,16 @@ segments** tabs.
   segments. Amber candidates are already selected for another line.
 - Select **Mark for retake** to clear the current selection and assign `RETAKE`
   status.
+- Select **Mark as reviewed** to assign `MANUALLY_REVIEWED` without changing
+  the current candidate selection.
 
 Line statuses are:
 
 - `AUTO_OK`: the pipeline selected a reliable take automatically.
 - `REVIEW`: a person should choose or confirm a take.
 - `MISSING`: no normal alignment candidate is available.
-- `MANUALLY_REVIEWED`: a candidate was selected manually.
+- `MANUALLY_REVIEWED`: the line was explicitly reviewed, with or without a
+  selected candidate.
 - `RETAKE`: the line should be recorded again.
 
 ### Copy and edit a candidate

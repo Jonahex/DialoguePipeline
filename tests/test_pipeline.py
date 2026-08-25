@@ -2371,6 +2371,19 @@ def test_filtered_line_selection_advances_after_current_line_disappears() -> Non
     ) == "line-2"
 
 
+def test_empty_line_tree_selection_clears_selected_line() -> None:
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    app.line_tree = SimpleNamespace(selection=lambda: ())
+    app.selected_line_id = "line-1"
+    renders = []
+    app.render_candidates = lambda: renders.append(True)
+
+    app._tree_line_selected(None)
+
+    assert app.selected_line_id is None
+    assert renders == [True]
+
+
 def test_new_project_pauses_for_mapping_review_after_inventory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6747,6 +6760,62 @@ def test_mark_for_retake_clears_selection_and_is_preserved(
     preserved = preserve_manual_selections(regenerated, saved)
     assert preserved["lines"][0]["status"] == "RETAKE"
     assert preserved["lines"][0]["selected_segment_id"] is None
+
+
+@pytest.mark.parametrize("with_selection", [False, True])
+def test_mark_as_reviewed_keeps_selection_state_and_is_preserved(
+    tmp_path: Path,
+    with_selection: bool,
+) -> None:
+    line = {
+        "line_id": "Sheet::R3",
+        "sheet": "Sheet",
+        "sheet_index": 0,
+        "excel_row": 3,
+        "line": "This line has been checked.",
+        "target_filename": "reviewed",
+    }
+    candidate = {
+        "segment_id": "session__s00001",
+        "segment_file": "segment.wav",
+        "session_id": "session",
+        "base_indices": [0],
+        "transcript": line["line"],
+        "match_score": 100.0,
+        "selection_score": 100.0,
+        "reliable": True,
+    }
+    review_path = tmp_path / "line_review.json"
+    review = build_line_review(
+        source_lines=[line],
+        candidates_by_line={line["line_id"]: [candidate]},
+        unmatched_segments=[],
+    )
+    expected_selection = candidate["segment_id"] if with_selection else None
+    review["lines"][0]["selected_segment_id"] = expected_selection
+    review["lines"][0]["status"] = "AUTO_OK" if with_selection else "REVIEW"
+    save_line_review(review_path, review)
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    app.review_path = review_path
+    app.review_data = review
+    app.selected_line_id = line["line_id"]
+    app.render_lines = lambda: None
+    app.render_candidates = lambda: None
+
+    app.mark_as_reviewed()
+
+    saved = load_line_review(review_path)
+    assert saved["lines"][0]["status"] == "MANUALLY_REVIEWED"
+    assert saved["lines"][0]["selected_segment_id"] == expected_selection
+
+    regenerated = build_line_review(
+        source_lines=[line],
+        candidates_by_line={line["line_id"]: [candidate]},
+        unmatched_segments=[],
+    )
+    preserved = preserve_manual_selections(regenerated, saved)
+    assert preserved["lines"][0]["status"] == "MANUALLY_REVIEWED"
+    assert preserved["lines"][0]["selected_segment_id"] == expected_selection
 
 
 def test_retake_status_rejects_a_selected_candidate(tmp_path: Path) -> None:

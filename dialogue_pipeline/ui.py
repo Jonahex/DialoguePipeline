@@ -3704,8 +3704,16 @@ class DialogueReviewApp:
             candidate_actions,
             text="Mark for retake",
             command=self.mark_for_retake,
+            state="disabled",
         )
         self.mark_retake_button.pack(side="left")
+        self.mark_reviewed_button = ttk.Button(
+            candidate_actions,
+            text="Mark as reviewed",
+            command=self.mark_as_reviewed,
+            state="disabled",
+        )
+        self.mark_reviewed_button.pack(side="left", padx=(8, 0))
         self.review_tabs = ttk.Notebook(right)
         self.review_tabs.grid(
             row=3,
@@ -3987,7 +3995,7 @@ class DialogueReviewApp:
             self.line_tree.focus(self.selected_line_id)
             self.line_tree.see(self.selected_line_id)
         self._update_line_headings()
-        if selection_changed:
+        if selection_changed or self.selected_line_id is None:
             self.render_candidates()
 
     def _update_line_headings(self) -> None:
@@ -4020,6 +4028,9 @@ class DialogueReviewApp:
     def _tree_line_selected(self, _event: tk.Event[Any]) -> None:
         selected = self.line_tree.selection()
         if not selected:
+            if self.selected_line_id is not None:
+                self.selected_line_id = None
+                self.render_candidates()
             return
         self.selected_line_id = selected[0]
         self.render_candidates()
@@ -4084,6 +4095,7 @@ class DialogueReviewApp:
             self.review_tabs.tab(self.base_segments_tab, state="disabled")
             self.review_tabs.select(self.candidates_tab)
             self.mark_retake_button.configure(state="disabled")
+            self.mark_reviewed_button.configure(state="disabled")
             self._set_context_display("")
             self.selected_line_label.configure(text="—")
             self.selected_acting_note_label.configure(text="—")
@@ -4116,6 +4128,13 @@ class DialogueReviewApp:
             self.selected_base_segment_id = None
         self.mark_retake_button.configure(
             state=("disabled" if line["status"] == "RETAKE" else "normal")
+        )
+        self.mark_reviewed_button.configure(
+            state=(
+                "disabled"
+                if line["status"] == "MANUALLY_REVIEWED"
+                else "normal"
+            )
         )
         self._set_context_display(line.get("context"))
         self.selected_line_label.configure(text=line["line_text"] or "—")
@@ -4698,6 +4717,17 @@ class DialogueReviewApp:
             return
         line["selected_segment_id"] = None
         line["status"] = "RETAKE"
+        save_line_review(self.review_path, self.review_data)
+        self.render_lines()
+        self.render_candidates()
+
+    def mark_as_reviewed(self) -> None:
+        assert self.review_path is not None
+        assert self.review_data is not None
+        line = self._selected_line()
+        if line is None:
+            return
+        line["status"] = "MANUALLY_REVIEWED"
         save_line_review(self.review_path, self.review_data)
         self.render_lines()
         self.render_candidates()

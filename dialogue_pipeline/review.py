@@ -996,6 +996,8 @@ def preserve_manual_selections(
             continue
         selected_id = previous_line.get("selected_segment_id")
         if not selected_id:
+            new_line["selected_segment_id"] = None
+            new_line["status"] = "MANUALLY_REVIEWED"
             continue
         new_line["selected_segment_id"] = selected_id
         new_line["status"] = "MANUALLY_REVIEWED"

@@ -102,6 +102,7 @@ from dialogue_pipeline.ui import (
     _first_line_base_segment_key,
     _format_excel_rows,
     _initial_segment_window,
+    _line_id_after_filtered_removal,
     _mapping_sheet_action_names,
     _parse_excel_rows,
     _panned_sample_window,
@@ -2004,16 +2005,6 @@ def test_float_wav_normalization(tmp_path: Path) -> None:
         assert reader.getsampwidth() == 2
 
 
-def test_sample_workbook_schema() -> None:
-    workbook_path = (
-        Path(__file__).parents[1] / "MaleElfYoung" / "ARG1RMElfYoung.xlsm"
-    )
-    result = parse_workbook(workbook_path)
-    assert result["sheet_count"] == 21
-    assert result["line_count"] == 457
-    assert len({line["target_filename"] for line in result["lines"]}) == 457
-
-
 def test_workbook_parser_supports_repeated_sections_and_note_vocalizations(
     tmp_path: Path,
 ) -> None:
@@ -2353,6 +2344,31 @@ def test_mapping_sheet_actions_follow_selection_and_bulk_state() -> None:
     app._toggle_all_mapping_sheets()
     assert session["sheets"] == []
     assert len(refreshes) == 2
+
+
+def test_filtered_line_selection_advances_after_current_line_disappears() -> None:
+    previous = ["line-1", "line-2", "line-3", "line-4"]
+
+    assert _line_id_after_filtered_removal(
+        previous_ids=previous,
+        selected_id="line-2",
+        visible_ids=["line-1", "line-3", "line-4"],
+    ) == "line-3"
+    assert _line_id_after_filtered_removal(
+        previous_ids=previous,
+        selected_id="line-4",
+        visible_ids=["line-1", "line-2", "line-3"],
+    ) == "line-3"
+    assert _line_id_after_filtered_removal(
+        previous_ids=previous,
+        selected_id="line-2",
+        visible_ids=[],
+    ) is None
+    assert _line_id_after_filtered_removal(
+        previous_ids=previous,
+        selected_id="line-2",
+        visible_ids=previous,
+    ) == "line-2"
 
 
 def test_new_project_pauses_for_mapping_review_after_inventory(

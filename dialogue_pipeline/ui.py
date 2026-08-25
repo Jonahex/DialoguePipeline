@@ -167,6 +167,30 @@ def _mapping_sheet_action_names(
     return selected_action, "Remove All" if remove_all else "Add All"
 
 
+def _line_id_after_filtered_removal(
+    *,
+    previous_ids: list[str],
+    selected_id: str | None,
+    visible_ids: list[str],
+) -> str | None:
+    """Keep position when the selected row disappears from a filtered list."""
+
+    if selected_id in visible_ids:
+        return selected_id
+    if not visible_ids:
+        return None
+    if selected_id in previous_ids:
+        selected_index = previous_ids.index(selected_id)
+        visible_set = set(visible_ids)
+        for line_id in previous_ids[selected_index + 1 :]:
+            if line_id in visible_set:
+                return line_id
+        for line_id in reversed(previous_ids[:selected_index]):
+            if line_id in visible_set:
+                return line_id
+    return visible_ids[0]
+
+
 def _context_display_text(value: Any) -> str:
     """Remove repeated multi-context headings while preserving context text."""
 
@@ -3516,7 +3540,10 @@ class DialogueReviewApp:
             width=22,
         )
         status_box.pack(side="left", padx=(6, 18))
-        status_box.bind("<<ComboboxSelected>>", lambda _event: self.render_lines())
+        status_box.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self.render_lines(preserve_position=False),
+        )
         ttk.Label(
             controls,
             textvariable=self.status_text,
@@ -3905,11 +3932,12 @@ class DialogueReviewApp:
             self.line_sort_descending = False
         self.render_lines()
 
-    def render_lines(self) -> None:
+    def render_lines(self, *, preserve_position: bool = True) -> None:
         assert self.review_data is not None
-        children = self.line_tree.get_children()
-        if children:
-            self.line_tree.delete(*children)
+        previous_selection = self.selected_line_id
+        previous_ids = [str(line_id) for line_id in self.line_tree.get_children()]
+        if previous_ids:
+            self.line_tree.delete(*previous_ids)
         lines = self._filtered_lines()
         self.status_text.set(
             f"{len(lines)} of {len(self.review_data['lines'])} lines"
@@ -3940,11 +3968,20 @@ class DialogueReviewApp:
                 ),
                 tags=(line["status"],),
             )
-        visible_ids = {line["line_id"] for line in lines}
-        selection_changed = False
-        if self.selected_line_id not in visible_ids:
-            self.selected_line_id = lines[0]["line_id"] if lines else None
-            selection_changed = True
+        visible_ids = [str(line["line_id"]) for line in lines]
+        if preserve_position:
+            self.selected_line_id = _line_id_after_filtered_removal(
+                previous_ids=previous_ids,
+                selected_id=previous_selection,
+                visible_ids=visible_ids,
+            )
+        else:
+            self.selected_line_id = (
+                previous_selection
+                if previous_selection in visible_ids
+                else visible_ids[0] if visible_ids else None
+            )
+        selection_changed = self.selected_line_id != previous_selection
         if self.selected_line_id in visible_ids:
             self.line_tree.selection_set(self.selected_line_id)
             self.line_tree.focus(self.selected_line_id)

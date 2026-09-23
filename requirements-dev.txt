@@ -1,3 +1,4 @@
 -r requirements.txt
 pytest>=8.3,<10
+setuptools>=65.5
 wheel>=0.45,<1

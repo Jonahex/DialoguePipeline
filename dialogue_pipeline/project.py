@@ -15,6 +15,7 @@ from .util import (
     read_json,
     relpath_for_config,
     resolve_project_path,
+    sha256_file,
     slugify,
     write_json,
 )
@@ -496,6 +497,180 @@ def create_project(
         _merge_project_settings(project, project_settings)
     write_json(project_file, project)
     return project
+
+
+def _audio_sort_key(path: Path) -> tuple[str, str]:
+    return path.name.casefold(), str(path).casefold()
+
+
+def _unique_session_id(session_id: str, used_ids: set[str]) -> str:
+    if session_id not in used_ids:
+        return session_id
+    suffix = 2
+    while f"{session_id}_{suffix}" in used_ids:
+        suffix += 1
+    return f"{session_id}_{suffix}"
+
+
+def _insert_session_in_name_order(
+    sessions: list[dict[str, Any]],
+    session: dict[str, Any],
+) -> None:
+    # Existing sessions keep their relative order; a new one is placed before
+    # the first recording that sorts after it, matching create_project order.
+    name = Path(str(session["audio"])).name.lower()
+    index = next(
+        (
+            position
+            for position, existing in enumerate(sessions)
+            if Path(str(existing["audio"])).name.lower() > name
+        ),
+        len(sessions),
+    )
+    sessions.insert(index, session)
+
+
+def update_audio_inventory(
+    *,
+    project_dir: Path,
+    project: dict[str, Any],
+) -> dict[str, Any]:
+    """Rescan source recordings and inventory only new or changed files.
+
+    A recording whose size and modification time match its stored entry keeps
+    that entry without being read. Other known recordings are hashed and are
+    re-probed only when their content changed. Every WAV in the audio
+    directory that no session references receives an inferred session, and
+    enabled sessions whose recording disappeared are disabled. The inventory
+    file is written here; the caller persists the mutated ``project``.
+    """
+
+    project_dir = project_dir.resolve()
+    inventory_path = resolve_project_path(project_dir, project["audio_inventory"])
+    previous_inventory = (
+        read_json(inventory_path) if inventory_path.is_file() else {"files": []}
+    )
+    previous_by_path = {
+        Path(item["path"]).resolve(): item
+        for item in previous_inventory.get("files", [])
+    }
+
+    sessions = project.setdefault("sessions", [])
+    session_audio = {
+        str(session["id"]): resolve_project_path(
+            project_dir,
+            str(session["audio"]),
+        ).resolve()
+        for session in sessions
+    }
+    audio_paths = {path for path in session_audio.values() if path.is_file()}
+    configured_audio_dir = project.get("audio_dir")
+    if configured_audio_dir:
+        audio_dir = resolve_project_path(project_dir, str(configured_audio_dir))
+        if not audio_dir.is_dir():
+            raise NotADirectoryError(f"Audio directory not found: {audio_dir}")
+        audio_paths.update(path.resolve() for path in audio_dir.glob("*.wav"))
+    if not audio_paths:
+        raise ValueError("No source recordings were found for this project.")
+
+    ordered_paths = sorted(audio_paths, key=_audio_sort_key)
+    inventory = []
+    new_paths: list[Path] = []
+    changed_paths: list[Path] = []
+    for index, audio_path in enumerate(ordered_paths, start=1):
+        check_processing_cancelled()
+        label = f"[inventory {index}/{len(ordered_paths)}] {audio_path.name}"
+        stat = audio_path.stat()
+        fingerprint = {
+            "size_bytes": stat.st_size,
+            "modified_ns": stat.st_mtime_ns,
+        }
+        previous = previous_by_path.get(audio_path)
+        if previous is None:
+            print(f"{label}: new recording", flush=True)
+            item = probe_audio(audio_path, include_hash=True)
+            new_paths.append(audio_path)
+        elif previous.get("sha256") and all(
+            previous.get(key) == value for key, value in fingerprint.items()
+        ):
+            item = previous
+        else:
+            print(f"{label}: checking for changes", flush=True)
+            digest = sha256_file(audio_path)
+            if digest == previous.get("sha256"):
+                item = dict(previous)
+            else:
+                print(f"{label}: changed recording", flush=True)
+                item = probe_audio(audio_path, include_hash=False)
+                item["sha256"] = digest
+                changed_paths.append(audio_path)
+        item.update(fingerprint)
+        inventory.append(item)
+
+    removed_paths = sorted(set(previous_by_path) - audio_paths, key=_audio_sort_key)
+
+    added_session_ids: list[str] = []
+    referenced_paths = set(session_audio.values())
+    unreferenced_paths = [
+        path for path in ordered_paths if path not in referenced_paths
+    ]
+    if unreferenced_paths:
+        source_data = load_source_data(project_dir, project)
+        inferred_by_path = {
+            resolve_project_path(project_dir, session["audio"]).resolve(): session
+            for session in infer_sessions(ordered_paths, source_data, project_dir)
+        }
+        used_ids = {str(session["id"]) for session in sessions}
+        for audio_path in unreferenced_paths:
+            session = inferred_by_path[audio_path]
+            session["id"] = _unique_session_id(str(session["id"]), used_ids)
+            used_ids.add(session["id"])
+            _insert_session_in_name_order(sessions, session)
+            added_session_ids.append(session["id"])
+            print(f"[inventory] Added recording session: {session['id']}", flush=True)
+
+    changed_set = set(changed_paths)
+    disabled_session_ids: list[str] = []
+    session_status: dict[str, str] = {
+        session_id: "new" for session_id in added_session_ids
+    }
+    for session in sessions:
+        session_id = str(session["id"])
+        audio_path = session_audio.get(session_id)
+        if audio_path is None:
+            continue
+        if audio_path not in audio_paths:
+            session_status[session_id] = "missing"
+            if session.get("enabled", True):
+                session["enabled"] = False
+                disabled_session_ids.append(session_id)
+                print(
+                    f"[inventory] Disabled session with missing recording: "
+                    f"{session_id} ({audio_path})",
+                    flush=True,
+                )
+        elif audio_path in changed_set:
+            session_status[session_id] = "changed"
+
+    check_processing_cancelled()
+    write_json(inventory_path, {"files": inventory})
+    unchanged_count = len(inventory) - len(new_paths) - len(changed_paths)
+    print(
+        f"[inventory] {len(inventory)} recording(s): {len(new_paths)} new, "
+        f"{len(changed_paths)} changed, {unchanged_count} unchanged, "
+        f"{len(removed_paths)} no longer present.",
+        flush=True,
+    )
+    return {
+        "audio_inventory": inventory_path,
+        "source_count": len(inventory),
+        "new_recordings": [str(path) for path in new_paths],
+        "changed_recordings": [str(path) for path in changed_paths],
+        "removed_recordings": [str(path) for path in removed_paths],
+        "added_sessions": added_session_ids,
+        "disabled_sessions": disabled_session_ids,
+        "session_status": session_status,
+    }
 
 
 def load_project(project_file: Path) -> tuple[Path, dict[str, Any]]:

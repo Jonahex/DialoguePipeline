@@ -10,11 +10,11 @@ from typing import Any
 from .alignment import align_project
 from .doctor import run_doctor
 from .finalize import finalize_review
-from .project import create_project, load_project
+from .project import create_project, load_project, update_audio_inventory
 from .review import REVIEW_FILE_NAME
 from .segmentation import refresh_project_audio, segment_project
 from .transcription import transcribe_project, transcribe_segments_project
-from .util import project_file_from_arg
+from .util import project_file_from_arg, write_json
 
 
 def _project_argument(parser: argparse.ArgumentParser) -> None:
@@ -93,6 +93,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     _project_argument(refresh_audio_parser)
+
+    inventory_parser = subparsers.add_parser(
+        "inventory",
+        help=(
+            "Rescan the audio directory of an existing project, inventory "
+            "new or changed recordings, and add sessions for new files."
+        ),
+    )
+    _project_argument(inventory_parser)
 
     segment_transcribe_parser = subparsers.add_parser(
         "transcribe-segments",
@@ -246,6 +255,11 @@ def dispatch(args: argparse.Namespace) -> int:
                 project=project,
             )
         )
+        return 0
+    if args.command == "inventory":
+        result = update_audio_inventory(project_dir=project_dir, project=project)
+        write_json(project_dir / "project.json", project)
+        _print_json(result)
         return 0
     if args.command == "transcribe-segments":
         output = transcribe_segments_project(

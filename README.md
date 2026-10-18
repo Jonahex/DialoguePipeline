@@ -65,6 +65,9 @@ The desktop app is the recommended way to use the pipeline:
    Transcription, Segment Transcription, Segmentation, Alignment, and Export.
 5. Start project creation. The app inventories the workbook and audio, then
    opens **Review Audio / Script Matching** before any transcription begins.
+   For an existing project, the app instead rescans the project's audio
+   directory and re-inventories only new or changed WAV files (see
+   [Reprocess after adding or replacing recordings](#reprocess-after-adding-or-replacing-recordings)).
 6. For every recording, confirm whether it is enabled and which workbook
    sheets it contains. Add, remove, reorder, or map/unmap all sheets at once,
    and optionally restrict the mapping to exact Excel rows such as `12, 18-24`.
@@ -82,6 +85,29 @@ shows the inferred mappings (ambiguous ones in yellow), audio metadata, sheet
 line counts, and any existing exact-line filters. Disabled recordings remain in
 the project but are skipped. Confirmed mappings are saved to the `sessions`
 section of `project.json`.
+
+### Reprocess after adding or replacing recordings
+
+Copy new or re-recorded WAV files into the project's audio directory, then
+select **Create or Reprocess Project** and choose the existing project
+directory. Before the matching screen opens, the app rescans that directory:
+
+- Recordings whose size and modification time are unchanged keep their stored
+  inventory entry and are not read again.
+- Other known recordings are hashed. Recordings whose content changed are
+  re-inventoried, and their transcripts and segments are regenerated during
+  processing. Unchanged recordings keep using their caches.
+- New WAV files are inventoried and added as recordings with inferred sheet
+  mappings.
+- Recordings whose files are no longer present are disabled.
+
+The matching screen summarizes the rescan, labels the affected recordings
+**New**, **Changed**, or **Missing**, and highlights new and changed recordings
+in blue (yellow still marks an ambiguous mapping). Confirm or adjust their
+mappings before processing.
+
+A renamed file is treated as a missing recording plus a new one, so map the new
+recording again.
 
 ### Open an existing project
 
@@ -233,6 +259,17 @@ the following for complete command and option documentation:
 
 Use this only for source-only edits that preserve timing and normalized frame
 count.
+
+### Update the audio inventory
+
+```powershell
+.\run_pipeline.ps1 inventory --project MaleElfYoung\PipelineWork
+```
+
+This runs the same audio-directory rescan as reprocessing in the desktop app.
+It re-inventories new or changed recordings, adds sessions for new files, and
+disables sessions whose files are missing. Review the `sessions` section of
+`project.json` before running `process`.
 
 ### Finalize selected files
 

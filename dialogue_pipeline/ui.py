@@ -33,6 +33,7 @@ from .project import (
     inventory_by_path,
     load_project,
     load_source_data,
+    update_audio_inventory,
 )
 from .retakes import export_retake_script
 from .review import (
@@ -69,6 +70,12 @@ STATUS_COLORS = {
     "MISSING": "#fee2e2",
     "MANUALLY_REVIEWED": "#dbeafe",
     "RETAKE": "#fce7f3",
+}
+
+AUDIO_STATUS_LABELS = {
+    "new": "New",
+    "changed": "Changed",
+    "missing": "Missing",
 }
 
 MULTIPLE_CONTEXTS_HEADER = "used in multiple contexts:"
@@ -150,6 +157,24 @@ def _validate_session_mappings(
             )
     if not enabled_count:
         raise ValueError("Enable at least one audio recording before processing.")
+
+
+def _audio_changes_summary(audio_changes: dict[str, Any] | None) -> str:
+    """Describe an existing project's audio rescan for the mapping screen."""
+
+    statuses = list(((audio_changes or {}).get("session_status") or {}).values())
+    parts = [
+        f"{statuses.count(status)} {label.lower()}"
+        for status, label in AUDIO_STATUS_LABELS.items()
+        if statuses.count(status)
+    ]
+    if not parts:
+        return ""
+    return (
+        "Audio folder rescanned: "
+        + ", ".join(parts)
+        + ". New and changed recordings are highlighted in blue."
+    )
 
 
 def _mapping_sheet_action_names(
@@ -2347,6 +2372,7 @@ class DialogueReviewApp:
         self._mapping_project: dict[str, Any] | None = None
         self._mapping_source_data: dict[str, Any] | None = None
         self._mapping_inventory: dict[Path, dict[str, Any]] = {}
+        self._mapping_audio_status: dict[str, str] = {}
         self._mapping_reprocessing = False
         self._mapping_session_id: str | None = None
         self._mapping_row_values: dict[str, str] = {}
@@ -2407,6 +2433,7 @@ class DialogueReviewApp:
         self._mapping_project = None
         self._mapping_source_data = None
         self._mapping_inventory = {}
+        self._mapping_audio_status = {}
         self._mapping_reprocessing = False
         self._mapping_session_id = None
         self._mapping_row_values = {}
@@ -2580,6 +2607,7 @@ class DialogueReviewApp:
         project_dir: Path,
         *,
         reprocessing: bool,
+        audio_changes: dict[str, Any] | None = None,
     ) -> None:
         """Pause processing so every recording-to-sheet mapping can be confirmed."""
 
@@ -2606,6 +2634,9 @@ class DialogueReviewApp:
             )
         self._mapping_source_data = source_data
         self._mapping_inventory = inventory
+        self._mapping_audio_status = dict(
+            (audio_changes or {}).get("session_status") or {}
+        )
         self._mapping_reprocessing = reprocessing
         self._mapping_session_id = None
         self._mapping_row_values = {
@@ -2634,6 +2665,13 @@ class DialogueReviewApp:
             ),
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(0, 14))
+        audio_changes_text = _audio_changes_summary(audio_changes)
+        if audio_changes_text:
+            ttk.Label(
+                outer,
+                text=audio_changes_text,
+                style="FieldName.TLabel",
+            ).pack(anchor="w", pady=(0, 10))
 
         panes = ttk.Panedwindow(outer, orient="horizontal")
         panes.pack(fill="both", expand=True)
@@ -2673,6 +2711,7 @@ class DialogueReviewApp:
         self.mapping_recording_tree.pack(side="left", fill="both", expand=True)
         recording_scroll.pack(side="right", fill="y")
         self.mapping_recording_tree.tag_configure("review", background="#fef3c7")
+        self.mapping_recording_tree.tag_configure("audio_changed", background="#dbeafe")
         self.mapping_recording_tree.tag_configure("disabled", foreground="#64748b")
         self.mapping_recording_tree.bind(
             "<<TreeviewSelect>>",
@@ -2875,11 +2914,17 @@ class DialogueReviewApp:
             duration_text = f"{float(duration) / 60:.1f} min" if duration is not None else "—"
             sheets = list(session.get("sheets") or [])
             enabled = bool(session.get("enabled", True))
+            audio_status = self._mapping_audio_status.get(session_id)
             state = "Review" if session.get("needs_mapping_review") else "Inferred"
             if not enabled:
                 state = "Skipped"
+            if audio_status in AUDIO_STATUS_LABELS:
+                state = AUDIO_STATUS_LABELS[audio_status]
             tags = (
-                "disabled" if not enabled else "review" if session.get("needs_mapping_review") else "",
+                "disabled" if not enabled
+                else "review" if session.get("needs_mapping_review")
+                else "audio_changed" if audio_status in {"new", "changed"}
+                else "",
             )
             self.mapping_recording_tree.insert(
                 "",
@@ -2923,6 +2968,13 @@ class DialogueReviewApp:
                 f"{float(metadata.get('duration_seconds') or 0):.1f} s, "
                 f"{int(metadata.get('sample_rate') or 0)} Hz, "
                 f"{int(metadata.get('channels') or 0)} channel(s)"
+            )
+        audio_status = self._mapping_audio_status.get(session_id)
+        if audio_status == "missing":
+            detail_parts.append("file not found")
+        elif audio_status in AUDIO_STATUS_LABELS:
+            detail_parts.append(
+                f"{AUDIO_STATUS_LABELS[audio_status].lower()} since the last inventory"
             )
         detail_parts.append(f"pass: {session.get('pass') or 'main'}")
         self.mapping_audio_name.set(audio_path.name)
@@ -3152,6 +3204,7 @@ class DialogueReviewApp:
         self._mapping_project = None
         self._mapping_source_data = None
         self._mapping_inventory = {}
+        self._mapping_audio_status = {}
         self._mapping_session_id = None
         self._mapping_row_values = {}
         self._mapping_line_id_values = {}
@@ -3220,12 +3273,21 @@ class DialogueReviewApp:
         """Rerun an existing project without recreating or clearing it."""
         self.show_progress(project_dir, title="Preparing project for reprocessing")
 
-        def work() -> Path:
+        def work() -> tuple[Path, dict[str, Any]]:
             check_processing_cancelled()
             loaded_dir, project = load_project(
                 project_file_from_arg(project_dir)
             )
             apply_project_settings(project, project_settings)
+            print(
+                "[existing project] Checking the audio folder for new or "
+                "changed recordings.",
+                flush=True,
+            )
+            audio_changes = update_audio_inventory(
+                project_dir=loaded_dir,
+                project=project,
+            )
             write_json(loaded_dir / "project.json", project)
             print(
                 "[existing project] Updated settings while preserving mappings "
@@ -3234,11 +3296,15 @@ class DialogueReviewApp:
             )
             check_processing_cancelled()
             print("Audio inventory is ready. Review session mappings next.", flush=True)
-            return loaded_dir
+            return loaded_dir, audio_changes
 
         self._start_worker(
             work,
-            lambda path: self._inventory_finished(path, reprocessing=True),
+            lambda result: self._inventory_finished(
+                result[0],
+                reprocessing=True,
+                audio_changes=result[1],
+            ),
         )
 
     def _run_pipeline_stages(
@@ -3266,11 +3332,18 @@ class DialogueReviewApp:
             flush=True,
         )
 
-    def _inventory_finished(self, project_dir: Path, *, reprocessing: bool) -> None:
+    def _inventory_finished(
+        self,
+        project_dir: Path,
+        *,
+        reprocessing: bool,
+        audio_changes: dict[str, Any] | None = None,
+    ) -> None:
         try:
             self.show_session_mapping_review(
                 project_dir,
                 reprocessing=reprocessing,
+                audio_changes=audio_changes,
             )
         except Exception as error:
             self._pipeline_failed(error)

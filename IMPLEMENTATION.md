@@ -64,14 +64,36 @@ filter, and retain or clear an existing exact line-ID filter. Confirmation
 validates that each enabled session resolves to at least one source line,
 clears `needs_mapping_review`, persists `project.json`, and only then starts
 transcription. Reprocessing uses the same gate and retains the existing mapping
-as its editable starting point.
+as its editable starting point. Before reprocessing reaches the gate, it updates
+the audio inventory incrementally (see below) and passes the per-session result
+to the gate, which labels new, changed, and missing recordings.
 
 ## Audio inventory, normalization, and refresh
 
 The inventory records hashes, duration, sample rate, channels, bit depth, and
-frame count. Sources not already in the export PCM shape are normalized once
-into `normalized_sources/`. This includes 32-bit floating-point post-processed
-WAV files.
+frame count, plus a `size_bytes`/`modified_ns` fingerprint. Sources not already
+in the export PCM shape are normalized once into `normalized_sources/`. This
+includes 32-bit floating-point post-processed WAV files.
+
+`update_audio_inventory` (desktop reprocessing and the `inventory` command)
+rescans every WAV file in `audio_dir`, plus any existing file referenced by a
+session:
+
+- An entry whose fingerprint matches the file is reused without reading the
+  file.
+- A known file with a different fingerprint, or a legacy entry without one, is
+  hashed. If the hash is unchanged, only the fingerprint is updated. Otherwise
+  the file is re-probed.
+- A new file is probed and hashed. If no session references it, `infer_sessions`
+  infers a session for it, using every inventoried recording as naming context,
+  and inserts it in file-name order. A colliding ID receives a numeric suffix.
+- A session whose recording no longer exists is disabled. Entries for vanished
+  files are dropped from the inventory.
+
+A missing `audio_dir` is an error. Because recording ASR, segmentation, and
+normalized-source names are keyed by the source hash, only changed recordings
+miss their caches on the next run. The function writes `audio_inventory.json`;
+the caller persists the mutated sessions in `project.json`.
 
 PCM input accepts both classic WAV headers and `WAVE_FORMAT_EXTENSIBLE` with
 the PCM subtype. Recent FFmpeg versions commonly use the extensible header for

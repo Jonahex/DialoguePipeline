@@ -83,6 +83,9 @@ def require_executable(name: str) -> str:
 
 def probe_audio(path: Path, *, include_hash: bool = True) -> dict[str, Any]:
     ffprobe = require_executable("ffprobe")
+    # Stat before reading so a concurrent rewrite leaves a stale fingerprint
+    # that forces the next incremental inventory to check the file again.
+    stat = path.stat()
     result = subprocess.run(
         [
             ffprobe,
@@ -114,7 +117,8 @@ def probe_audio(path: Path, *, include_hash: bool = True) -> dict[str, Any]:
     stream = audio_streams[0]
     output = {
         "path": str(path.resolve()),
-        "size_bytes": int(payload["format"].get("size") or path.stat().st_size),
+        "size_bytes": int(payload["format"].get("size") or stat.st_size),
+        "modified_ns": stat.st_mtime_ns,
         "duration_seconds": float(payload["format"]["duration"]),
         "codec": stream.get("codec_name"),
         "sample_format": stream.get("sample_fmt"),

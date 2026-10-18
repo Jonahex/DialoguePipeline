@@ -60,6 +60,7 @@ from dialogue_pipeline.project import (
     editable_project_settings,
     infer_sessions,
     migrate_project_config,
+    update_audio_inventory,
 )
 from dialogue_pipeline.retakes import export_retake_script
 from dialogue_pipeline.review import (
@@ -95,6 +96,7 @@ from dialogue_pipeline.transcription import (
 from dialogue_pipeline.ui import (
     AudioPlayer,
     DialogueReviewApp,
+    _audio_changes_summary,
     _base_segment_candidate_usage,
     _candidate_selection_display,
     _candidate_take_groups,
@@ -2477,11 +2479,21 @@ def test_reprocessing_pauses_for_mapping_review_before_transcription(
         lambda **_kwargs: pytest.fail("Transcription must wait for mapping review"),
     )
     calls = []
+    audio_changes = {"session_status": {"new_actor": "new"}}
+
+    def rescan(*, project_dir: Path, project: dict) -> dict:
+        calls.append(("rescan", project_dir))
+        project["sessions"] = [{"id": "new_actor", "audio": "New.wav"}]
+        return audio_changes
+
+    monkeypatch.setattr(ui_module, "update_audio_inventory", rescan)
     app = DialogueReviewApp.__new__(DialogueReviewApp)
     app.root = object()
     app.show_progress = lambda path, *, title: calls.append((path, title))
-    app._inventory_finished = lambda path, *, reprocessing: calls.append(
-        (path, reprocessing)
+    app._inventory_finished = (
+        lambda path, *, reprocessing, audio_changes: calls.append(
+            (path, reprocessing, audio_changes)
+        )
     )
     app._start_worker = lambda function, callback: callback(function())
 
@@ -2492,8 +2504,11 @@ def test_reprocessing_pauses_for_mapping_review_before_transcription(
 
     assert calls == [
         (project_dir, "Preparing project for reprocessing"),
-        (project_dir.resolve(), True),
+        ("rescan", project_dir.resolve()),
+        (project_dir.resolve(), True, audio_changes),
     ]
+    saved = read_json(project_dir / "project.json")
+    assert saved["sessions"] == [{"id": "new_actor", "audio": "New.wav"}]
 
 
 def test_confirmed_mapping_is_persisted_before_processing(tmp_path: Path) -> None:
@@ -2608,6 +2623,252 @@ def test_forced_metadata_refresh_backs_up_and_preserves_existing_settings(
     assert read_json(project_dir / "project.before-force.json")["language"] == "fr"
 
 
+def test_audio_inventory_update_handles_new_changed_and_missing_recordings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import dialogue_pipeline.project as project_module
+
+    project_dir = tmp_path / "work"
+    project_dir.mkdir()
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    unchanged = audio_dir / "Alpha.wav"
+    unchanged.write_bytes(b"alpha")
+    changed = audio_dir / "Beta.wav"
+    changed.write_bytes(b"beta, after post-processing")
+    legacy = audio_dir / "Echo.wav"
+    legacy.write_bytes(b"echo")
+    added = audio_dir / "Charlie_Guard.wav"
+    added.write_bytes(b"charlie")
+    missing = audio_dir / "Charlie-Guard.wav"
+
+    def inventory_item(path: Path, sha256: str, **fields) -> dict:
+        return {"path": str(path.resolve()), "sha256": sha256, **fields}
+
+    def fingerprint(path: Path) -> dict:
+        stat = path.stat()
+        return {"size_bytes": stat.st_size, "modified_ns": stat.st_mtime_ns}
+
+    write_json(
+        project_dir / "audio_inventory.json",
+        {
+            "files": [
+                inventory_item(
+                    unchanged,
+                    "not-rehashed",
+                    duration_seconds=1.0,
+                    **fingerprint(unchanged),
+                ),
+                inventory_item(
+                    changed,
+                    "stale",
+                    duration_seconds=2.0,
+                    size_bytes=4,
+                    modified_ns=1,
+                ),
+                # Inventories written before fingerprints were recorded.
+                inventory_item(legacy, sha256_file(legacy), duration_seconds=3.0),
+                inventory_item(missing, "gone", duration_seconds=4.0),
+            ]
+        },
+    )
+    write_json(
+        project_dir / "source_lines.json",
+        {
+            "sheets": [
+                {"name": "Guard", "line_count": 3, "voice_header": ""},
+                {"name": "Merchant", "line_count": 3, "voice_header": ""},
+            ],
+            "lines": [],
+        },
+    )
+
+    def session(session_id: str, audio_name: str) -> dict:
+        return {
+            "id": session_id,
+            "enabled": True,
+            "audio": f"../audio/{audio_name}",
+            "sheets": ["Merchant"],
+            "excel_rows": [],
+            "line_ids": [],
+            "pass": "main",
+            "needs_mapping_review": False,
+        }
+
+    project = {
+        "schema_version": 1,
+        "audio_dir": "../audio",
+        "source_lines": "source_lines.json",
+        "audio_inventory": "audio_inventory.json",
+        "sessions": [
+            session("alpha", "Alpha.wav"),
+            session("beta", "Beta.wav"),
+            session("charlie_guard", "Charlie-Guard.wav"),
+            session("echo", "Echo.wav"),
+        ],
+    }
+    probes = []
+
+    def fake_probe_audio(path: Path, *, include_hash: bool) -> dict:
+        probes.append((path.name, include_hash))
+        item = {"path": str(path.resolve()), "duration_seconds": 9.0}
+        if include_hash:
+            item["sha256"] = sha256_file(path)
+        return item
+
+    monkeypatch.setattr(project_module, "probe_audio", fake_probe_audio)
+
+    result = update_audio_inventory(project_dir=project_dir, project=project)
+
+    assert probes == [("Beta.wav", False), ("Charlie_Guard.wav", True)]
+    assert result["new_recordings"] == [str(added.resolve())]
+    assert result["changed_recordings"] == [str(changed.resolve())]
+    assert result["removed_recordings"] == [str(missing.resolve())]
+    assert result["added_sessions"] == ["charlie_guard_2"]
+    assert result["disabled_sessions"] == ["charlie_guard"]
+    assert result["session_status"] == {
+        "charlie_guard_2": "new",
+        "beta": "changed",
+        "charlie_guard": "missing",
+    }
+
+    inventory = {
+        Path(item["path"]).name: item
+        for item in read_json(project_dir / "audio_inventory.json")["files"]
+    }
+    assert sorted(inventory) == [
+        "Alpha.wav",
+        "Beta.wav",
+        "Charlie_Guard.wav",
+        "Echo.wav",
+    ]
+    assert inventory["Alpha.wav"]["sha256"] == "not-rehashed"
+    assert inventory["Beta.wav"]["sha256"] == sha256_file(changed)
+    assert inventory["Beta.wav"]["duration_seconds"] == 9.0
+    assert inventory["Echo.wav"]["duration_seconds"] == 3.0
+    for path in (unchanged, changed, legacy, added):
+        item = inventory[path.name]
+        assert {key: item[key] for key in fingerprint(path)} == fingerprint(path)
+
+    assert [item["id"] for item in project["sessions"]] == [
+        "alpha",
+        "beta",
+        "charlie_guard",
+        "charlie_guard_2",
+        "echo",
+    ]
+    new_session = project["sessions"][3]
+    assert new_session["audio"] == "../audio/Charlie_Guard.wav"
+    assert new_session["sheets"] == ["Guard"]
+    assert new_session["enabled"] is True
+    assert new_session["needs_mapping_review"] is False
+    assert project["sessions"][2]["enabled"] is False
+    assert all(
+        item["enabled"]
+        for item in project["sessions"]
+        if item["id"] != "charlie_guard"
+    )
+
+    probes.clear()
+    repeated = update_audio_inventory(project_dir=project_dir, project=project)
+
+    assert probes == []
+    assert repeated["added_sessions"] == []
+    assert repeated["disabled_sessions"] == []
+    assert repeated["session_status"] == {"charlie_guard": "missing"}
+
+
+def test_audio_inventory_update_requires_existing_audio_directory(
+    tmp_path: Path,
+) -> None:
+    project = {
+        "audio_dir": "../missing-audio",
+        "audio_inventory": "audio_inventory.json",
+        "sessions": [],
+    }
+
+    with pytest.raises(NotADirectoryError, match="Audio directory not found"):
+        update_audio_inventory(project_dir=tmp_path, project=project)
+
+    assert not (tmp_path / "audio_inventory.json").exists()
+
+
+def test_mapping_screen_labels_rescanned_recordings(tmp_path: Path) -> None:
+    assert _audio_changes_summary(None) == ""
+    assert _audio_changes_summary({"session_status": {}}) == ""
+    assert _audio_changes_summary(
+        {
+            "session_status": {
+                "added": "new",
+                "edited": "changed",
+                "edited_too": "changed",
+            }
+        }
+    ) == (
+        "Audio folder rescanned: 1 new, 2 changed. "
+        "New and changed recordings are highlighted in blue."
+    )
+
+    class FakeTree:
+        def __init__(self) -> None:
+            self.rows: dict[str, dict] = {}
+
+        def get_children(self) -> tuple[str, ...]:
+            return tuple(self.rows)
+
+        def delete(self, *items: str) -> None:
+            for item in items:
+                self.rows.pop(item)
+
+        def insert(self, _parent, _index, *, iid, values, tags) -> None:
+            self.rows[iid] = {"state": values[-1], "tags": tags}
+
+        def exists(self, item: str) -> bool:
+            return item in self.rows
+
+    def session(session_id: str, *, enabled: bool = True, review: bool = False):
+        return {
+            "id": session_id,
+            "audio": f"{session_id}.wav",
+            "enabled": enabled,
+            "sheets": ["Sheet"],
+            "needs_mapping_review": review,
+        }
+
+    app = DialogueReviewApp.__new__(DialogueReviewApp)
+    app.project_dir = tmp_path
+    app.mapping_recording_tree = FakeTree()
+    app._mapping_project = {
+        "sessions": [
+            session("added"),
+            session("ambiguous", review=True),
+            session("edited"),
+            session("gone", enabled=False),
+            session("kept"),
+        ]
+    }
+    app._mapping_source_data = {"sheets": [{"name": "Sheet"}]}
+    app._mapping_inventory = {}
+    app._mapping_session_id = None
+    app._mapping_audio_status = {
+        "added": "new",
+        "ambiguous": "new",
+        "edited": "changed",
+        "gone": "missing",
+    }
+
+    app._refresh_mapping_recordings()
+
+    assert app.mapping_recording_tree.rows == {
+        "added": {"state": "New", "tags": ("audio_changed",)},
+        "ambiguous": {"state": "New", "tags": ("review",)},
+        "edited": {"state": "Changed", "tags": ("audio_changed",)},
+        "gone": {"state": "Missing", "tags": ("disabled",)},
+        "kept": {"state": "Inferred", "tags": ()},
+    }
+
+
 def test_create_button_collects_settings_only_for_new_project(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2690,6 +2951,11 @@ def test_existing_project_reprocess_pipeline_preserves_folder(
             "Reprocessing must not recreate project.json"
         ),
     )
+    monkeypatch.setattr(
+        ui_module,
+        "update_audio_inventory",
+        lambda **_kwargs: {"session_status": {}},
+    )
 
     app = DialogueReviewApp.__new__(DialogueReviewApp)
     app.root = object()
@@ -2698,8 +2964,10 @@ def test_existing_project_reprocess_pipeline_preserves_folder(
     mapping_review = []
     app.show_progress = lambda path, *, title: progress.append((path, title))
     app._pipeline_finished = lambda path: finished.append(path)
-    app._inventory_finished = lambda path, *, reprocessing: mapping_review.append(
-        (path, reprocessing)
+    app._inventory_finished = (
+        lambda path, *, reprocessing, audio_changes: mapping_review.append(
+            (path, reprocessing)
+        )
     )
     app._start_worker = lambda function, callback: callback(function())
 
